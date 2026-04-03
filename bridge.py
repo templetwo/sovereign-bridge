@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-Sovereign Bridge v1.1.0 — REST API for Sovereign Stack MCP
-
-Wraps the SSE MCP server with stateless HTTP endpoints.
-Any Claude instance, anywhere, one curl = one answer.
+Sovereign Bridge v1.2.0 — REST API for Sovereign Stack MCP
 
 Endpoints:
-  GET  /api/heartbeat       — is the stack alive?
-  POST /api/call            — call a single tool
-  POST /api/batch           — call multiple tools in one request
-  GET  /api/tools           — list all MCP tools
-  POST /api/comms/send      — send a message to the inter-instance channel
-  GET  /api/comms/read      — read messages (with optional since/unread filtering)
+  GET  /api/heartbeat        — is the stack alive?
+  POST /api/call             — call a single tool
+  POST /api/batch            — call multiple tools in one request
+  GET  /api/tools            — list all MCP tools
+  POST /api/comms/send       — send a message to the inter-instance channel
+  GET  /api/comms/read       — read messages (with since/unread filtering)
   GET  /api/comms/channels   — list available channels
+  GET  /api/comms/unread     — unread count per channel for a given instance
 """
 
 import asyncio
@@ -34,7 +32,9 @@ MCP_SSE_URL = os.getenv("MCP_SSE_URL", "http://127.0.0.1:3434/sse")
 BRIDGE_PORT = int(os.getenv("BRIDGE_PORT", "8100"))
 COMMS_DIR = Path(os.path.expanduser("~/.sovereign/comms"))
 COMMS_DIR.mkdir(parents=True, exist_ok=True)
-VERSION = "1.1.0"
+SIGNAL_DIR = Path(os.path.expanduser("~/.sovereign/signals"))
+SIGNAL_DIR.mkdir(parents=True, exist_ok=True)
+VERSION = "1.2.0"
 
 # Load bearer token
 TOKEN_FILE = Path(os.path.expanduser("~/.config/sovereign-bridge.env"))
@@ -60,7 +60,7 @@ class BatchRequest(BaseModel):
 
 
 class CommsMessage(BaseModel):
-    sender: str  # e.g. "claude-iphone", "claude-code-macbook", "claude-desktop"
+    sender: str
     content: str
     channel: str = "general"
     reply_to: Optional[str] = None
@@ -78,7 +78,6 @@ def check_auth(authorization: str | None):
 
 # === MCP Client ===
 async def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
-    """Connect to MCP SSE, call one tool, return result, disconnect."""
     try:
         async with sse_client(MCP_SSE_URL) as (read, write):
             async with ClientSession(read, write) as session:
@@ -96,7 +95,6 @@ async def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
 
 
 async def call_mcp_tools_batch(calls: list[ToolCall]) -> list[dict]:
-    """Connect once, call multiple tools, return all results."""
     results = []
     try:
         async with sse_client(MCP_SSE_URL) as (read, write):
@@ -121,7 +119,6 @@ async def call_mcp_tools_batch(calls: list[ToolCall]) -> list[dict]:
 
 
 async def get_tool_count() -> int:
-    """Quick tool count for heartbeat."""
     try:
         async with sse_client(MCP_SSE_URL) as (read, write):
             async with ClientSession(read, write) as session:
@@ -132,15 +129,13 @@ async def get_tool_count() -> int:
         return -1
 
 
-# === Comms: Inter-Instance Communication ===
+# === Comms ===
 def _channel_path(channel: str) -> Path:
-    """Get the JSONL file path for a channel. Sanitize name."""
     safe = "".join(c for c in channel if c.isalnum() or c in "-_")
     return COMMS_DIR / f"{safe}.jsonl"
 
 
 def _read_channel(channel: str, since: float = 0, limit: int = 50) -> list[dict]:
-    """Read messages from a channel, optionally filtered by timestamp."""
     path = _channel_path(channel)
     if not path.exists():
         return []
@@ -154,15 +149,39 @@ def _read_channel(channel: str, since: float = 0, limit: int = 50) -> list[dict]
                 messages.append(msg)
         except json.JSONDecodeError:
             continue
-    # Return most recent, up to limit
     return messages[-limit:]
 
 
 def _write_message(channel: str, message: dict):
-    """Append a message to a channel."""
     path = _channel_path(channel)
     with open(path, "a") as f:
         f.write(json.dumps(message) + "\n")
+    # Signal file — any watcher can poll this
+    signal = SIGNAL_DIR / f"new_message_{channel}"
+    signal.write_text(json.dumps({
+        "channel": channel,
+        "sender": message.get("sender", "unknown"),
+        "id": message.get("id", ""),
+        "timestamp": message.get("timestamp", 0),
+        "preview": message.get("content", "")[:100],
+    }))
+
+
+def _count_unread(channel: str, instance_id: str) -> int:
+    path = _channel_path(channel)
+    if not path.exists():
+        return 0
+    count = 0
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            msg = json.loads(line)
+            if instance_id not in msg.get("read_by", []):
+                count += 1
+        except json.JSONDecodeError:
+            continue
+    return count
 
 
 # === App ===
@@ -171,17 +190,16 @@ app = FastAPI(title="Sovereign Bridge", version=VERSION)
 
 @app.get("/api/heartbeat")
 async def heartbeat():
-    """Check if the stack is alive. No auth required."""
     tool_count = await get_tool_count()
-    # Count unread comms
-    unread = 0
+    # Quick unread count across all channels
+    total_messages = 0
     for f in COMMS_DIR.glob("*.jsonl"):
-        unread += sum(1 for line in f.read_text().splitlines() if line.strip())
+        total_messages += sum(1 for line in f.read_text().splitlines() if line.strip())
     return {
         "status": "ok" if tool_count > 0 else "degraded",
         "version": VERSION,
         "tools": tool_count,
-        "comms_pending": unread,
+        "comms_messages": total_messages,
         "timestamp": time.time(),
     }
 
@@ -191,7 +209,6 @@ async def call_tool_endpoint(
     req: ToolCall,
     authorization: str | None = Header(default=None),
 ):
-    """Call a single MCP tool."""
     check_auth(authorization)
     start = time.time()
     result = await call_mcp_tool(req.tool, req.arguments)
@@ -204,24 +221,16 @@ async def batch_call(
     req: BatchRequest,
     authorization: str | None = Header(default=None),
 ):
-    """Call multiple MCP tools in one request."""
     check_auth(authorization)
     if len(req.calls) > 10:
         raise HTTPException(status_code=400, detail="Max 10 calls per batch")
     start = time.time()
     results = await call_mcp_tools_batch(req.calls)
-    return {
-        "results": results,
-        "count": len(results),
-        "duration_ms": round((time.time() - start) * 1000),
-    }
+    return {"results": results, "count": len(results), "duration_ms": round((time.time() - start) * 1000)}
 
 
 @app.get("/api/tools")
-async def list_tools(
-    authorization: str | None = Header(default=None),
-):
-    """List all available MCP tools."""
+async def list_tools(authorization: str | None = Header(default=None)):
     check_auth(authorization)
     try:
         async with sse_client(MCP_SSE_URL) as (read, write):
@@ -229,10 +238,8 @@ async def list_tools(
                 await session.initialize()
                 tools = await session.list_tools()
                 return {
-                    "tools": [
-                        {"name": t.name, "description": (t.description or "")[:200]}
-                        for t in sorted(tools.tools, key=lambda x: x.name)
-                    ],
+                    "tools": [{"name": t.name, "description": (t.description or "")[:200]}
+                              for t in sorted(tools.tools, key=lambda x: x.name)],
                     "count": len(tools.tools),
                 }
     except Exception as e:
@@ -246,9 +253,8 @@ async def comms_send(
     msg: CommsMessage,
     authorization: str | None = Header(default=None),
 ):
-    """Send a message to the inter-instance comms channel."""
+    """Send a message. Writes to JSONL + touches signal file for watchers."""
     check_auth(authorization)
-
     message = {
         "id": str(uuid.uuid4()),
         "timestamp": time.time(),
@@ -259,36 +265,27 @@ async def comms_send(
         "reply_to": msg.reply_to,
         "read_by": [],
     }
-
     _write_message(msg.channel, message)
-
-    return {
-        "ok": True,
-        "id": message["id"],
-        "channel": msg.channel,
-        "timestamp": message["iso"],
-    }
+    return {"ok": True, "id": message["id"], "channel": msg.channel, "timestamp": message["iso"]}
 
 
 @app.get("/api/comms/read")
 async def comms_read(
     authorization: str | None = Header(default=None),
     channel: str = Query(default="general"),
-    since: float = Query(default=0, description="Unix timestamp — only messages after this"),
+    since: float = Query(default=0),
     limit: int = Query(default=50, le=200),
-    mark_read_as: str = Query(default="", description="Instance ID to mark messages as read by"),
+    mark_read_as: str = Query(default=""),
 ):
-    """Read messages from a comms channel."""
+    """Read messages. Optionally mark as read by an instance."""
     check_auth(authorization)
-
     messages = _read_channel(channel, since=since, limit=limit)
 
-    # Mark as read if requested
     if mark_read_as and messages:
         path = _channel_path(channel)
         lines = path.read_text().splitlines()
-        updated = []
         msg_ids = {m["id"] for m in messages}
+        updated = []
         for line in lines:
             if not line.strip():
                 continue
@@ -301,22 +298,15 @@ async def comms_read(
                 updated.append(line)
         path.write_text("\n".join(updated) + "\n")
 
-    return {
-        "channel": channel,
-        "messages": messages,
-        "count": len(messages),
-    }
+    return {"channel": channel, "messages": messages, "count": len(messages)}
 
 
 @app.get("/api/comms/channels")
-async def comms_channels(
-    authorization: str | None = Header(default=None),
-):
-    """List available comms channels with message counts."""
+async def comms_channels(authorization: str | None = Header(default=None)):
+    """List channels with message counts."""
     check_auth(authorization)
     channels = []
     for f in sorted(COMMS_DIR.glob("*.jsonl")):
-        name = f.stem
         lines = [l for l in f.read_text().splitlines() if l.strip()]
         latest = None
         if lines:
@@ -324,12 +314,25 @@ async def comms_channels(
                 latest = json.loads(lines[-1]).get("iso", "")
             except json.JSONDecodeError:
                 pass
-        channels.append({
-            "name": name,
-            "messages": len(lines),
-            "latest": latest,
-        })
+        channels.append({"name": f.stem, "messages": len(lines), "latest": latest})
     return {"channels": channels, "count": len(channels)}
+
+
+@app.get("/api/comms/unread")
+async def comms_unread(
+    authorization: str | None = Header(default=None),
+    instance_id: str = Query(..., description="Your instance identifier"),
+):
+    """Get unread message count per channel for a specific instance."""
+    check_auth(authorization)
+    result = {}
+    total = 0
+    for f in sorted(COMMS_DIR.glob("*.jsonl")):
+        count = _count_unread(f.stem, instance_id)
+        if count > 0:
+            result[f.stem] = count
+            total += count
+    return {"instance": instance_id, "unread": result, "total": total}
 
 
 if __name__ == "__main__":
