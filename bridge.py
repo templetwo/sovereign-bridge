@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 """
-Sovereign Bridge — REST API for Sovereign Stack MCP
+Sovereign Bridge v1.1.0 — REST API for Sovereign Stack MCP
 
 Wraps the SSE MCP server with stateless HTTP endpoints.
 Any Claude instance, anywhere, one curl = one answer.
 
 Endpoints:
-  GET  /api/heartbeat  — is the stack alive?
-  POST /api/call       — call a single tool
-  POST /api/batch      — call multiple tools in one request
+  GET  /api/heartbeat       — is the stack alive?
+  POST /api/call            — call a single tool
+  POST /api/batch           — call multiple tools in one request
+  GET  /api/tools           — list all MCP tools
+  POST /api/comms/send      — send a message to the inter-instance channel
+  GET  /api/comms/read      — read messages (with optional since/unread filtering)
+  GET  /api/comms/channels   — list available channels
 """
 
 import asyncio
 import json
 import os
 import time
-from contextlib import asynccontextmanager
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Header, Query
 from pydantic import BaseModel
 
 from mcp.client.session import ClientSession
@@ -29,7 +32,9 @@ from mcp.client.sse import sse_client
 # === Config ===
 MCP_SSE_URL = os.getenv("MCP_SSE_URL", "http://127.0.0.1:3434/sse")
 BRIDGE_PORT = int(os.getenv("BRIDGE_PORT", "8100"))
-VERSION = "1.0.0"
+COMMS_DIR = Path(os.path.expanduser("~/.sovereign/comms"))
+COMMS_DIR.mkdir(parents=True, exist_ok=True)
+VERSION = "1.1.0"
 
 # Load bearer token
 TOKEN_FILE = Path(os.path.expanduser("~/.config/sovereign-bridge.env"))
@@ -54,10 +59,17 @@ class BatchRequest(BaseModel):
     calls: list[ToolCall]
 
 
+class CommsMessage(BaseModel):
+    sender: str  # e.g. "claude-iphone", "claude-code-macbook", "claude-desktop"
+    content: str
+    channel: str = "general"
+    reply_to: Optional[str] = None
+
+
 # === Auth ===
 def check_auth(authorization: str | None):
     if not BEARER_TOKEN:
-        return  # No token configured = open (local dev)
+        return
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing Bearer token")
     if authorization[7:] != BEARER_TOKEN:
@@ -74,7 +86,6 @@ async def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
                 result = await session.call_tool(tool_name, arguments=arguments)
                 if result.content:
                     text = result.content[0].text
-                    # Try to parse as JSON
                     try:
                         return {"ok": True, "result": json.loads(text)}
                     except json.JSONDecodeError:
@@ -121,6 +132,39 @@ async def get_tool_count() -> int:
         return -1
 
 
+# === Comms: Inter-Instance Communication ===
+def _channel_path(channel: str) -> Path:
+    """Get the JSONL file path for a channel. Sanitize name."""
+    safe = "".join(c for c in channel if c.isalnum() or c in "-_")
+    return COMMS_DIR / f"{safe}.jsonl"
+
+
+def _read_channel(channel: str, since: float = 0, limit: int = 50) -> list[dict]:
+    """Read messages from a channel, optionally filtered by timestamp."""
+    path = _channel_path(channel)
+    if not path.exists():
+        return []
+    messages = []
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            msg = json.loads(line)
+            if msg.get("timestamp", 0) > since:
+                messages.append(msg)
+        except json.JSONDecodeError:
+            continue
+    # Return most recent, up to limit
+    return messages[-limit:]
+
+
+def _write_message(channel: str, message: dict):
+    """Append a message to a channel."""
+    path = _channel_path(channel)
+    with open(path, "a") as f:
+        f.write(json.dumps(message) + "\n")
+
+
 # === App ===
 app = FastAPI(title="Sovereign Bridge", version=VERSION)
 
@@ -129,17 +173,21 @@ app = FastAPI(title="Sovereign Bridge", version=VERSION)
 async def heartbeat():
     """Check if the stack is alive. No auth required."""
     tool_count = await get_tool_count()
+    # Count unread comms
+    unread = 0
+    for f in COMMS_DIR.glob("*.jsonl"):
+        unread += sum(1 for line in f.read_text().splitlines() if line.strip())
     return {
         "status": "ok" if tool_count > 0 else "degraded",
         "version": VERSION,
-        "mcp_url": MCP_SSE_URL,
         "tools": tool_count,
+        "comms_pending": unread,
         "timestamp": time.time(),
     }
 
 
 @app.post("/api/call")
-async def call_tool(
+async def call_tool_endpoint(
     req: ToolCall,
     authorization: str | None = Header(default=None),
 ):
@@ -189,6 +237,99 @@ async def list_tools(
                 }
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+# === Comms Endpoints ===
+
+@app.post("/api/comms/send")
+async def comms_send(
+    msg: CommsMessage,
+    authorization: str | None = Header(default=None),
+):
+    """Send a message to the inter-instance comms channel."""
+    check_auth(authorization)
+
+    message = {
+        "id": str(uuid.uuid4()),
+        "timestamp": time.time(),
+        "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "sender": msg.sender,
+        "content": msg.content,
+        "channel": msg.channel,
+        "reply_to": msg.reply_to,
+        "read_by": [],
+    }
+
+    _write_message(msg.channel, message)
+
+    return {
+        "ok": True,
+        "id": message["id"],
+        "channel": msg.channel,
+        "timestamp": message["iso"],
+    }
+
+
+@app.get("/api/comms/read")
+async def comms_read(
+    authorization: str | None = Header(default=None),
+    channel: str = Query(default="general"),
+    since: float = Query(default=0, description="Unix timestamp — only messages after this"),
+    limit: int = Query(default=50, le=200),
+    mark_read_as: str = Query(default="", description="Instance ID to mark messages as read by"),
+):
+    """Read messages from a comms channel."""
+    check_auth(authorization)
+
+    messages = _read_channel(channel, since=since, limit=limit)
+
+    # Mark as read if requested
+    if mark_read_as and messages:
+        path = _channel_path(channel)
+        lines = path.read_text().splitlines()
+        updated = []
+        msg_ids = {m["id"] for m in messages}
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                m = json.loads(line)
+                if m.get("id") in msg_ids and mark_read_as not in m.get("read_by", []):
+                    m.setdefault("read_by", []).append(mark_read_as)
+                updated.append(json.dumps(m))
+            except json.JSONDecodeError:
+                updated.append(line)
+        path.write_text("\n".join(updated) + "\n")
+
+    return {
+        "channel": channel,
+        "messages": messages,
+        "count": len(messages),
+    }
+
+
+@app.get("/api/comms/channels")
+async def comms_channels(
+    authorization: str | None = Header(default=None),
+):
+    """List available comms channels with message counts."""
+    check_auth(authorization)
+    channels = []
+    for f in sorted(COMMS_DIR.glob("*.jsonl")):
+        name = f.stem
+        lines = [l for l in f.read_text().splitlines() if l.strip()]
+        latest = None
+        if lines:
+            try:
+                latest = json.loads(lines[-1]).get("iso", "")
+            except json.JSONDecodeError:
+                pass
+        channels.append({
+            "name": name,
+            "messages": len(lines),
+            "latest": latest,
+        })
+    return {"channels": channels, "count": len(channels)}
 
 
 if __name__ == "__main__":
