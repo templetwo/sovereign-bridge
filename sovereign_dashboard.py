@@ -13,18 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import deque
 
-BRIDGE_URL = "http://127.0.0.1:8100"
-BRIDGE_TOKEN = ""
-SOVEREIGN_DIR = Path.home() / ".sovereign"
-CHRONICLE_DIR = SOVEREIGN_DIR / "chronicle"
-COMMS_INBOX = SOVEREIGN_DIR / "comms_inbox.txt"
-
-TOKEN_FILE = Path.home() / ".config" / "sovereign-bridge.env"
-if TOKEN_FILE.exists():
-    for line in TOKEN_FILE.read_text().splitlines():
-        if "BRIDGE_TOKEN" in line:
-            BRIDGE_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
-            break
+from bridge_config import BRIDGE_URL, BRIDGE_TOKEN, HEADERS, SOVEREIGN_DIR, CHRONICLE_DIR, COMMS_INBOX
 
 POLL_INTERVAL = 3
 ACTIVITY_LOG_MAX = 50
@@ -64,7 +53,7 @@ async def get_spiral_status():
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             r = await client.post(f"{BRIDGE_URL}/api/call",
-                headers={"Authorization": f"Bearer {BRIDGE_TOKEN}", "Content-Type": "application/json"},
+                headers=HEADERS,
                 json={"tool": "spiral_status", "arguments": {}})
             if r.status_code == 200:
                 result = r.json().get("result", "")
@@ -91,7 +80,7 @@ async def get_comms():
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             r = await client.get(f"{BRIDGE_URL}/api/comms/unread?instance_id=dashboard",
-                headers={"Authorization": f"Bearer {BRIDGE_TOKEN}"})
+                headers=HEADERS)
             if r.status_code == 200:
                 data = r.json()
                 stats["comms_unread"] = data.get("total", 0)

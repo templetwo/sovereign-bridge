@@ -12,21 +12,10 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-BRIDGE_URL = "http://127.0.0.1:8100"
-BRIDGE_TOKEN = ""
-SOVEREIGN_DIR = Path.home() / ".sovereign"
-ACTION_QUEUE = SOVEREIGN_DIR / "action_queue"
-ACTION_LOG = SOVEREIGN_DIR / "action_log.jsonl"
+from bridge_config import BRIDGE_URL, BRIDGE_TOKEN, HEADERS, SOVEREIGN_DIR, ACTION_QUEUE, ACTION_LOG
 POLL_INTERVAL = 30
 INSTANCE_ID = "comms-dispatcher"
-CHANNEL = "general"
-
-TOKEN_FILE = Path.home() / ".config" / "sovereign-bridge.env"
-if TOKEN_FILE.exists():
-    for line in TOKEN_FILE.read_text().splitlines():
-        if "BRIDGE_TOKEN" in line:
-            BRIDGE_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
-            break
+CHANNEL = "general" 
 
 ACTION_QUEUE.mkdir(parents=True, exist_ok=True)
 
@@ -40,7 +29,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("dispatcher")
 
-HEADERS = {"Authorization": f"Bearer {BRIDGE_TOKEN}", "Content-Type": "application/json"}
+# HEADERS imported from bridge_config
 
 def bridge_call(tool, arguments):
     try:
