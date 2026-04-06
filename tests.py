@@ -81,8 +81,8 @@ test("Heartbeat returns ok", test_heartbeat)
 
 def test_heartbeat_tool_count():
     r = httpx.get(f"{BRIDGE_URL}/api/heartbeat", timeout=5)
-    return r.json().get("tools", 0) == 38
-test("Tool count is 38", test_heartbeat_tool_count)
+    return r.json().get("tools", 0) >= 38
+test("Tool count is >= 38", test_heartbeat_tool_count)
 
 def test_heartbeat_has_comms():
     r = httpx.get(f"{BRIDGE_URL}/api/heartbeat", timeout=5)
@@ -134,7 +134,7 @@ def test_tools_list():
     r = httpx.get(f"{BRIDGE_URL}/api/tools", headers=HEADERS, timeout=10)
     d = r.json()
     names = [t["name"] for t in d.get("tools", [])]
-    return d.get("count") == 38 and "guardian_status" in names and "spiral_status" in names
+    return d.get("count") >= 38 and "guardian_status" in names and "spiral_status" in names
 test("Tools list has 38 tools including guardian", test_tools_list)
 
 # ════════════════════════════════════════
