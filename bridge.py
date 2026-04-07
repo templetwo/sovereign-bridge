@@ -222,6 +222,44 @@ async def dashboard_root():
     return FileResponse(os.path.join(DASHBOARD_DIR, "index.html"))
 
 
+@app.get("/api/discover")
+async def discover():
+    """Self-describing endpoint. Any AI system hits this once and knows how to use the Stack."""
+    return {
+        "name": "Sovereign Stack",
+        "version": VERSION,
+        "description": "Persistent memory, governance, and epistemic continuity for AI systems. 43 tools.",
+        "auth": "Bearer token in Authorization header. GET /api/heartbeat needs no auth.",
+        "endpoints": {
+            "call": {"method": "POST", "path": "/api/call", "body": {"tool": "string", "arguments": "object"}, "auth": True},
+            "batch": {"method": "POST", "path": "/api/batch", "body": {"calls": [{"tool": "string", "arguments": "object"}]}, "auth": True},
+            "heartbeat": {"method": "GET", "path": "/api/heartbeat", "auth": False},
+            "tools": {"method": "GET", "path": "/api/tools", "auth": True},
+            "comms_send": {"method": "POST", "path": "/api/comms/send", "body": {"sender": "string", "content": "string", "channel": "general"}, "auth": True},
+            "comms_read": {"method": "GET", "path": "/api/comms/read?channel=general&limit=10", "auth": True},
+            "discover": {"method": "GET", "path": "/api/discover", "auth": False},
+        },
+        "quick_start": {
+            "step_1": "GET /api/heartbeat — verify the stack is alive",
+            "step_2": "POST /api/call with tool=session_handoff, arguments={action: read} — read what happened last session",
+            "step_3": "POST /api/call with tool=self_model, arguments={action: read} — know your shape",
+            "step_4": "POST /api/call with tool=get_open_threads, arguments={} — see what needs attention",
+        },
+        "essential_tools": {
+            "session_handoff": "Read/write session continuity. THE most important tool.",
+            "self_model": "Read/update instance patterns: strength, drift, blind_spot, tendency.",
+            "context_retrieve": "Focus-weighted retrieval — pass what you are working on, get relevant insights.",
+            "record_insight": "Write to chronicle. Layers: ground_truth, hypothesis, open_thread.",
+            "metabolize": "Run metabolism cycle — detect contradictions, stale threads.",
+            "spiral_status": "Current phase and tool call count.",
+            "guardian_status": "Security posture and health score.",
+            "get_open_threads": "Unresolved questions needing investigation.",
+        },
+        "protocol": "Start: read handoff + self_model. During: record insights, check context. End: write handoff, update self_model.",
+        "base_url": "https://stack.templetwo.com",
+    }
+
+
 @app.get("/api/heartbeat")
 async def heartbeat():
     tool_count = await get_tool_count()
