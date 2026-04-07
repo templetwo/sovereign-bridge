@@ -196,6 +196,14 @@ def _count_unread(channel: str, instance_id: str) -> int:
 # === App ===
 app = FastAPI(title="Sovereign Bridge", version=VERSION)
 
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import os
