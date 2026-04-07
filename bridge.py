@@ -196,6 +196,16 @@ def _count_unread(channel: str, instance_id: str) -> int:
 # === App ===
 app = FastAPI(title="Sovereign Bridge", version=VERSION)
 
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+import os
+
+DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), "dashboard")
+
+@app.get("/")
+async def dashboard_root():
+    return FileResponse(os.path.join(DASHBOARD_DIR, "index.html"))
+
 
 @app.get("/api/heartbeat")
 async def heartbeat():

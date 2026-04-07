@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>†⟡† Sovereign Stack Dashboard</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0a0f; color: #e7e5e4; font-family: 'Inter', -apple-system, sans-serif; }
+
+.header { 
+  background: linear-gradient(135deg, #14141c 0%, #1a1a2e 100%);
+  border-bottom: 1px solid #2a2a3e;
+  padding: 1.5rem 2rem;
+  display: flex; justify-content: space-between; align-items: center;
+}
+.header h1 { font-size: 1.4rem; color: #a78bfa; }
+.header .status { display: flex; gap: 1rem; align-items: center; font-size: 0.85rem; }
+.header .status .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.dot-green { background: #34d399; box-shadow: 0 0 6px #34d399; }
+.dot-red { background: #f87171; box-shadow: 0 0 6px #f87171; }
+
+.grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; padding: 1.5rem 2rem; }
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+.card {
+  background: #14141c; border: 1px solid #1e1e28; border-radius: 12px;
+  padding: 1.25rem; min-height: 200px;
+}
+.card h2 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; color: #78716c; margin-bottom: 1rem; }
+
+.metric { font-size: 2.5rem; font-weight: 700; color: #a78bfa; line-height: 1; }
+.metric-label { font-size: 0.8rem; color: #57534e; margin-top: 0.25rem; }
+.metric-row { display: flex; gap: 2rem; margin-bottom: 1rem; }
+.metric-item { text-align: center; }
+.metric-sm { font-size: 1.5rem; font-weight: 600; }
+
+.signal-bar { display: flex; height: 24px; border-radius: 6px; overflow: hidden; margin-top: 0.5rem; }
+.signal-open { background: #34d399; }
+.signal-pause { background: #fbbf24; }
+.signal-witness { background: #a78bfa; }
+
+.service { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; font-size: 0.85rem; }
+.service .dot { width: 6px; height: 6px; border-radius: 50%; }
+
+.feed { max-height: 400px; overflow-y: auto; }
+.feed-item { 
+  padding: 0.5rem 0; border-bottom: 1px solid #1e1e28; font-size: 0.8rem;
+  display: flex; gap: 0.75rem;
+}
+.feed-time { color: #57534e; min-width: 60px; }
+.feed-cat { font-weight: 600; min-width: 80px; }
+.cat-TOOLS { color: #34d399; }
+.cat-CHRONICLE { color: #a78bfa; }
+.cat-COMMS { color: #fbbf24; }
+.cat-GUARDIAN { color: #f87171; }
+.cat-METABOLISM { color: #60a5fa; }
+
+.thread { padding: 0.5rem 0; border-bottom: 1px solid #1e1e28; font-size: 0.8rem; }
+.thread-domain { color: #a78bfa; font-size: 0.7rem; text-transform: uppercase; }
+
+.mirror-item { margin-bottom: 0.75rem; }
+.mirror-cat { font-size: 0.7rem; text-transform: uppercase; color: #78716c; }
+.mirror-text { font-size: 0.85rem; color: #d6d3d1; }
+
+.comms-msg { padding: 0.5rem 0; border-bottom: 1px solid #1e1e28; font-size: 0.8rem; }
+.comms-sender { color: #34d399; font-weight: 600; }
+.comms-signal { font-size: 0.65rem; padding: 2px 6px; border-radius: 4px; margin-left: 0.5rem; }
+.signal-OPEN { background: #34d39930; color: #34d399; }
+.signal-PAUSE { background: #fbbf2430; color: #fbbf24; }
+.signal-WITNESS { background: #a78bfa30; color: #a78bfa; }
+
+.full-width { grid-column: 1 / -1; }
+.two-col { grid-column: span 2; }
+@media (max-width: 900px) { .two-col { grid-column: span 1; } }
+
+.refresh { font-size: 0.7rem; color: #57534e; text-align: center; padding: 1rem; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>†⟡† Sovereign Stack</h1>
+  <div class="status">
+    <span><span class="dot dot-green" id="health-dot"></span> <span id="health-text">Connecting...</span></span>
+    <span id="tool-count">— tools</span>
+    <span id="uptime">—</span>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Row 1: Key metrics -->
+  <div class="card">
+    <h2>Spiral Phase</h2>
+    <div class="metric" id="phase">—</div>
+    <div class="metric-label">Current cognitive phase</div>
+    <div style="margin-top:1rem">
+      <div class="metric-sm" id="tool-calls" style="color:#34d399">—</div>
+      <div class="metric-label">Lifetime tool calls</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Chronicle</h2>
+    <div class="metric-row">
+      <div class="metric-item">
+        <div class="metric-sm" id="insights" style="color:#a78bfa">—</div>
+        <div class="metric-label">Insights</div>
+      </div>
+      <div class="metric-item">
+        <div class="metric-sm" id="ground-truth" style="color:#34d399">—</div>
+        <div class="metric-label">Ground Truth</div>
+      </div>
+      <div class="metric-item">
+        <div class="metric-sm" id="hypotheses" style="color:#fbbf24">—</div>
+        <div class="metric-label">Hypotheses</div>
+      </div>
+    </div>
+    <div class="metric-row">
+      <div class="metric-item">
+        <div class="metric-sm" id="threads" style="color:#60a5fa">—</div>
+        <div class="metric-label">Open Threads</div>
+      </div>
+      <div class="metric-item">
+        <div class="metric-sm" id="contradictions" style="color:#f87171">—</div>
+        <div class="metric-label">Contradictions</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Guardian</h2>
+    <div class="metric" id="health-score" style="color:#34d399">—</div>
+    <div class="metric-label">Health Score</div>
+    <div style="margin-top:1rem">
+      <div class="metric-sm" id="listeners" style="color:#fbbf24">—</div>
+      <div class="metric-label">Listeners</div>
+    </div>
+    <div id="guardian-issues" style="margin-top:0.75rem; font-size:0.8rem; color:#78716c;"></div>
+  </div>
+
+  <!-- Row 2: Services + Mirror + Comms -->
+  <div class="card">
+    <h2>Services</h2>
+    <div id="services"></div>
+  </div>
+
+  <div class="card">
+    <h2>Self-Model Mirror</h2>
+    <div id="mirror"></div>
+  </div>
+
+  <div class="card">
+    <h2>Recent Comms</h2>
+    <div id="comms" class="feed"></div>
+  </div>
+
+  <!-- Row 3: Open Threads full width -->
+  <div class="card full-width">
+    <h2>Open Threads</h2>
+    <div id="open-threads" style="display:flex; gap:1rem; flex-wrap:wrap;"></div>
+  </div>
+</div>
+
+<div class="refresh">Refreshes every 5s · <span id="last-update">—</span></div>
+
+<script>
+const BRIDGE = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+  ? 'http://127.0.0.1:8100'
+  : 'https://stack.templetwo.com';
+let TOKEN = localStorage.getItem('bridge_token') || '';
+
+if (!TOKEN) {
+  TOKEN = prompt('Enter your Sovereign Bridge bearer token:');
+  if (TOKEN) localStorage.setItem('bridge_token', TOKEN);
+}
+
+const headers = { 'Authorization': `Bearer ${TOKEN}`, 'Content-Type': 'application/json' };
+
+async function callTool(tool, args = {}) {
+  try {
+    const r = await fetch(`${BRIDGE}/api/call`, {
+      method: 'POST', headers, body: JSON.stringify({ tool, arguments: args })
+    });
+    const d = await r.json();
+    return d.ok ? d.result : null;
+  } catch { return null; }
+}
+
+async function fetchComms() {
+  try {
+    const r = await fetch(`${BRIDGE}/api/comms/read?channel=general&limit=5`, { headers });
+    return await r.json();
+  } catch { return { messages: [] }; }
+}
+
+async function refresh() {
+  // Heartbeat
+  try {
+    const r = await fetch(`${BRIDGE}/api/heartbeat`);
+    const d = await r.json();
+    document.getElementById('health-dot').className = d.status === 'ok' ? 'dot dot-green' : 'dot dot-red';
+    document.getElementById('health-text').textContent = d.status === 'ok' ? 'Connected' : 'Degraded';
+    document.getElementById('tool-count').textContent = `${d.tools} tools`;
+  } catch {
+    document.getElementById('health-dot').className = 'dot dot-red';
+    document.getElementById('health-text').textContent = 'Offline';
+  }
+
+  // Spiral status
+  const spiral = await callTool('spiral_status');
+  if (spiral) {
+    const lines = spiral.split('\n');
+    for (const line of lines) {
+      if (line.includes('Phase:')) document.getElementById('phase').textContent = line.split(':')[1].trim();
+      if (line.includes('Tool Calls:')) document.getElementById('tool-calls').textContent = line.split(':')[1].trim();
+      if (line.includes('Duration:')) {
+        const secs = parseFloat(line.split(':')[1]);
+        const days = Math.floor(secs / 86400);
+        document.getElementById('uptime').textContent = `${days}d uptime`;
+      }
+    }
+  }
+
+  // Metabolism
+  const metab = await callTool('metabolize', { max_age_days: 30 });
+  if (metab) {
+    const m = metab.match(/(\d+) insights/); if (m) document.getElementById('insights').textContent = m[1];
+    const gt = metab.match(/(\d+) ground truth/); if (gt) document.getElementById('ground-truth').textContent = gt[1];
+    const hy = metab.match(/(\d+) hypotheses/); if (hy) document.getElementById('hypotheses').textContent = hy[1];
+    const ct = metab.match(/(\d+) potential contradiction/); document.getElementById('contradictions').textContent = ct ? ct[1] : '0';
+  }
+
+  // Open threads
+  const threads = await callTool('get_open_threads');
+  if (threads) {
+    try {
+      const arr = typeof threads === 'string' ? JSON.parse(threads) : threads;
+      const unresolved = arr.filter(t => !t.resolved);
+      document.getElementById('threads').textContent = unresolved.length;
+      document.getElementById('open-threads').innerHTML = unresolved.map(t => 
+        `<div class="thread"><div class="thread-domain">${t.domain || '?'}</div>${(t.question || '').slice(0, 100)}</div>`
+      ).join('');
+    } catch { document.getElementById('threads').textContent = '?'; }
+  }
+
+  // Guardian
+  const guard = await callTool('guardian_status');
+  if (guard) {
+    try {
+      const g = typeof guard === 'string' ? JSON.parse(guard.replace(/^[^{]*/, '')) : guard;
+      document.getElementById('health-score').textContent = g.health_score || '?';
+      document.getElementById('listeners').textContent = g.listeners || '?';
+      const issues = g.issues || [];
+      document.getElementById('guardian-issues').innerHTML = issues.map(i => `<div style="color:#f87171">⚠ ${i}</div>`).join('');
+    } catch {}
+  }
+
+  // Self-model
+  const mirror = await callTool('self_model', { action: 'read' });
+  if (mirror) {
+    const cats = ['STRENGTH', 'DRIFT', 'BLIND_SPOT', 'TENDENCY'];
+    let html = '';
+    for (const cat of cats) {
+      const re = new RegExp(`${cat.toLowerCase()}:\\s*(.+?)(?=\\n|$)`, 'i');
+      const m = mirror.match(re);
+      if (m) {
+        html += `<div class="mirror-item"><div class="mirror-cat">${cat}</div><div class="mirror-text">${m[1].trim().slice(0, 120)}</div></div>`;
+      }
+    }
+    document.getElementById('mirror').innerHTML = html || '<div style="color:#57534e">No self-model yet</div>';
+  }
+
+  // Comms
+  const comms = await fetchComms();
+  if (comms.messages) {
+    document.getElementById('comms').innerHTML = comms.messages.slice(-5).reverse().map(m => {
+      const sig = m.epistemic_signal ? `<span class="comms-signal signal-${m.epistemic_signal}">${m.epistemic_signal}</span>` : '';
+      return `<div class="comms-msg"><span class="comms-sender">${m.sender || '?'}</span>${sig}<br>${(m.content || '').slice(0, 120)}</div>`;
+    }).join('');
+  }
+
+  // Services (hardcoded names — would need a tool to query)
+  document.getElementById('services').innerHTML = [
+    'sovereign-sse (3434)', 'sovereign-bridge (8100)', 'cloudflared-tunnel',
+    'comms-listener', 'comms-dispatcher', 'dashboard (screen)'
+  ].map(s => `<div class="service"><span class="dot dot-green"></span>${s}</div>`).join('');
+
+  document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
