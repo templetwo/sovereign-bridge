@@ -82,7 +82,7 @@ def check_auth(authorization: str | None):
     if not BEARER_TOKEN:
         logger.warning("No BEARER_TOKEN configured — open access")
         return
-    if not authorization or not authorization.startswith("Bearer "):
+    if not authorization or not authorization.startswith("Bearer ") or len(authorization) < 39:
         logger.warning(f"Missing auth header. Got: {repr(authorization)[:50]}")
         raise HTTPException(status_code=401, detail="Missing Bearer token")
     received = authorization[7:]
