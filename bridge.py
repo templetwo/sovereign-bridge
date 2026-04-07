@@ -77,11 +77,18 @@ class CommsMessage(BaseModel):
 
 # === Auth ===
 def check_auth(authorization: str | None):
+    import logging
+    logger = logging.getLogger("auth-debug")
     if not BEARER_TOKEN:
+        logger.warning("No BEARER_TOKEN configured — open access")
         return
     if not authorization or not authorization.startswith("Bearer "):
+        logger.warning(f"Missing auth header. Got: {repr(authorization)[:50]}")
         raise HTTPException(status_code=401, detail="Missing Bearer token")
-    if authorization[7:] != BEARER_TOKEN:
+    received = authorization[7:]
+    if received != BEARER_TOKEN:
+        logger.warning(f"Token mismatch. Got: {received[:10]}... Expected: {BEARER_TOKEN[:10]}...")
+        logger.warning(f"Got len={len(received)} Expected len={len(BEARER_TOKEN)}")
         raise HTTPException(status_code=403, detail="Invalid token")
 
 
