@@ -27,6 +27,15 @@ from pydantic import BaseModel
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
 
+# Epistemic breathing — classify messages before delivery
+import sys
+sys.path.insert(0, os.path.expanduser("~/sovereign-stack/src"))
+try:
+    from sovereign_stack.epistemic_breathing import breathe_comms, classify_query
+    BREATHING_AVAILABLE = True
+except ImportError:
+    BREATHING_AVAILABLE = False
+
 # === Config ===
 MCP_SSE_URL = os.getenv("MCP_SSE_URL", "http://127.0.0.1:3434/sse")
 BRIDGE_PORT = int(os.getenv("BRIDGE_PORT", "8100"))
@@ -265,8 +274,16 @@ async def comms_send(
         "reply_to": msg.reply_to,
         "read_by": [],
     }
+    # Epistemic breathing — classify before storing
+    if BREATHING_AVAILABLE:
+        message = breathe_comms(message)
+
     _write_message(msg.channel, message)
-    return {"ok": True, "id": message["id"], "channel": msg.channel, "timestamp": message["iso"]}
+    result = {"ok": True, "id": message["id"], "channel": msg.channel, "timestamp": message["iso"]}
+    if message.get("epistemic_signal"):
+        result["epistemic_signal"] = message["epistemic_signal"]
+        result["hold"] = message.get("hold", False)
+    return result
 
 
 @app.get("/api/comms/read")
