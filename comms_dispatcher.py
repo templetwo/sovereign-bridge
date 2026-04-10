@@ -69,7 +69,7 @@ def parse_action(message):
         return {"action": "write_code", "args": {"description": content}, "raw": content, "from": message.get("sender", "?")}
     if any(kw in cl for kw in ["run benchmark", "test", "evaluate"]):
         return {"action": "run_benchmark", "args": {"description": content}, "raw": content, "from": message.get("sender", "?")}
-    if any(kw in cl for kw in ["status", "how are things", "what's running"]):
+    if any(kw in cl for kw in ["how are things", "what's running"]):  # removed bare status — too broad
         return {"action": "check_status", "args": {}, "raw": content, "from": message.get("sender", "?")}
     return None
 
@@ -101,6 +101,10 @@ def main():
         try:
             messages = read_unread()
             for msg in messages:
+                # Skip messages from ourselves — prevents feedback loop
+                sender = msg.get("sender", "")
+                if sender == INSTANCE_ID or sender == "comms-dispatcher":
+                    continue
                 action = parse_action(msg)
                 if action is None:
                     log.info(f"Message from {msg.get('sender','?')}: {msg.get('content','')[:60]} (no action)")
