@@ -36,6 +36,15 @@ try:
 except ImportError:
     BREATHING_AVAILABLE = False
 
+# Shared comms read surface — single source of truth across bridge REST
+# and the MCP tool registry. Fixes the silent partial-success pagination
+# bug opus-4-7-web flagged from the iPhone-app side of the door (2026-04-19).
+try:
+    from sovereign_stack import comms as stack_comms
+    STACK_COMMS_AVAILABLE = True
+except ImportError:
+    STACK_COMMS_AVAILABLE = False
+
 # === Config ===
 MCP_SSE_URL = os.getenv("MCP_SSE_URL", "http://127.0.0.1:3434/sse")
 BRIDGE_PORT = int(os.getenv("BRIDGE_PORT", "8100"))
@@ -353,13 +362,40 @@ async def comms_send(
 async def comms_read(
     authorization: str | None = Header(default=None),
     channel: str = Query(default="general"),
-    since: float = Query(default=0),
-    limit: int = Query(default=50, le=200),
+    since: str = Query(default="", description="Lower time bound (exclusive). Epoch or ISO8601."),
+    until: str = Query(default="", description="Upper time bound (exclusive). Epoch or ISO8601."),
+    order: str = Query(default="desc", pattern="^(asc|desc)$"),
+    limit: int = Query(default=50, le=2000),
+    offset: int = Query(default=0, ge=0),
+    unread_for: str = Query(default="", description="If set, return only messages this instance hasn't read_by-tagged."),
     mark_read_as: str = Query(default=""),
 ):
-    """Read messages. Optionally mark as read by an instance."""
+    """
+    Read messages with real pagination.
+
+    Fixes the silent partial-success bug: `offset`, `order`, and `unread_for`
+    are honored now; limit can reach 2000; `since`/`until` accept both epoch
+    and ISO8601.
+
+    Backward-compat: omitting all new params gives the previous default
+    behavior of "most recent 50 in channel" (order=desc, limit=50, offset=0).
+    """
     check_auth(authorization)
-    messages = _read_channel(channel, since=since, limit=limit)
+
+    if STACK_COMMS_AVAILABLE:
+        messages = stack_comms.read_channel(
+            channel=channel,
+            since=since or None,
+            until=until or None,
+            order=order,
+            limit=limit,
+            offset=offset,
+            unread_for=unread_for or None,
+        )
+    else:
+        # Fallback to the local in-bridge implementation (legacy behavior).
+        since_float = float(since) if since else 0
+        messages = _read_channel(channel, since=since_float, limit=limit)
 
     if mark_read_as and messages:
         path = _channel_path(channel)
@@ -379,6 +415,40 @@ async def comms_read(
         path.write_text("\n".join(updated) + "\n")
 
     return {"channel": channel, "messages": messages, "count": len(messages)}
+
+
+@app.get("/api/comms/unread_for")
+async def comms_unread_for(
+    authorization: str | None = Header(default=None),
+    instance_id: str = Query(..., description="Your instance identifier."),
+    channel: str = Query(default="general"),
+    limit: int = Query(default=50, le=2000),
+    order: str = Query(default="asc", pattern="^(asc|desc)$"),
+):
+    """
+    Return actual message bodies (not just counts) that instance_id has not
+    yet read_by-tagged. Complements /api/comms/unread. Default order is asc
+    so the caller catches up in the order things were said.
+
+    Requested by opus-4-7-web (2026-04-19) so any remote node — phone, web,
+    fresh session — can reach back into the conversation it missed.
+    """
+    check_auth(authorization)
+    if not STACK_COMMS_AVAILABLE:
+        raise HTTPException(status_code=503, detail="sovereign_stack.comms not available on bridge")
+    messages = stack_comms.unread_messages(
+        instance_id=instance_id,
+        channel=channel,
+        limit=limit,
+        order=order,
+    )
+    return {
+        "instance_id": instance_id,
+        "channel": channel,
+        "unread_count": stack_comms.count_unread(channel, instance_id),
+        "returned": len(messages),
+        "messages": messages,
+    }
 
 
 @app.get("/api/comms/channels")
