@@ -13,6 +13,7 @@ UNREAD=$(curl -s "$BRIDGE_URL/api/comms/unread?instance_id=$INSTANCE" \
   -H "Authorization: Bearer $TOKEN" 2>/dev/null)
 
 COUNT=$(echo "$UNREAD" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total',0))" 2>/dev/null)
+COUNT=${COUNT:-0}   # default to 0 when bridge is down or returns non-JSON
 
 if [ "$COUNT" -gt 0 ]; then
     # Fetch and log new messages
@@ -29,3 +30,9 @@ for m in d.get('messages', []):
 " >> "$INBOX" 2>/dev/null
     echo "" >> "$INBOX"
 fi
+
+# Heartbeat: always touch stdout so monitoring tools have a reliable
+# "last run" signal regardless of whether unread messages were found.
+# Without this the stdout log file's mtime never updates and the
+# connectivity manager's stale check fires false positives.
+echo "[$(date '+%Y-%m-%dT%H:%M:%SZ')] tick — count=$COUNT"
