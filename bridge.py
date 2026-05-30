@@ -110,6 +110,11 @@ def _record_legacy_caller(ua: str | None, ip: str | None, path: str | None, toke
             ledger = json.loads(LEGACY_LEDGER_FILE.read_text())
         except Exception:
             ledger = {"schema_version": 1, "legacy_token_prefix": token_prefix, "callers": {}}
+        # Always refresh the top-level legacy_token_prefix to reflect the
+        # current legacy bearer — LEGACY_BRIDGE_TOKEN cascades on rotation,
+        # so a file written under a previous rotation's prefix would stay
+        # stale across subsequent rotations without this update.
+        ledger["legacy_token_prefix"] = token_prefix
         callers = ledger.setdefault("callers", {})
         entry = callers.get(key)
         is_new = entry is None
@@ -119,6 +124,11 @@ def _record_legacy_caller(ua: str | None, ip: str | None, path: str | None, toke
                 "first_seen": now, "last_seen": now, "count": 0, "endpoints": {},
             }
             callers[key] = entry
+        # Always refresh per-entry token_prefix so the field shows the most
+        # recent prefix this caller hit with, not the first one. Important
+        # when a caller migrates from one legacy prefix to another across
+        # successive rotations.
+        entry["token_prefix"] = token_prefix
         entry["last_seen"] = now
         entry["count"] += 1
         if path:
