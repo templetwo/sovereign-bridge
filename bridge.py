@@ -65,7 +65,7 @@ COMMS_DIR = Path(os.path.expanduser("~/.sovereign/comms"))
 COMMS_DIR.mkdir(parents=True, exist_ok=True)
 SIGNAL_DIR = Path(os.path.expanduser("~/.sovereign/signals"))
 SIGNAL_DIR.mkdir(parents=True, exist_ok=True)
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 
 # Load bearer token
 TOKEN_FILE = Path(os.path.expanduser("~/.config/sovereign-bridge.env"))
