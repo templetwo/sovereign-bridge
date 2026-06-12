@@ -83,6 +83,10 @@ if not BEARER_TOKEN:
 if not LEGACY_BEARER_TOKEN:
     LEGACY_BEARER_TOKEN = os.getenv("LEGACY_BRIDGE_TOKEN", "") or None
 
+# The SSE server gates GET /sse on this same token (feat/sse-native-gate,
+# 2026-06-12) — present it on every upstream MCP connect.
+_MCP_SSE_HEADERS = {"Authorization": f"Bearer {BEARER_TOKEN}"} if BEARER_TOKEN else None
+
 # Caller context — captured per request by middleware so check_auth can
 # log User-Agent + source IP on legacy-token use without changing every
 # route signature. Remove with the legacy-token grace window.
@@ -233,7 +237,7 @@ def check_auth(authorization: str | None):
 # === MCP Client ===
 async def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
     try:
-        async with sse_client(MCP_SSE_URL) as (read, write):
+        async with sse_client(MCP_SSE_URL, headers=_MCP_SSE_HEADERS) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.call_tool(tool_name, arguments=arguments)
@@ -251,7 +255,7 @@ async def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
 async def call_mcp_tools_batch(calls: list[ToolCall]) -> list[dict]:
     results = []
     try:
-        async with sse_client(MCP_SSE_URL) as (read, write):
+        async with sse_client(MCP_SSE_URL, headers=_MCP_SSE_HEADERS) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 for call in calls:
@@ -274,7 +278,7 @@ async def call_mcp_tools_batch(calls: list[ToolCall]) -> list[dict]:
 
 async def get_tool_count() -> int:
     try:
-        async with sse_client(MCP_SSE_URL) as (read, write):
+        async with sse_client(MCP_SSE_URL, headers=_MCP_SSE_HEADERS) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = await session.list_tools()
@@ -497,7 +501,7 @@ async def batch_call(
 async def list_tools(authorization: str | None = Header(default=None)):
     check_auth(authorization)
     try:
-        async with sse_client(MCP_SSE_URL) as (read, write):
+        async with sse_client(MCP_SSE_URL, headers=_MCP_SSE_HEADERS) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = await session.list_tools()
