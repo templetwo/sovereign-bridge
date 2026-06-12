@@ -70,101 +70,60 @@ VERSION = "1.6.1"
 # Load bearer token
 TOKEN_FILE = Path(os.path.expanduser("~/.config/sovereign-bridge.env"))
 BEARER_TOKEN = None
-LEGACY_BEARER_TOKEN = None
 if TOKEN_FILE.exists():
     for line in TOKEN_FILE.read_text().splitlines():
         if line.startswith("BRIDGE_TOKEN="):
             BEARER_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
-        elif line.startswith("LEGACY_BRIDGE_TOKEN="):
-            LEGACY_BEARER_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
 
 if not BEARER_TOKEN:
     BEARER_TOKEN = os.getenv("BRIDGE_TOKEN", "")
-if not LEGACY_BEARER_TOKEN:
-    LEGACY_BEARER_TOKEN = os.getenv("LEGACY_BRIDGE_TOKEN", "") or None
+
+# Legacy-token grace window CLOSED 2026-06-12. Opened 2026-05-10; last legacy
+# hit 2026-05-30; Anthony chose loud-break for unmigrated callers (Path B,
+# chronicle 2026-05-30). The forensic ledger at ~/.sovereign/security/
+# legacy_callers.json stays readable via GET /api/security/legacy-callers.
 
 # The SSE server gates GET /sse on this same token (feat/sse-native-gate,
 # 2026-06-12) — present it on every upstream MCP connect.
 _MCP_SSE_HEADERS = {"Authorization": f"Bearer {BEARER_TOKEN}"} if BEARER_TOKEN else None
 
-# Caller context — captured per request by middleware so check_auth can
-# log User-Agent + source IP on legacy-token use without changing every
-# route signature. Remove with the legacy-token grace window.
+# Caller context — captured per request by middleware for auth logging and
+# the public-traffic rate limiter.
 _caller_ua: ContextVar[str | None] = ContextVar("caller_ua", default=None)
 _caller_ip: ContextVar[str | None] = ContextVar("caller_ip", default=None)
 _caller_path: ContextVar[str | None] = ContextVar("caller_path", default=None)
 
-# Legacy-token forensic ledger + Guardian feed. Deduplicated by (UA, IP);
-# Guardian ingests via its standard chronicle sweep (security,guardian,*).
+# Forensic ledger written during the legacy-token grace window (2026-05-10 →
+# 2026-06-12). Read-only now; served by GET /api/security/legacy-callers.
 import threading
-LEGACY_LEDGER_DIR = Path(os.path.expanduser("~/.sovereign/security"))
-LEGACY_LEDGER_DIR.mkdir(parents=True, exist_ok=True)
-LEGACY_LEDGER_FILE = LEGACY_LEDGER_DIR / "legacy_callers.json"
-GUARDIAN_FEED_DIR = Path(os.path.expanduser(
-    "~/.sovereign/chronicle/insights/security,guardian,legacy-token"
-))
-_legacy_lock = threading.Lock()
+LEGACY_LEDGER_FILE = Path(os.path.expanduser("~/.sovereign/security/legacy_callers.json"))
+
+# === Rate limiting (public traffic only) ===
+# Token bucket keyed on CF-Connecting-IP. Requests WITHOUT that header came
+# from this machine (local daemons, HQ seats) — never throttled. Everything
+# arriving through the Cloudflare tunnel carries it.
+_RATE_BURST = float(os.getenv("BRIDGE_RATE_BURST", "60"))
+_RATE_REFILL_PER_SEC = float(os.getenv("BRIDGE_RATE_PER_MIN", "120")) / 60.0
+_rate_buckets: dict[str, tuple[float, float]] = {}
+_rate_lock = threading.Lock()
 
 
-def _record_legacy_caller(ua: str | None, ip: str | None, path: str | None, token_prefix: str) -> None:
-    key = f"{ua or '?'}|{ip or '?'}"
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    with _legacy_lock:
-        try:
-            ledger = json.loads(LEGACY_LEDGER_FILE.read_text())
-        except Exception:
-            ledger = {"schema_version": 1, "legacy_token_prefix": token_prefix, "callers": {}}
-        # Always refresh the top-level legacy_token_prefix to reflect the
-        # current legacy bearer — LEGACY_BRIDGE_TOKEN cascades on rotation,
-        # so a file written under a previous rotation's prefix would stay
-        # stale across subsequent rotations without this update.
-        ledger["legacy_token_prefix"] = token_prefix
-        callers = ledger.setdefault("callers", {})
-        entry = callers.get(key)
-        is_new = entry is None
-        if is_new:
-            entry = {
-                "ua": ua, "ip": ip, "token_prefix": token_prefix,
-                "first_seen": now, "last_seen": now, "count": 0, "endpoints": {},
-            }
-            callers[key] = entry
-        # Always refresh per-entry token_prefix so the field shows the most
-        # recent prefix this caller hit with, not the first one. Important
-        # when a caller migrates from one legacy prefix to another across
-        # successive rotations.
-        entry["token_prefix"] = token_prefix
-        entry["last_seen"] = now
-        entry["count"] += 1
-        if path:
-            entry["endpoints"][path] = entry["endpoints"].get(path, 0) + 1
-        tmp = LEGACY_LEDGER_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(ledger, indent=2))
-        tmp.replace(LEGACY_LEDGER_FILE)
-        if is_new:
-            GUARDIAN_FEED_DIR.mkdir(parents=True, exist_ok=True)
-            feed_file = GUARDIAN_FEED_DIR / f"legacy-token-{time.strftime('%Y%m')}.jsonl"
-            insight = {
-                "timestamp": now,
-                "domain": "security,guardian,legacy-token",
-                "content": (
-                    f"Pre-rotation bearer (prefix {token_prefix}) used by "
-                    f"ua={ua!r} from ip={ip!r} on {path}. Caller has not been "
-                    f"updated since the bridge token rotation. Likely candidates: "
-                    f"claude.ai Connector, OpenAI Action, xAI Grok integration, or "
-                    f"a custom GCP-hosted agent. Identify and migrate to the new "
-                    f"bearer; remove LEGACY_BRIDGE_TOKEN from the bridge env when "
-                    f"all callers are migrated."
-                ),
-                "intensity": 0.6,
-                "layer": "ground_truth",
-                "session_id": "bridge_legacy_token_grace",
-                "metadata": {
-                    "ua": ua, "ip": ip, "endpoint": path,
-                    "token_prefix": token_prefix, "first_seen": now,
-                },
-            }
-            with open(feed_file, "a") as f:
-                f.write(json.dumps(insight) + "\n")
+def _rate_limit_ok(ip: str) -> bool:
+    """Consume one token from ip's bucket. True if the request may proceed."""
+    now = time.monotonic()
+    with _rate_lock:
+        if len(_rate_buckets) > 10000:
+            # Bound memory under address churn: drop buckets idle > 10 min.
+            stale = [k for k, (_, last) in _rate_buckets.items() if now - last > 600]
+            for k in stale:
+                del _rate_buckets[k]
+        tokens, last = _rate_buckets.get(ip, (_RATE_BURST, now))
+        tokens = min(_RATE_BURST, tokens + (now - last) * _RATE_REFILL_PER_SEC)
+        if tokens >= 1.0:
+            _rate_buckets[ip] = (tokens - 1.0, now)
+            return True
+        _rate_buckets[ip] = (tokens, now)
+        return False
 
 
 # === Models ===
@@ -192,8 +151,12 @@ def check_auth(authorization: str | None):
     import logging
     logger = logging.getLogger("auth-debug")
     if not BEARER_TOKEN:
-        logger.warning("No BEARER_TOKEN configured — open access")
-        return
+        # Fail closed: a bridge with no configured token serves nothing.
+        logger.error("No BEARER_TOKEN configured — refusing all authenticated routes")
+        raise HTTPException(
+            status_code=503,
+            detail="Bridge token not configured on the server. This is a server-side state, not a caller error.",
+        )
     if not authorization or not authorization.startswith("Bearer ") or len(authorization) < 39:
         logger.warning(f"Missing auth header. Got: {repr(authorization)[:50]}")
         raise HTTPException(
@@ -209,20 +172,9 @@ def check_auth(authorization: str | None):
     received = authorization[7:]
     if hmac.compare_digest(received.encode(), BEARER_TOKEN.encode()):
         return
-    if LEGACY_BEARER_TOKEN and hmac.compare_digest(received.encode(), LEGACY_BEARER_TOKEN.encode()):
-        ua, ip, path = _caller_ua.get(), _caller_ip.get(), _caller_path.get()
-        logger.warning(
-            f"LEGACY-TOKEN-USED ip={ip!r} ua={ua!r} path={path!r} "
-            f"token_prefix={received[:10]} — caller still has the pre-rotation "
-            f"bearer; identify and update before the legacy grace window ends"
-        )
-        try:
-            _record_legacy_caller(ua, ip, path, received[:10])
-        except Exception as e:
-            logger.warning(f"legacy-ledger write failed: {e!r}")
-        return
-    logger.warning(f"Token mismatch. Got: {received[:10]}...")
-    logger.warning(f"Got len={len(received)} Expected len={len(BEARER_TOKEN)}")
+    logger.warning(
+        f"Token mismatch from ip={_caller_ip.get()!r} prefix={received[:10]}..."
+    )
     raise HTTPException(
         status_code=403,
         detail=(
@@ -351,6 +303,19 @@ async def _capture_caller(request: Request, call_next):
     _caller_ua.set(request.headers.get("user-agent"))
     _caller_ip.set(request.client.host if request.client else None)
     _caller_path.set(f"{request.method} {request.url.path}")
+    # Rate-limit public traffic only: CF-Connecting-IP is present iff the
+    # request arrived through the Cloudflare tunnel. Local daemons are exempt.
+    cf_ip = request.headers.get("cf-connecting-ip")
+    if cf_ip and not _rate_limit_ok(cf_ip):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "Too Many Requests",
+                "detail": "Per-IP rate limit exceeded. Back off and retry.",
+            },
+            headers={"Retry-After": "30"},
+        )
     return await call_next(request)
 
 
@@ -516,22 +481,18 @@ async def list_tools(authorization: str | None = Header(default=None)):
 
 @app.get("/api/security/legacy-callers")
 async def legacy_callers(authorization: str | None = Header(default=None)):
-    """Forensic ledger of callers still using the pre-rotation bearer.
-    Auth requires the *current* bearer (legacy bearer is rejected here even
-    while the grace window is open). Remove with the grace window."""
+    """Forensic ledger from the legacy-token grace window (closed 2026-06-12).
+    Read-only historical record; the bridge no longer accepts any legacy bearer."""
     check_auth(authorization)
-    if authorization and authorization.startswith("Bearer ") and \
-            LEGACY_BEARER_TOKEN and hmac.compare_digest(authorization[7:].encode(), LEGACY_BEARER_TOKEN.encode()):
-        raise HTTPException(status_code=403, detail="legacy bearer not accepted on this endpoint")
     if not LEGACY_LEDGER_FILE.exists():
         return {"schema_version": 1, "callers": {}, "count": 0,
-                "grace_window_active": bool(LEGACY_BEARER_TOKEN)}
+                "grace_window_active": False}
     try:
         ledger = json.loads(LEGACY_LEDGER_FILE.read_text())
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"ledger read failed: {e!r}")
     ledger["count"] = len(ledger.get("callers", {}))
-    ledger["grace_window_active"] = bool(LEGACY_BEARER_TOKEN)
+    ledger["grace_window_active"] = False
     return ledger
 
 
