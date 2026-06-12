@@ -23,7 +23,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.StreamHandler(),
+        # FileHandler only: launchd already routes stderr to dispatcher.err,
+        # so a StreamHandler here duplicated every record into a byte-identical
+        # second 12MB file (root-caused 2026-06-12). dispatcher.err now carries
+        # genuine crash tracebacks only.
         logging.FileHandler(SOVEREIGN_DIR / "dispatcher.log"),
     ]
 )
