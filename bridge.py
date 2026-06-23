@@ -65,7 +65,14 @@ COMMS_DIR = Path(os.path.expanduser("~/.sovereign/comms"))
 COMMS_DIR.mkdir(parents=True, exist_ok=True)
 SIGNAL_DIR = Path(os.path.expanduser("~/.sovereign/signals"))
 SIGNAL_DIR.mkdir(parents=True, exist_ok=True)
-VERSION = "1.7.2"
+# Derive the reported version from the stack itself, so the heartbeat (the
+# canonical "live version" signal callers trust) tracks the stack release
+# automatically instead of drifting behind a hand-bumped constant. The bridge
+# runs in the stack venv with ~/sovereign-stack/src on sys.path (above).
+try:
+    from sovereign_stack import __version__ as VERSION
+except Exception:
+    VERSION = "unknown"
 
 # Load bearer token
 TOKEN_FILE = Path(os.path.expanduser("~/.config/sovereign-bridge.env"))
