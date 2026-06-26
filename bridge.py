@@ -28,8 +28,10 @@ import asyncio
 import hmac
 import json
 import os
+import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
@@ -342,8 +344,115 @@ def _count_unread(channel: str, instance_id: str) -> int:
     return count
 
 
+# === Clock-trust self-attestation ===========================================
+# The heartbeat is the one place an arriving instance reads the current
+# datetime, so it must SELF-ATTEST that the host clock is synced rather than
+# merely asserting "verified". A background daemon probes an NTP server
+# READ-ONLY (sntp query, NO -s/-S — it never sets the clock) every
+# CLOCK_PROBE_INTERVAL seconds and caches the measured offset. heartbeat()
+# reads this cache ONLY; it never runs sntp in the request path. On any probe
+# failure (egress down, timeout, parse miss) the cache is LEFT AS-IS — a stale
+# or empty cache maps to clock_synced="unknown", NEVER to a false "drift".
+CLOCK_PROBE_INTERVAL = 600  # seconds between probes
+CLOCK_PROBE_TIMEOUT = 6.0   # per-attempt wall budget (sntp -t 5 + overhead)
+SNTP_BIN = "/usr/bin/sntp"  # absolute: launchd PATH is minimal
+NTP_SERVERS = ("time.apple.com", "pool.ntp.org", "time.cloudflare.com")
+# Bound the upstream MCP list_tools() call inside heartbeat. Module-level so a
+# test can shrink it (monkeypatch) to drive the timeout->degraded path fast.
+HEARTBEAT_TOOL_TIMEOUT = 5.0
+
+CLOCK_PROBE: dict[str, Any] = {
+    "drift_seconds": None,
+    "drift_uncertainty": None,
+    "drift_measured_at": None,
+    "drift_source": None,
+}
+
+# sntp prints e.g. "+0.039766 +/- 0.006780 time.apple.com 2620:149:a33::21"
+_SNTP_LINE = re.compile(r"^\s*([+-]?\d+\.\d+)\s+\+/-\s+(\d+\.\d+)")
+
+
+def _parse_sntp(text: str) -> tuple[float, float] | None:
+    """First line matching the '<offset> +/- <uncertainty>' shape wins.
+    Returns (offset_seconds_signed, uncertainty_seconds) or None on no match."""
+    for line in text.splitlines():
+        m = _SNTP_LINE.match(line)
+        if m:
+            try:
+                return float(m.group(1)), float(m.group(2))
+            except ValueError:
+                continue
+    return None
+
+
+async def _probe_one(server: str) -> tuple[float, float] | None:
+    """Query one NTP server READ-ONLY via sntp. Captures BOTH stdout+stderr and
+    parses the combined text (stream placement varies across sntp builds). Kills
+    the subprocess on timeout so no zombie lingers. None on any failure."""
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            SNTP_BIN, "-t", "5", server,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=CLOCK_PROBE_TIMEOUT)
+        combined = (out or b"").decode("utf-8", "replace") + "\n" + (err or b"").decode("utf-8", "replace")
+        return _parse_sntp(combined)
+    except (asyncio.TimeoutError, FileNotFoundError, Exception):
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+        return None
+
+
+async def _run_clock_probe() -> bool:
+    """One probe pass: try each NTP server in order, write CLOCK_PROBE only on a
+    successful parse. On total failure LEAVE the cache untouched (never a false
+    reading). Returns True if the cache was updated."""
+    for server in NTP_SERVERS:
+        parsed = await _probe_one(server)
+        if parsed is not None:
+            offset, uncertainty = parsed
+            CLOCK_PROBE["drift_seconds"] = offset
+            CLOCK_PROBE["drift_uncertainty"] = uncertainty
+            CLOCK_PROBE["drift_measured_at"] = datetime.now(timezone.utc).isoformat()
+            CLOCK_PROBE["drift_source"] = server
+            return True
+    return False
+
+
+async def _clock_probe_loop() -> None:
+    """Probe immediately, then every CLOCK_PROBE_INTERVAL seconds. Never raises
+    out — a probe failure just leaves the cache and waits for the next cycle."""
+    while True:
+        try:
+            await _run_clock_probe()
+        except Exception:
+            pass
+        await asyncio.sleep(CLOCK_PROBE_INTERVAL)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Start the read-only clock-drift probe daemon. It runs the first probe
+    # itself (probe-then-sleep), so startup is NOT delayed waiting on sntp.
+    task = asyncio.create_task(_clock_probe_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
 # === App ===
-app = FastAPI(title="Sovereign Bridge", version=VERSION)
+app = FastAPI(title="Sovereign Bridge", version=VERSION, lifespan=lifespan)
 
 
 @app.exception_handler(HTTPException)
@@ -360,6 +469,26 @@ async def _http_exc_handler(request: Request, exc: HTTPException):
     from fastapi.responses import JSONResponse
 
     return JSONResponse(status_code=code, content={"detail": exc.detail, "failure_class": fclass})
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exc_handler(request: Request, exc: Exception):
+    # Last-resort net: even an unanticipated raise must yield a TIMESTAMPED
+    # body, so an arriving instance that hits a 500 still gets a trustworthy
+    # current datetime instead of an opaque error. server_time_utc is computed
+    # fresh here (independent of any request-path state).
+    from fastapi.responses import JSONResponse
+
+    now = datetime.now(timezone.utc)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": str(exc),
+            "failure_class": "internal",
+            "timestamp": now.timestamp(),
+            "server_time_utc": now.isoformat(),
+        },
+    )
 
 
 @app.middleware("http")
@@ -409,6 +538,7 @@ async def discover():
     reflect the actual current essential tier and boot ritual — the
     earlier version pointed at session_handoff + self_model as the entry
     pair, which has since been superseded by where_did_i_leave_off."""
+    now = datetime.now(timezone.utc)
     return {
         "name": "Sovereign Stack",
         "version": VERSION,
@@ -427,8 +557,8 @@ async def discover():
             "those numbers."
         ),
         "auth": "Bearer token in Authorization header. GET /api/heartbeat and GET /api/discover need no auth.",
-        "server_time_utc": datetime.now(timezone.utc).isoformat(),
-        "time_note": "verified server clock — never assume the current date/time; read it here or from /api/heartbeat",
+        "server_time_utc": now.isoformat(),
+        "time_note": "server host clock (UTC); see clock_synced / drift_seconds on /api/heartbeat for sync trust — do not assume the current date/time, read it here or from /api/heartbeat",
         "endpoints": {
             "call": {
                 "method": "POST",
@@ -487,22 +617,75 @@ async def discover():
 
 @app.get("/api/heartbeat")
 async def heartbeat():
-    """Liveness check, no auth. The shape an arriving instance hits first."""
-    tool_count = await get_tool_count()
-    # Quick unread count across all channels (informational; chronicle is
-    # the primary correspondence layer post-v1.3.3 distillation).
+    """Liveness check, no auth. The shape an arriving instance hits first.
+
+    Datetime delivery is bulletproof: `now` is read ONCE, FIRST, before any
+    fragile/awaited code, and both time fields derive from it (atomic single
+    read). The upstream tool-count call is bounded; the comms scan is guarded;
+    an unanticipated raise still hits the global Exception handler, which emits
+    its own fresh server_time_utc. So a caller ALWAYS gets a trustworthy clock.
+    """
+    # P0.1 — single atomic clock read, FIRST, before anything that can fail.
+    now = datetime.now(timezone.utc)
+
+    # P0.3 — bound the upstream MCP call. Timeout/error => -1 => degraded path,
+    # but the handler still reaches its return with the datetime intact.
+    try:
+        tool_count = await asyncio.wait_for(get_tool_count(), timeout=HEARTBEAT_TOOL_TIMEOUT)
+    except Exception:
+        tool_count = -1
+
+    # P0.2 — quick unread count across channels (informational). Guard EACH
+    # file read: a missing/corrupt/non-UTF8/permission failure must not sink
+    # the handler. Any failed file => comms_messages sentinel -1.
     total_messages = 0
+    comms_failed = False
     for f in COMMS_DIR.glob("*.jsonl"):
-        total_messages += sum(1 for line in f.read_text().splitlines() if line.strip())
+        try:
+            total_messages += sum(1 for line in f.read_text().splitlines() if line.strip())
+        except Exception:
+            comms_failed = True
+            continue
+    if comms_failed:
+        total_messages = -1
+
     healthy = tool_count > 0
+
+    # P1.7 — clock-trust self-attestation. Read the CLOCK_PROBE cache ONLY;
+    # never run sntp in-request. Three-state clock_synced:
+    #   True     -> probe fresh AND |drift| < 0.25s
+    #   False    -> probe fresh AND |drift| >= 0.25s
+    #   "unknown"-> cache empty OR stale (age > 2x interval) OR egress was down
+    # CRITICAL: empty/stale/egress-down => "unknown", NEVER False (a failed
+    # probe is not evidence of real drift).
+    measured_at = CLOCK_PROBE.get("drift_measured_at")
+    drift_seconds = CLOCK_PROBE.get("drift_seconds")
+    probe_age = None
+    if measured_at:
+        try:
+            probe_age = (now - datetime.fromisoformat(measured_at)).total_seconds()
+        except Exception:
+            probe_age = None
+    fresh = probe_age is not None and probe_age <= 2 * CLOCK_PROBE_INTERVAL
+    if not fresh or drift_seconds is None:
+        clock_synced: bool | str = "unknown"
+    elif abs(drift_seconds) < 0.25:
+        clock_synced = True
+    else:
+        clock_synced = False
+
     return {
         "status": "ok" if healthy else "degraded",
         "version": VERSION,
         "tools": tool_count,
         "comms_messages": total_messages,
-        "timestamp": time.time(),
-        "server_time_utc": datetime.now(timezone.utc).isoformat(),
-        "datetime_note": "verified server clock — do not assume the current date/time, read it here",
+        "timestamp": now.timestamp(),
+        "server_time_utc": now.isoformat(),
+        "datetime_note": "server host clock (UTC); see clock_synced / drift_seconds for sync trust — do not assume the current date/time, read it here",
+        "clock_synced": clock_synced,
+        "drift_seconds": drift_seconds,
+        "drift_measured_at": measured_at,
+        "clock_probe_age_seconds": probe_age,
         "welcome": (
             "You are through. The stack is alive."
             if healthy
