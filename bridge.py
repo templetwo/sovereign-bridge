@@ -31,6 +31,7 @@ import os
 import time
 import uuid
 from contextvars import ContextVar
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -426,11 +427,24 @@ async def discover():
             "those numbers."
         ),
         "auth": "Bearer token in Authorization header. GET /api/heartbeat and GET /api/discover need no auth.",
+        "server_time_utc": datetime.now(timezone.utc).isoformat(),
+        "time_note": "verified server clock — never assume the current date/time; read it here or from /api/heartbeat",
         "endpoints": {
-            "call": {"method": "POST", "path": "/api/call", "body": {"tool": "string", "arguments": "object"}, "auth": True},
+            "call": {
+                "method": "POST",
+                "path": "/api/call",
+                "body": {
+                    "tool": "string",
+                    "arguments": "object",
+                    "idempotency_key": "string, OPTIONAL — repeat the same key to retry a write safely; a replay returns idempotent_replay=true and does not re-execute",
+                    "validate_only": "bool, OPTIONAL — pre-flight shape check; returns {valid, problems[], would_call} and commits NOTHING",
+                },
+                "auth": True,
+                "on_error": "the response body carries failure_class: auth | malformed | stack | egress (no second call needed to disambiguate)",
+            },
             "batch": {"method": "POST", "path": "/api/batch", "body": {"calls": [{"tool": "string", "arguments": "object"}]}, "auth": True},
             "heartbeat": {"method": "GET", "path": "/api/heartbeat", "auth": False},
-            "tools": {"method": "GET", "path": "/api/tools", "auth": True},
+            "tools": {"method": "GET", "path": "/api/tools", "auth": True, "note": "each entry carries a compact signature {required, optional}; GET /api/tools?name=<tool> returns that tool's full description + complete inputSchema (types, enums, defaults) — read the schema instead of guessing args"},
             "comms_send": {"method": "POST", "path": "/api/comms/send", "body": {"sender": "string", "content": "string", "channel": "general"}, "auth": True, "note": "Demoted in v1.3.3 — chronicle won the correspondence layer race; prefer record_insight."},
             "comms_read": {"method": "GET", "path": "/api/comms/read?channel=general&limit=10", "auth": True, "note": "Demoted in v1.3.3."},
             "discover": {"method": "GET", "path": "/api/discover", "auth": False},
@@ -487,6 +501,8 @@ async def heartbeat():
         "tools": tool_count,
         "comms_messages": total_messages,
         "timestamp": time.time(),
+        "server_time_utc": datetime.now(timezone.utc).isoformat(),
+        "datetime_note": "verified server clock — do not assume the current date/time, read it here",
         "welcome": (
             "You are through. The stack is alive."
             if healthy
