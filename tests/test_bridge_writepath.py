@@ -106,6 +106,20 @@ def test_validate_only_reflection_flagged(client, monkeypatch):
     assert len(calls) == 0  # nothing committed
 
 
+def test_schema_signature():
+    s = {
+        "type": "object",
+        "properties": {"domain": {}, "content": {}, "layer": {}, "intensity": {}},
+        "required": ["domain", "content"],
+    }
+    assert bridge._schema_signature(s) == {
+        "required": ["domain", "content"],
+        "optional": ["layer", "intensity"],
+    }
+    assert bridge._schema_signature(None) is None
+    assert bridge._schema_signature({}) == {"required": [], "optional": []}
+
+
 def test_validate_only_valid_shape(client, monkeypatch):
     calls = []
     _mock_tool(monkeypatch, calls)

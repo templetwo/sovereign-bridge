@@ -562,19 +562,49 @@ async def batch_call(
     return {"results": results, "count": len(results), "duration_ms": round((time.time() - start) * 1000)}
 
 
+def _schema_signature(schema) -> dict | None:
+    """Compact, scannable signature from a JSON inputSchema: required vs optional
+    field names, so a caller sees what a tool needs AT A GLANCE without the full
+    schema. None when there's no usable schema."""
+    if not isinstance(schema, dict):
+        return None
+    props = list((schema.get("properties") or {}).keys())
+    required = list(schema.get("required") or [])
+    return {"required": required, "optional": [p for p in props if p not in required]}
+
+
 @app.get("/api/tools")
-async def list_tools(authorization: str | None = Header(default=None)):
+async def list_tools(name: str | None = None, authorization: str | None = Header(default=None)):
+    """List tools. Each entry carries a compact `signature` (required/optional
+    fields) so the schema is obvious at a glance. Pass ?name=<tool> to get that
+    one tool's full description + complete inputSchema (types, enums, defaults)."""
     check_auth(authorization)
     try:
         async with sse_client(MCP_SSE_URL, headers=_MCP_SSE_HEADERS) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                tools = await session.list_tools()
+                listed = await session.list_tools()
+                items = sorted(listed.tools, key=lambda x: x.name)
+                if name:
+                    match = next((t for t in items if t.name == name), None)
+                    if match is None:
+                        raise HTTPException(status_code=404, detail=f"unknown tool {name!r}")
+                    return {
+                        "name": match.name,
+                        "description": match.description or "",
+                        "inputSchema": getattr(match, "inputSchema", None),
+                    }
                 return {
-                    "tools": [{"name": t.name, "description": (t.description or "")[:200]}
-                              for t in sorted(tools.tools, key=lambda x: x.name)],
-                    "count": len(tools.tools),
+                    "tools": [{
+                        "name": t.name,
+                        "description": (t.description or "")[:200],
+                        "signature": _schema_signature(getattr(t, "inputSchema", None)),
+                    } for t in items],
+                    "count": len(items),
+                    "hint": "GET /api/tools?name=<tool> for that tool's full description + complete inputSchema",
                 }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
