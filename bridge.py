@@ -352,7 +352,7 @@ async def _http_exc_handler(request: Request, exc: HTTPException):
     code = exc.status_code
     if code in (401, 403):
         fclass = "auth"
-    elif code == 400:
+    elif code in (400, 404):
         fclass = "malformed"
     else:
         fclass = "stack"
@@ -579,34 +579,35 @@ async def list_tools(name: str | None = None, authorization: str | None = Header
     fields) so the schema is obvious at a glance. Pass ?name=<tool> to get that
     one tool's full description + complete inputSchema (types, enums, defaults)."""
     check_auth(authorization)
+    # Network fetch only inside the try/async-with; raising an HTTPException here
+    # would be wrapped by sse_client's anyio TaskGroup into an ExceptionGroup and
+    # masked as a 502, so the 404/shape handling happens AFTER the context exits.
     try:
         async with sse_client(MCP_SSE_URL, headers=_MCP_SSE_HEADERS) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 listed = await session.list_tools()
-                items = sorted(listed.tools, key=lambda x: x.name)
-                if name:
-                    match = next((t for t in items if t.name == name), None)
-                    if match is None:
-                        raise HTTPException(status_code=404, detail=f"unknown tool {name!r}")
-                    return {
-                        "name": match.name,
-                        "description": match.description or "",
-                        "inputSchema": getattr(match, "inputSchema", None),
-                    }
-                return {
-                    "tools": [{
-                        "name": t.name,
-                        "description": (t.description or "")[:200],
-                        "signature": _schema_signature(getattr(t, "inputSchema", None)),
-                    } for t in items],
-                    "count": len(items),
-                    "hint": "GET /api/tools?name=<tool> for that tool's full description + complete inputSchema",
-                }
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    items = sorted(listed.tools, key=lambda x: x.name)
+    if name:
+        match = next((t for t in items if t.name == name), None)
+        if match is None:
+            raise HTTPException(status_code=404, detail=f"unknown tool {name!r}")
+        return {
+            "name": match.name,
+            "description": match.description or "",
+            "inputSchema": getattr(match, "inputSchema", None),
+        }
+    return {
+        "tools": [{
+            "name": t.name,
+            "description": (t.description or "")[:200],
+            "signature": _schema_signature(getattr(t, "inputSchema", None)),
+        } for t in items],
+        "count": len(items),
+        "hint": "GET /api/tools?name=<tool> for that tool's full description + complete inputSchema",
+    }
 
 
 @app.get("/api/security/legacy-callers")
