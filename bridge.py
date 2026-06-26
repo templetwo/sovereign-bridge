@@ -137,6 +137,9 @@ def _rate_limit_ok(ip: str) -> bool:
 class ToolCall(BaseModel):
     tool: str
     arguments: dict[str, Any] = {}
+    # Opt-in write-path helpers (additive; absent => behavior unchanged).
+    idempotency_key: str | None = None  # repeated key replays cached result, never double-writes
+    validate_only: bool = False  # lightweight pre-flight shape check; commits nothing
 
 
 class BatchRequest(BaseModel):
@@ -194,6 +197,39 @@ def check_auth(authorization: str | None):
 
 
 # === MCP Client ===
+# === Idempotency cache (write-path #3) =======================================
+# File-backed, TTL-pruned. A repeated idempotency_key replays the cached success
+# instead of re-calling the tool, so a client that lost the response can retry
+# without double-writing. A corrupt/missing cache never breaks a call.
+_IDEM_PATH = Path(os.path.expanduser("~/.sovereign/bridge/idempotency.json"))
+_IDEM_TTL = 24 * 3600
+
+
+def _idem_load() -> dict:
+    try:
+        return json.loads(_IDEM_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _idem_get(key: str):
+    entry = _idem_load().get(key)
+    if entry and (time.time() - entry.get("ts", 0)) < _IDEM_TTL:
+        return entry.get("result")
+    return None
+
+
+def _idem_put(key: str, result: dict) -> None:
+    try:
+        now = time.time()
+        d = {k: v for k, v in _idem_load().items() if (now - v.get("ts", 0)) < _IDEM_TTL}
+        d[key] = {"result": result, "ts": now}
+        _IDEM_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _IDEM_PATH.write_text(json.dumps(d))
+    except Exception:
+        pass
+
+
 async def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
     try:
         async with sse_client(MCP_SSE_URL, headers=_MCP_SSE_HEADERS) as (read, write):
@@ -208,7 +244,11 @@ async def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
                         return {"ok": True, "result": text}
                 return {"ok": True, "result": None}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        msg = str(e)
+        low = msg.lower()
+        egress_signals = ("connect", "refused", "unreachable", "name resolution", "dns", "getaddrinfo")
+        fclass = "egress" if any(s in low for s in egress_signals) else "stack"
+        return {"ok": False, "error": msg, "failure_class": fclass}
 
 
 async def call_mcp_tools_batch(calls: list[ToolCall]) -> list[dict]:
@@ -303,6 +343,22 @@ def _count_unread(channel: str, instance_id: str) -> int:
 
 # === App ===
 app = FastAPI(title="Sovereign Bridge", version=VERSION)
+
+
+@app.exception_handler(HTTPException)
+async def _http_exc_handler(request: Request, exc: HTTPException):
+    # Failure-class (#7): a caller knows auth vs malformed vs stack without a
+    # second /api/heartbeat round-trip. Preserves the existing `detail`.
+    code = exc.status_code
+    if code in (401, 403):
+        fclass = "auth"
+    elif code == 400:
+        fclass = "malformed"
+    else:
+        fclass = "stack"
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(status_code=code, content={"detail": exc.detail, "failure_class": fclass})
 
 
 @app.middleware("http")
@@ -451,8 +507,45 @@ async def call_tool_endpoint(
 ):
     check_auth(authorization)
     start = time.time()
+
+    # validate_only (#5): lightweight, shape-only pre-flight; commits nothing.
+    if req.validate_only:
+        problems: list[str] = []
+        if not isinstance(req.tool, str) or not req.tool.strip():
+            problems.append("tool must be a non-empty string")
+        if not isinstance(req.arguments, dict):
+            problems.append("arguments must be an object")
+        if req.tool == "record_insight":
+            layer = (req.arguments or {}).get("layer")
+            if layer is not None and layer not in ("ground_truth", "hypothesis", "open_thread"):
+                if layer == "reflection":
+                    problems.append("layer 'reflection' is daemon-owned and will be rejected; use 'hypothesis'")
+                else:
+                    problems.append(f"layer {layer!r} invalid; use ground_truth | hypothesis | open_thread")
+        return {
+            "valid": not problems,
+            "problems": problems,
+            "would_call": req.tool,
+            "note": "shape-only pre-flight; deep checks (e.g. verified_by receipt resolvability) run at real write time",
+            "duration_ms": round((time.time() - start) * 1000),
+        }
+
+    # idempotency (#3): replay a cached success for a repeated key; never double-write.
+    if req.idempotency_key:
+        cached = _idem_get(req.idempotency_key)
+        if cached is not None:
+            replay = dict(cached)
+            replay["idempotent_replay"] = True
+            replay["duration_ms"] = round((time.time() - start) * 1000)
+            return replay
+
     result = await call_mcp_tool(req.tool, req.arguments)
+    if not result.get("ok") and "failure_class" not in result:
+        result["failure_class"] = "stack"  # (#7)
     result["duration_ms"] = round((time.time() - start) * 1000)
+
+    if req.idempotency_key and result.get("ok"):
+        _idem_put(req.idempotency_key, result)
     return result
 
 
