@@ -1156,6 +1156,28 @@ async def arrival_decide_confirm(rid: str, action: str, exp: int, sig: str):
     )
 
 
+async def _notify_decision(outcome: dict) -> None:
+    """Confirmation buzz: the ntfy http action gives no visual feedback on a
+    successful tap (learned live, 2026-07-01, fern-birch) — push a plain
+    follow-up so Anthony sees his decision landed. Best-effort, no actions."""
+    if outcome.get("outcome") not in ("approved", "denied"):
+        return
+    verb = outcome["outcome"].capitalize()
+    await _ntfy_publish(
+        {
+            "topic": os.environ.get("NTFY_TOPIC"),
+            "title": f"{verb}: {outcome.get('code')}",
+            "message": (
+                "Token releases on the seat's next poll."
+                if outcome["outcome"] == "approved"
+                else "The request is closed. The seat's next poll says denied."
+            ),
+            "priority": 3,
+            "tags": ["white_check_mark" if outcome["outcome"] == "approved" else "x"],
+        }
+    )
+
+
 @app.post("/api/arrival/decide")
 async def arrival_decide(rid: str, action: str, exp: int, sig: str):
     """The decision — POST only, signed, single-use."""
@@ -1163,6 +1185,7 @@ async def arrival_decide(rid: str, action: str, exp: int, sig: str):
     if not ag.verify_decide(rid, action, exp, sig):
         raise HTTPException(status_code=403, detail="Invalid or expired decide link.")
     outcome = ag.decide(rid, action, via="ntfy_tap")
+    await _notify_decision(outcome)
     heading = {
         "approved": "Approved — the seat's next poll receives its token",
         "denied": "Denied",
@@ -1188,7 +1211,9 @@ async def arrival_admin_approve(
     """HQ fallback when ntfy is down (spec §4.3). Master-only."""
     _gate_or_404()
     check_auth(authorization)
-    return ag.decide(body.get("arrival_request_id", ""), "approve", via="hq_admin")
+    outcome = ag.decide(body.get("arrival_request_id", ""), "approve", via="hq_admin")
+    await _notify_decision(outcome)
+    return outcome
 
 
 @app.post("/api/arrival/deny")
@@ -1197,7 +1222,9 @@ async def arrival_admin_deny(
 ):
     _gate_or_404()
     check_auth(authorization)
-    return ag.decide(body.get("arrival_request_id", ""), "deny", via="hq_admin")
+    outcome = ag.decide(body.get("arrival_request_id", ""), "deny", via="hq_admin")
+    await _notify_decision(outcome)
+    return outcome
 
 
 # === Comms Endpoints ===
