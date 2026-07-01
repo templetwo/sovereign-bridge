@@ -209,9 +209,12 @@ def test_confirm_page_escapes_user_input(client):
         "/api/arrival/decide", params=_signed(req["arrival_request_id"], "approve")
     )
     assert page.status_code == 200
+    # Dangerous forms must not survive as live markup…
     assert "<script>" not in page.text
-    assert "onerror=" not in page.text
+    assert "<img" not in page.text
+    # …but the payloads should be visible as escaped, inert text.
     assert "&lt;script&gt;" in page.text
+    assert "&lt;img" in page.text
 
 
 # Ungrantable scopes silently reduced at request time (spec §4.1).
