@@ -1126,27 +1126,32 @@ async def arrival_decide_confirm(rid: str, action: str, exp: int, sig: str):
     row = ag.get_request(rid)
     if row is None:
         raise HTTPException(status_code=404, detail="Unknown arrival request.")
+    # XSS guard: source_instance / seat_description arrive from the
+    # UNAUTHENTICATED request endpoint and render in the page Anthony opens
+    # from his phone — escape every interpolated field, no exceptions.
+    import html as _html
+
     if row["status"] != "pending":
         return HTMLResponse(
             ag.DECIDED_PAGE.format(
                 heading="Already decided",
-                code=row["code"],
-                detail=f"status: {row['status']}",
-                stamp=row.get("decided_at") or "",
+                code=_html.escape(row["code"]),
+                detail=_html.escape(f"status: {row['status']}"),
+                stamp=_html.escape(row.get("decided_at") or ""),
             )
         )
     return HTMLResponse(
         ag.CONFIRM_PAGE.format(
-            rid=rid,
-            action=action,
+            rid=_html.escape(rid),
+            action=_html.escape(action),
             exp=exp,
-            sig=sig,
-            code=row["code"],
-            source=row.get("source_instance") or "unknown instance",
-            seat=row.get("seat_description") or "no seat description",
-            scope="+".join(json.loads(row.get("granted_scope") or "[]")),
-            ttl=row.get("ttl_hours"),
-            label=action.capitalize(),
+            sig=_html.escape(sig),
+            code=_html.escape(row["code"]),
+            source=_html.escape(row.get("source_instance") or "unknown instance"),
+            seat=_html.escape(row.get("seat_description") or "no seat description"),
+            scope=_html.escape("+".join(json.loads(row.get("granted_scope") or "[]"))),
+            ttl=_html.escape(str(row.get("ttl_hours"))),
+            label=_html.escape(action.capitalize()),
         )
     )
 
@@ -1164,11 +1169,13 @@ async def arrival_decide(rid: str, action: str, exp: int, sig: str):
         "already_decided": "Already decided",
         "unknown_request": "Unknown request",
     }.get(outcome["outcome"], outcome["outcome"])
+    import html as _html
+
     return HTMLResponse(
         ag.DECIDED_PAGE.format(
-            heading=heading,
-            code=outcome.get("code") or "",
-            detail=f"outcome: {outcome['outcome']}",
+            heading=_html.escape(heading),
+            code=_html.escape(outcome.get("code") or ""),
+            detail=_html.escape(f"outcome: {outcome['outcome']}"),
             stamp=datetime.now(timezone.utc).isoformat(),
         )
     )

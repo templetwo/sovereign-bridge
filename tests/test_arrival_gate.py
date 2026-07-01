@@ -197,6 +197,23 @@ def test_decide_single_use(client):
     assert client.get(f"/api/arrival/poll/{rid}").json()["status"] == "approved"
 
 
+# XSS: attacker-controlled request fields must render escaped on the confirm
+# page Anthony opens from his phone.
+def test_confirm_page_escapes_user_input(client):
+    req = _request(
+        client,
+        source_instance='<script>alert(1)</script>',
+        seat_description='"><img src=x onerror=alert(2)>',
+    )
+    page = client.get(
+        "/api/arrival/decide", params=_signed(req["arrival_request_id"], "approve")
+    )
+    assert page.status_code == 200
+    assert "<script>" not in page.text
+    assert "onerror=" not in page.text
+    assert "&lt;script&gt;" in page.text
+
+
 # Ungrantable scopes silently reduced at request time (spec §4.1).
 def test_request_scope_clamped(client):
     req = _request(client, requested_scope=["read", "admin", "mint"])
