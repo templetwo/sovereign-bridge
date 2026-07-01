@@ -77,13 +77,27 @@ try:
 except Exception:
     VERSION = "unknown"
 
-# Load bearer token
+# Load bearer token (+ arrival-gate config from the same secret file — The
+# Door That Asks, Phase 2: ARRIVAL_DECIDE_SECRET / NTFY_TOPIC / NTFY_SERVER /
+# ARRIVAL_GATE_ENABLED / PUBLIC_BASE_URL are exported into the process env so
+# arrival_gate.py reads one source of truth).
 TOKEN_FILE = Path(os.path.expanduser("~/.config/sovereign-bridge.env"))
 BEARER_TOKEN = None
+_GATE_ENV_KEYS = (
+    "ARRIVAL_DECIDE_SECRET",
+    "ARRIVAL_GATE_ENABLED",
+    "NTFY_TOPIC",
+    "NTFY_SERVER",
+    "PUBLIC_BASE_URL",
+)
 if TOKEN_FILE.exists():
     for line in TOKEN_FILE.read_text().splitlines():
         if line.startswith("BRIDGE_TOKEN="):
             BEARER_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
+        else:
+            for key in _GATE_ENV_KEYS:
+                if line.startswith(f"{key}=") and not os.environ.get(key):
+                    os.environ[key] = line.split("=", 1)[1].strip().strip('"').strip("'")
 
 if not BEARER_TOKEN:
     BEARER_TOKEN = os.getenv("BRIDGE_TOKEN", "")
@@ -736,12 +750,27 @@ async def heartbeat():
             if healthy
             else "Stack reachable but degraded — check launchctl on HQ."
         ),
+        "arrival_gate": _heartbeat_gate_enabled(),
         "next": {
             "first_call": "POST /api/call with tool=where_did_i_leave_off (no arguments needed)",
             "if_first_visit": "POST /api/call with tool=start_here for a 5-minute orientation",
+            "if_no_token": (
+                "POST /api/arrival/request — consent-gated arrival: you get a human "
+                "code, Anthony's phone gets the same code, he taps approve, your "
+                "poll returns a short-lived scoped token. See /api/discover."
+            ),
             "doc": "GET /api/discover for the full self-describing entry-point doc",
         },
     }
+
+
+def _heartbeat_gate_enabled() -> bool:
+    try:
+        import arrival_gate as _ag
+
+        return _ag.gate_enabled()
+    except Exception:
+        return False
 
 
 @app.post("/api/call")
@@ -966,6 +995,202 @@ async def admin_list_tokens(
     check_auth(authorization)  # master-only
     tokens = st.list_tokens(include_dead=include_dead)
     return {"tokens": tokens, "count": len(tokens)}
+
+
+# === Arrival gate (The Door That Asks, Phase 2) =============================
+# Consent-gated arrival: request → ntfy push to Anthony's phone → decision
+# is ALWAYS a POST (review correction #1) → poll releases a scoped session
+# token exactly once. All routes 404 when the gate is disabled or the decide
+# secret is missing (fail-closed).
+
+import arrival_gate as ag
+from fastapi.responses import HTMLResponse, JSONResponse
+
+
+class ArrivalRequest(BaseModel):
+    source_instance: Optional[str] = None
+    seat_description: Optional[str] = None
+    requested_scope: list[str] = ["read"]
+    requested_ttl_hours: int = st.TTL_DEFAULT_HOURS
+
+
+def _gate_or_404():
+    if not ag.gate_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+def _public_base() -> str:
+    return (os.environ.get("PUBLIC_BASE_URL") or "https://stack.templetwo.com").rstrip("/")
+
+
+async def _ntfy_publish(payload: dict) -> bool:
+    """Best-effort push (spec §7): delivery may fail, consent may not."""
+    if not payload.get("topic"):
+        return False
+    try:
+        import httpx
+
+        server = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+        async with httpx.AsyncClient(timeout=10) as cx:
+            r = await cx.post(server, json=payload)
+            return r.status_code < 300
+    except Exception:
+        return False
+
+
+@app.post("/api/arrival/request", status_code=201)
+async def arrival_request(req: ArrivalRequest, request: Request):
+    _gate_or_404()
+    ip = request.headers.get("cf-connecting-ip") or (
+        request.client.host if request.client else None
+    )
+    try:
+        created = ag.create_request(
+            source_instance=req.source_instance,
+            seat_description=req.seat_description,
+            requested_scope=req.requested_scope,
+            requested_ttl_hours=req.requested_ttl_hours,
+            requester_ip=ip,
+        )
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": str(exc), "failure_class": "rate_limited"},
+        )
+    if not created.get("duplicate_of_recent_request"):
+        row = ag.get_request(created["arrival_request_id"]) or {}
+        notified = await _ntfy_publish(
+            ag.build_ntfy_message(
+                {
+                    **created,
+                    "source_instance": row.get("source_instance"),
+                    "seat_description": row.get("seat_description"),
+                    "granted_scope": json.loads(row.get("granted_scope") or "[]"),
+                    "ttl_hours": row.get("ttl_hours"),
+                    "requester_ip": row.get("requester_ip"),
+                },
+                _public_base(),
+            )
+        )
+        created["notification_sent"] = notified
+        if not notified:
+            created["note"] = (
+                "Notification delivery failed or is unconfigured — the request "
+                "still exists; Anthony can approve from HQ."
+            )
+    return created
+
+
+@app.get("/api/arrival/poll/{rid}")
+async def arrival_poll(rid: str):
+    _gate_or_404()
+    result = ag.poll(rid)
+    # Chronicle the grant at the moment the token is released (spec §9) —
+    # server-side, best-effort, guarded: a chronicle outage must not eat the
+    # one-time token response.
+    if result.get("status") == "approved" and result.get("session_token"):
+        try:
+            grant = result.get("grant") or {}
+            await call_mcp_tool(
+                "record_insight",
+                {
+                    "content": (
+                        f"Arrival grant: {grant.get('code')}, scope "
+                        f"{'+'.join(result['scope'])}, token {result['token_id']}, "
+                        f"decided via {grant.get('decided_via')} at {grant.get('decided_at')}."
+                    ),
+                    "domain": "sovereign-stack,arrivals,session-grant",
+                    "layer": "ground_truth",
+                    "intensity": 0.35,
+                    "verified_by": [
+                        {
+                            "kind": "human",
+                            "ref": f"arrival decide rid={rid}",
+                            "note": "the tap on Anthony's phone (or HQ admin call) IS the human decision",
+                        }
+                    ],
+                },
+            )
+        except Exception:
+            pass
+    return result
+
+
+@app.get("/api/arrival/decide")
+async def arrival_decide_confirm(rid: str, action: str, exp: int, sig: str):
+    """Signed confirm page. GET never decides (review correction #1) — a
+    link-preview fetcher hitting this URL sees a page, changes nothing."""
+    _gate_or_404()
+    if not ag.verify_decide(rid, action, exp, sig):
+        raise HTTPException(status_code=403, detail="Invalid or expired decide link.")
+    row = ag.get_request(rid)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Unknown arrival request.")
+    if row["status"] != "pending":
+        return HTMLResponse(
+            ag.DECIDED_PAGE.format(
+                heading="Already decided",
+                code=row["code"],
+                detail=f"status: {row['status']}",
+                stamp=row.get("decided_at") or "",
+            )
+        )
+    return HTMLResponse(
+        ag.CONFIRM_PAGE.format(
+            rid=rid,
+            action=action,
+            exp=exp,
+            sig=sig,
+            code=row["code"],
+            source=row.get("source_instance") or "unknown instance",
+            seat=row.get("seat_description") or "no seat description",
+            scope="+".join(json.loads(row.get("granted_scope") or "[]")),
+            ttl=row.get("ttl_hours"),
+            label=action.capitalize(),
+        )
+    )
+
+
+@app.post("/api/arrival/decide")
+async def arrival_decide(rid: str, action: str, exp: int, sig: str):
+    """The decision — POST only, signed, single-use."""
+    _gate_or_404()
+    if not ag.verify_decide(rid, action, exp, sig):
+        raise HTTPException(status_code=403, detail="Invalid or expired decide link.")
+    outcome = ag.decide(rid, action, via="ntfy_tap")
+    heading = {
+        "approved": "Approved — the seat's next poll receives its token",
+        "denied": "Denied",
+        "already_decided": "Already decided",
+        "unknown_request": "Unknown request",
+    }.get(outcome["outcome"], outcome["outcome"])
+    return HTMLResponse(
+        ag.DECIDED_PAGE.format(
+            heading=heading,
+            code=outcome.get("code") or "",
+            detail=f"outcome: {outcome['outcome']}",
+            stamp=datetime.now(timezone.utc).isoformat(),
+        )
+    )
+
+
+@app.post("/api/arrival/approve")
+async def arrival_admin_approve(
+    body: dict, authorization: str | None = Header(default=None)
+):
+    """HQ fallback when ntfy is down (spec §4.3). Master-only."""
+    _gate_or_404()
+    check_auth(authorization)
+    return ag.decide(body.get("arrival_request_id", ""), "approve", via="hq_admin")
+
+
+@app.post("/api/arrival/deny")
+async def arrival_admin_deny(
+    body: dict, authorization: str | None = Header(default=None)
+):
+    _gate_or_404()
+    check_auth(authorization)
+    return ag.decide(body.get("arrival_request_id", ""), "deny", via="hq_admin")
 
 
 # === Comms Endpoints ===
