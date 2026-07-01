@@ -157,10 +157,25 @@ class CommsMessage(BaseModel):
 
 
 # === Auth ===
-def check_auth(authorization: str | None):
+import session_tokens as st
+
+
+class ScopeHTTPException(HTTPException):
+    """403 whose failure_class is 'scope', not 'auth' — valid credential,
+    insufficient grant (The Door That Asks, Phase 1, spec §8)."""
+
+    failure_class = "scope"
+
+
+def check_auth(authorization: str | None, allow_session: bool = False):
     """Validate Bearer token. Auth-failure responses are framed to help an
     arriving instance distinguish auth issues from sandbox-egress / path
-    issues — see the /api/heartbeat foot-gun note in the discover doc."""
+    issues — see the /api/heartbeat foot-gun note in the discover doc.
+
+    Returns None for the master token (unchanged legacy contract) or an
+    auth-context dict for a scoped session token. Routes that do not pass
+    allow_session=True are master-only: session tokens are refused there
+    by default (default-deny applied to routes, HQ review correction #3)."""
     import logging
     logger = logging.getLogger("auth-debug")
     if not BEARER_TOKEN:
@@ -184,7 +199,35 @@ def check_auth(authorization: str | None):
         )
     received = authorization[7:]
     if hmac.compare_digest(received.encode(), BEARER_TOKEN.encode()):
-        return
+        return None  # master token — full reach, unchanged behavior
+    if received.startswith(st.TOKEN_PREFIX):
+        # Scoped session token (The Door That Asks, Phase 1). House 401/403
+        # semantics kept (HQ review correction #4): known format but dead
+        # token → 403, failure_class 'auth', body says which way it died.
+        outcome = st.resolve(received)
+        status = outcome["status"]
+        if status == "ok":
+            if not allow_session:
+                raise ScopeHTTPException(
+                    status_code=403,
+                    detail=(
+                        "This route is master-only. Session tokens may only use "
+                        "POST /api/call, within their granted scope."
+                    ),
+                )
+            return outcome  # {"status","token_id","scope","source_instance"}
+        reason = {
+            "expired": "This session token has expired. Ask Anthony for a fresh grant.",
+            "revoked": "This session token was revoked. Ask Anthony for a fresh grant.",
+            "unknown": "Unknown session token. It may predate a store reset — ask Anthony for a fresh grant.",
+        }[status]
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"{reason} The stack itself is reachable — GET /api/heartbeat "
+                "will confirm."
+            ),
+        )
     logger.warning(
         f"Token mismatch from ip={_caller_ip.get()!r} prefix={received[:10]}..."
     )
@@ -460,7 +503,9 @@ async def _http_exc_handler(request: Request, exc: HTTPException):
     # Failure-class (#7): a caller knows auth vs malformed vs stack without a
     # second /api/heartbeat round-trip. Preserves the existing `detail`.
     code = exc.status_code
-    if code in (401, 403):
+    if getattr(exc, "failure_class", None):
+        fclass = exc.failure_class  # e.g. 'scope' from ScopeHTTPException
+    elif code in (401, 403):
         fclass = "auth"
     elif code in (400, 404):
         fclass = "malformed"
@@ -704,8 +749,30 @@ async def call_tool_endpoint(
     req: ToolCall,
     authorization: str | None = Header(default=None),
 ):
-    check_auth(authorization)
+    ctx = check_auth(authorization, allow_session=True)
     start = time.time()
+
+    # Scoped session token (The Door That Asks, Phase 1): default-deny per
+    # tool, hard-deny on the never list, and stamp chronicle writes with the
+    # grant so inspect_claim can trace any entry back to it (spec §4.4).
+    # ctx is None for the master token (and for tests that bypass auth).
+    if ctx is not None and ctx.get("status") == "ok":
+        if not st.tool_allowed(req.tool, ctx["scope"]):
+            raise ScopeHTTPException(
+                status_code=403,
+                detail=(
+                    f"Tool '{req.tool}' is outside this session token's grant "
+                    f"(scope: {', '.join(ctx['scope'])}). Unmapped and protected "
+                    "tools are master-only by default."
+                ),
+            )
+        if req.tool == "record_insight" and isinstance(req.arguments, dict):
+            # record_insight accepts **metadata; other write tools do not
+            # take arbitrary kwargs, so their attribution rides on the grant
+            # receipt + last_used stamps instead of injected fields.
+            req.arguments.setdefault("session_token_id", ctx["token_id"])
+            if ctx.get("source_instance"):
+                req.arguments.setdefault("source_instance", ctx["source_instance"])
 
     # validate_only (#5): lightweight, shape-only pre-flight; commits nothing.
     if req.validate_only:
@@ -824,6 +891,81 @@ async def legacy_callers(authorization: str | None = Header(default=None)):
     ledger["count"] = len(ledger.get("callers", {}))
     ledger["grace_window_active"] = False
     return ledger
+
+
+# === Session-token admin (The Door That Asks, Phase 1) ======================
+# Master-only. Mint returns plaintext exactly once and writes the grant to
+# the chronicle server-side (spec §9) — best-effort, guarded: a chronicle
+# outage must not block a mint, but the miss is reported in the response.
+
+
+class MintRequest(BaseModel):
+    scope: list[str] = ["read"]
+    ttl_hours: int = st.TTL_DEFAULT_HOURS
+    label: Optional[str] = None
+    source_instance: Optional[str] = None
+
+
+class RevokeRequest(BaseModel):
+    token_id: Optional[str] = None
+    all: bool = False
+
+
+@app.post("/api/admin/tokens/mint")
+async def admin_mint(req: MintRequest, authorization: str | None = Header(default=None)):
+    check_auth(authorization)  # master-only
+    minted = st.mint(
+        scope=req.scope,
+        ttl_hours=req.ttl_hours,
+        label=req.label,
+        source_instance=req.source_instance,
+    )
+    chronicle = "skipped"
+    try:
+        entry = await call_mcp_tool(
+            "record_insight",
+            {
+                "content": (
+                    f"Arrival grant: {req.source_instance or 'unlabelled seat'}, "
+                    f"scope {'+'.join(minted['scope'])}, TTL {minted['ttl_hours']}h, "
+                    f"token {minted['token_id']}, decided via hq_mint"
+                    + (f" ({req.label})." if req.label else ".")
+                ),
+                "domain": "sovereign-stack,arrivals,session-grant",
+                "layer": "ground_truth",
+                "intensity": 0.35,
+                "verified_by": [
+                    {
+                        "kind": "human",
+                        "ref": f"hq_mint token_id={minted['token_id']}",
+                        "note": "the mint from HQ under the master token IS the human decision",
+                    }
+                ],
+            },
+        )
+        chronicle = "recorded" if entry.get("ok") else f"failed: {entry.get('error')}"
+    except Exception as exc:
+        chronicle = f"failed: {exc}"
+    minted["chronicle_receipt"] = chronicle
+    return minted
+
+
+@app.post("/api/admin/tokens/revoke")
+async def admin_revoke(req: RevokeRequest, authorization: str | None = Header(default=None)):
+    check_auth(authorization)  # master-only
+    if not req.all and not req.token_id:
+        raise HTTPException(status_code=400, detail="Pass token_id, or all=true for every active token.")
+    count = st.revoke(token_id=req.token_id, revoke_all=req.all)
+    return {"revoked": count}
+
+
+@app.get("/api/admin/tokens")
+async def admin_list_tokens(
+    include_dead: bool = False, authorization: str | None = Header(default=None)
+):
+    check_auth(authorization)  # master-only
+    tokens = st.list_tokens(include_dead=include_dead)
+    return {"tokens": tokens, "count": len(tokens)}
 
 
 # === Comms Endpoints ===
