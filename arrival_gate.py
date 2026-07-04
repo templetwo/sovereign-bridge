@@ -309,8 +309,13 @@ def get_request(rid: str) -> dict | None:
 
 
 def build_ntfy_message(req: dict, base_url: str) -> dict:
-    """ntfy publish payload (spec §7). Action buttons are direct POSTs to the
-    signed decide endpoint — review correction #1: no GET ever decides."""
+    """ntfy publish payload (spec §7). Action buttons are `view` actions that
+    OPEN the signed confirm page (a GET — which never decides; review
+    correction #1 still holds), where one button POSTs the decision and the
+    response page shows it landed. `http` actions were dropped 2026-07-04:
+    the iOS ntfy app ignores `clear` on http actions and gives no tap
+    feedback (ntfy issue #1728), so Approve looked dead and the notification
+    never dismissed. `view` is reliable and visible on iOS."""
     exp = int(time.time()) + DECIDE_URL_TTL_SECONDS
     rid = req["arrival_request_id"]
 
@@ -326,15 +331,18 @@ def build_ntfy_message(req: dict, base_url: str) -> dict:
             f"{req.get('seat_description') or 'no seat description'}\n"
             f"scope: {'+'.join(req.get('granted_scope') or ['read'])} · "
             f"TTL {req.get('ttl_hours')}h · ip {req.get('requester_ip') or '?'}\n"
-            f"Match this code against the one claimed in your conversation."
+            f"Tap Approve or Deny to open the decision page. Match this code "
+            f"against the one claimed in your conversation first."
         ),
         "priority": 4,
         "tags": ["door"],
+        # `view` opens the signed confirm page (GET renders, never decides —
+        # correction #1 holds); the page's button POSTs. `http` actions were
+        # dropped: iOS ntfy ignores `clear` + gives no tap feedback on them
+        # (issue #1728), so they looked broken and never dismissed.
         "actions": [
-            {"action": "http", "label": "Approve", "url": _post_url("approve"),
-             "method": "POST", "clear": True},
-            {"action": "http", "label": "Deny", "url": _post_url("deny"),
-             "method": "POST", "clear": True},
+            {"action": "view", "label": "Approve", "url": _post_url("approve"), "clear": True},
+            {"action": "view", "label": "Deny", "url": _post_url("deny"), "clear": True},
         ],
     }
 
