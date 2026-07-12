@@ -68,14 +68,63 @@ COMMS_DIR = Path(os.path.expanduser("~/.sovereign/comms"))
 COMMS_DIR.mkdir(parents=True, exist_ok=True)
 SIGNAL_DIR = Path(os.path.expanduser("~/.sovereign/signals"))
 SIGNAL_DIR.mkdir(parents=True, exist_ok=True)
-# Derive the reported version from the stack itself, so the heartbeat (the
-# canonical "live version" signal callers trust) tracks the stack release
-# automatically instead of drifting behind a hand-bumped constant. The bridge
-# runs in the stack venv with ~/sovereign-stack/src on sys.path (above).
+# Derive the reported version from the stack's checked-out SOURCE, not from
+# installed-package metadata. Postmortem 2026-07-11: sovereign_stack.__version__
+# reads importlib.metadata, which reads .dist-info written at the last
+# `pip install -e .` — a snapshot that does NOT move when the tree is later
+# `git checkout`'d elsewhere. That drift produced a false ground_truth entry
+# ("stack at v1.13.0") in the chronicle while main was really at v1.12.0.
+# pyproject.toml lives IN the tree; reading it directly means the reported
+# version can only be as stale as the last commit, never as stale as the
+# last `pip install`.
+def _find_repo_root(start: Path) -> Optional[Path]:
+    for candidate in (start, *start.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def _pyproject_version(repo_root: Optional[Path]) -> Optional[str]:
+    if repo_root is None:
+        return None
+    pp = repo_root / "pyproject.toml"
+    if not pp.exists():
+        return None
+    try:
+        import tomllib
+        with pp.open("rb") as f:
+            data = tomllib.load(f)
+        v = data.get("project", {}).get("version")
+        return v if isinstance(v, str) and v else None
+    except Exception:
+        return None
+
+
+def _stack_repo_root() -> Optional[Path]:
+    try:
+        import sovereign_stack as _ss
+        return _find_repo_root(Path(_ss.__file__).resolve())
+    except Exception:
+        return None
+
+
+def _resolve_version(repo_root: Optional[Path], metadata_fallback: str) -> str:
+    """Prefer the tree, fall back to metadata only when the tree itself is
+    unreadable (e.g. a non-editable install with no pyproject.toml on disk).
+    metadata_fallback is exactly the value the OLD code returned unconditionally
+    — it can be stale (frozen at the last `pip install -e .`); this function's
+    whole job is to not trust it when the tree can answer directly."""
+    return _pyproject_version(repo_root) or metadata_fallback
+
+
+_STACK_REPO_ROOT = _stack_repo_root()
+
 try:
-    from sovereign_stack import __version__ as VERSION
+    from sovereign_stack import __version__ as _METADATA_VERSION
 except Exception:
-    VERSION = "unknown"
+    _METADATA_VERSION = "unknown"
+
+VERSION = _resolve_version(_STACK_REPO_ROOT, _METADATA_VERSION)
 
 # Load bearer token (+ arrival-gate config from the same secret file — The
 # Door That Asks, Phase 2: ARRIVAL_DECIDE_SECRET / NTFY_TOPIC / NTFY_SERVER /
@@ -401,6 +450,98 @@ def _count_unread(channel: str, instance_id: str) -> int:
     return count
 
 
+# === Runtime-freshness receipt ==============================================
+# VERSION (above) answers "what does the checked-out tree call itself".
+# This answers the harder question underneath the 2026-07-11 postmortem:
+# "IS the checked-out tree what's actually running, and has it moved since
+# process start". A version string alone can't prove that — two trees at
+# different commits can carry the same pyproject.toml version between
+# releases. The git HEAD short SHA can't lie the way dist-info did: it is
+# read fresh from .git on THIS boot, never frozen at install time.
+#
+# Same shape as CLOCK_PROBE: computed ONCE at process start (lifespan hook,
+# see `_compute_runtime_receipt` + `lifespan` below) and cached. `git` calls
+# are local, not network, so — unlike the NTP probe — startup awaits them
+# directly rather than probe-then-background; a timeout still bounds them so
+# a wedged git process can never hang boot. heartbeat() reads this cache
+# ONLY; it never shells out in the request path — a per-request subprocess
+# inside an async handler is the identical event-loop-blocking hazard class
+# as the dist-info freeze this fixes.
+GIT_BIN = "/usr/bin/git"  # absolute: launchd PATH is minimal (see SNTP_BIN)
+GIT_PROBE_TIMEOUT = 5.0
+
+RUNTIME_RECEIPT: dict[str, Any] = {
+    "source_commit": None,          # sovereign_stack HEAD — the surface being served
+    "working_tree_dirty": None,     # tracked-file changes vs source_commit; None = unknown
+    "source_repo": None,
+    "bridge_commit": None,          # sovereign-bridge's OWN HEAD — do not confuse with source_commit
+    "bridge_working_tree_dirty": None,
+    "service_start_time": None,
+}
+
+
+async def _run_git(repo_root: Path, *args: str) -> str | None:
+    """Run one git subcommand against repo_root, stdout stripped. Kills the
+    subprocess on timeout so no zombie lingers — mirrors _probe_one's sntp
+    handling exactly (same hazard, same fix). None on any failure: missing
+    binary, non-repo path, non-zero exit, or timeout."""
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            GIT_BIN, "-C", str(repo_root), *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=GIT_PROBE_TIMEOUT)
+        if proc.returncode != 0:
+            return None
+        return out.decode("utf-8", "replace").strip()
+    except (asyncio.TimeoutError, FileNotFoundError, Exception):
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+        return None
+
+
+async def _git_head_state(repo_root: Path | None) -> tuple[str | None, bool | None]:
+    """(short_sha, working_tree_dirty) for repo_root's checked-out HEAD.
+
+    working_tree_dirty checks TRACKED files only (--untracked-files=no) —
+    ambient scratch (temp_clone/, *.json working notes) sits untracked in
+    normal HQ use and would peg this True permanently, which is noise, not
+    signal. The question that matters for a freshness receipt is "do the
+    files that make up source_commit differ from that commit", not "is the
+    directory tidy". Never raises: (None, None) on missing git, a path
+    that isn't a repo, or a timeout — the heartbeat degrades to an honest
+    "unknown", it does not crash and does not block on a wedged process."""
+    if repo_root is None or not Path(GIT_BIN).exists():
+        return None, None
+    sha = await _run_git(repo_root, "rev-parse", "--short", "HEAD")
+    if not sha:
+        return None, None
+    status = await _run_git(repo_root, "status", "--porcelain", "--untracked-files=no")
+    dirty = bool(status) if status is not None else None
+    return sha, dirty
+
+
+async def _compute_runtime_receipt() -> None:
+    """Populate RUNTIME_RECEIPT once. Called from lifespan before the app
+    starts serving — never per-request."""
+    RUNTIME_RECEIPT["service_start_time"] = datetime.now(timezone.utc).isoformat()
+    RUNTIME_RECEIPT["source_repo"] = str(_STACK_REPO_ROOT) if _STACK_REPO_ROOT else None
+    bridge_root = _find_repo_root(Path(__file__).resolve().parent)
+    (stack_sha, stack_dirty), (bridge_sha, bridge_dirty) = await asyncio.gather(
+        _git_head_state(_STACK_REPO_ROOT),
+        _git_head_state(bridge_root),
+    )
+    RUNTIME_RECEIPT["source_commit"] = stack_sha
+    RUNTIME_RECEIPT["working_tree_dirty"] = stack_dirty
+    RUNTIME_RECEIPT["bridge_commit"] = bridge_sha
+    RUNTIME_RECEIPT["bridge_working_tree_dirty"] = bridge_dirty
+
+
 # === Clock-trust self-attestation ===========================================
 # The heartbeat is the one place an arriving instance reads the current
 # datetime, so it must SELF-ATTEST that the host clock is synced rather than
@@ -495,6 +636,10 @@ async def _clock_probe_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Runtime-freshness receipt: local `git` calls, bounded by GIT_PROBE_TIMEOUT
+    # each, so awaited directly rather than probe-then-background (contrast the
+    # NTP probe below, which is network and can hang far longer).
+    await _compute_runtime_receipt()
     # Start the read-only clock-drift probe daemon. It runs the first probe
     # itself (probe-then-sleep), so startup is NOT delayed waiting on sntp.
     task = asyncio.create_task(_clock_probe_loop())
@@ -745,6 +890,12 @@ async def heartbeat():
         "drift_seconds": drift_seconds,
         "drift_measured_at": measured_at,
         "clock_probe_age_seconds": probe_age,
+        "source_commit": RUNTIME_RECEIPT.get("source_commit"),
+        "working_tree_dirty": RUNTIME_RECEIPT.get("working_tree_dirty"),
+        "service_start_time": RUNTIME_RECEIPT.get("service_start_time"),
+        "bridge_commit": RUNTIME_RECEIPT.get("bridge_commit"),
+        "bridge_working_tree_dirty": RUNTIME_RECEIPT.get("bridge_working_tree_dirty"),
+        "source_note": "version is read from sovereign_stack's pyproject.toml in the checked-out tree, NOT from installed package metadata (that metadata is a snapshot frozen at the last `pip install -e .` and can silently outlive a later `git checkout` — see 2026-07-11 postmortem). source_commit is sovereign_stack's git HEAD, the field that cannot lie the way a stale version string can; bridge_commit is this bridge script's OWN repo HEAD — do not confuse the two.",
         "welcome": (
             "You are through. The stack is alive."
             if healthy
