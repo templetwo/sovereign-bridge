@@ -237,3 +237,52 @@ def test_parse_sntp_signed_offset():
 def test_parse_sntp_no_match_returns_none():
     assert bridge._parse_sntp("sntp: no servers can be used, exiting") is None
     assert bridge._parse_sntp("") is None
+
+
+def test_probe_one_kills_process_on_cancellation_no_orphan(monkeypatch, tmp_path):
+    """_probe_one is _run_git's structural twin and carried the IDENTICAL
+    cancellation gap (2026-07-13, found while chasing a real
+    PytestUnraisableExceptionWarning in the runtime-receipt test suite —
+    every `with TestClient(...)` receipt test starts _clock_probe_loop via
+    lifespan, which spawns a real sntp subprocess; empirically isolated to
+    THIS function, 8/30 stress runs warned with real sntp vs 0/30 with it
+    neutralized). asyncio.CancelledError is a BaseException, not an
+    Exception — it does not route through `except (..., Exception)`, so
+    without a dedicated branch a cancel landing mid-communicate() orphans
+    the child sntp process. Mirrors
+    test_run_git_kills_process_on_cancellation_no_orphan in
+    test_runtime_receipt.py exactly."""
+    spawned_pids = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def slow_exec(*args, **kwargs):
+        proc = await real_exec(
+            "sleep", "5", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        spawned_pids.append(proc.pid)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", slow_exec)
+
+    async def _drive():
+        task = asyncio.create_task(bridge._probe_one("time.apple.com"))
+        await asyncio.sleep(0.1)  # let it get past create_subprocess_exec, into communicate()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_drive())
+
+    assert spawned_pids, "test setup didn't actually spawn a subprocess"
+    import os
+
+    deadline = time.time() + 2.0
+    alive = True
+    while time.time() < deadline:
+        try:
+            os.kill(spawned_pids[0], 0)
+            time.sleep(0.05)
+        except ProcessLookupError:
+            alive = False
+            break
+    assert not alive, f"pid {spawned_pids[0]} (sleep 5) was left running after cancellation — orphaned process"

@@ -118,6 +118,11 @@ def _resolve_version(repo_root: Optional[Path], metadata_fallback: str) -> str:
 
 
 _STACK_REPO_ROOT = _stack_repo_root()
+# This bridge script's OWN repo root never changes for the life of the
+# process — computed once here, not on every TTL refresh (_find_repo_root
+# does synchronous filesystem stat calls; repeating that every 30s on the
+# event loop for a value that's fixed at import time is pure waste).
+_BRIDGE_REPO_ROOT = _find_repo_root(Path(__file__).resolve().parent)
 
 try:
     from sovereign_stack import __version__ as _METADATA_VERSION
@@ -457,26 +462,96 @@ def _count_unread(channel: str, instance_id: str) -> int:
 # process start". A version string alone can't prove that — two trees at
 # different commits can carry the same pyproject.toml version between
 # releases. The git HEAD short SHA can't lie the way dist-info did: it is
-# read fresh from .git on THIS boot, never frozen at install time.
+# read fresh from .git, never frozen at install time.
 #
-# Same shape as CLOCK_PROBE: computed ONCE at process start (lifespan hook,
-# see `_compute_runtime_receipt` + `lifespan` below) and cached. `git` calls
-# are local, not network, so — unlike the NTP probe — startup awaits them
-# directly rather than probe-then-background; a timeout still bounds them so
-# a wedged git process can never hang boot. heartbeat() reads this cache
-# ONLY; it never shells out in the request path — a per-request subprocess
-# inside an async handler is the identical event-loop-blocking hazard class
-# as the dist-info freeze this fixes.
+# 2026-07-12 incident: this receipt was originally compute-ONCE-at-boot-only.
+# sovereign_stack merged 8ba052d while this bridge process stayed up ~20h;
+# source_commit kept reporting the old sha the entire time, with no field
+# telling a reader it had gone stale. Fixed by refreshing on a TTL via a
+# background asyncio task (_runtime_receipt_refresh_loop, started from
+# lifespan, same cancel-cleanly-on-shutdown shape as the clock probe below),
+# single-flighted so an in-progress refresh can never be stacked on top of
+# another (_refresh_runtime_receipt), and outer-bounded by
+# RUNTIME_RECEIPT_REFRESH_TIMEOUT so a hang anywhere in the pass — including
+# inside create_subprocess_exec itself, which sits OUTSIDE _run_git's own
+# per-call GIT_PROBE_TIMEOUT — can't wedge the single-flight flag forever.
+# That bound is only real because EVERY step in the pass is awaitable: the git
+# calls are asyncio subprocesses, and the pyproject read is pushed to a thread
+# via asyncio.to_thread. asyncio.wait_for CANNOT bound a synchronous call — a
+# blocked event loop cannot fire its own timeout callback. An earlier draft ran
+# _pyproject_version inline and claimed this timeout covered it; a 3s stall
+# against a 0.5s timeout returned after 3.02s and drove heartbeat latency from
+# 24.8ms to 2910ms. If you ever inline a sync call back into this pass, this
+# whole paragraph becomes a lie again and the loop can freeze (see 2026-07-10).
+# heartbeat() still reads this cache ONLY and NEVER shells out in the
+# request path — but NOT because a per-request subprocess would block the
+# event loop (asyncio.create_subprocess_exec + await does not block it; that
+# was never true, and the comment that used to live here was wrong). The
+# real reason: /api/heartbeat is UNAUTHENTICATED and public, so a
+# per-request git spawn is an unbounded-subprocess-spawn / resource-
+# exhaustion vector open to anyone on the internet, not an event-loop hazard.
+#
+# VERSION is refreshed on the SAME pass, under the SAME rule, for the same
+# reason: VERSION used to be resolved once at module import and never
+# touched again — mechanically just as capable of going stale as
+# source_commit was. The 2026-07-12 incident didn't happen to move the
+# version string, so it read as "live and correct" by coincidence, not by
+# construction; fixing source_commit alone while leaving VERSION
+# boot-frozen would have made `receipt_stale: false` a verdict on a payload
+# that was still half-lying. So the two are gated TOGETHER: receipt_
+# computed_at only advances when BOTH the stack git read AND the
+# pyproject.toml read succeed in the same pass. One consequence worth
+# flagging explicitly: a version-read failure alone (e.g. pyproject.toml
+# mid-edit) freezes source_commit too and flips receipt_stale, even if git
+# itself is perfectly healthy. That's intentional — this is ONE joint
+# freshness pledge covering both fields, not two independent ones — but it
+# is not obvious from the field names alone.
+#
+# Because the cache can now go stale BETWEEN refreshes (a wedged git call, a
+# dead background task), it must disclose its own age rather than assert a
+# freshness it can't back up — source_commit_read_at / source_commit_age_
+# seconds / receipt_stale on the heartbeat payload. On a FAILED read the
+# cache is left untouched (mirrors _run_clock_probe below: "a stale or empty
+# cache maps to unknown, NEVER to a false reading") — stamping receipt_
+# computed_at on a read that didn't actually succeed would recreate the
+# exact stale-but-confident failure this receipt exists to rule out.
+#
+# source_commit is git HEAD ON DISK — what a NEW process would import if it
+# started right now. It is NOT proof of what sovereign-sse (the process that
+# actually serves the tools) is currently running: bridge.py and
+# sovereign-sse are SEPARATE processes with INDEPENDENT lifetimes. If the
+# tree moves and sovereign-sse is not restarted, sovereign-sse keeps serving
+# the pre-move code no matter how fresh source_commit reads here.
+# source_commit_at_bridge_boot (frozen at THIS bridge process's first
+# successful read, never touched again) is what this process itself
+# actually imported — also not sovereign-sse's sha. Neither field can
+# answer "what is sovereign-sse running" without the stack side
+# interrogating that process directly, which is out of scope for this fix —
+# see source_note on the heartbeat payload, which says this plainly.
 GIT_BIN = "/usr/bin/git"  # absolute: launchd PATH is minimal (see SNTP_BIN)
 GIT_PROBE_TIMEOUT = 5.0
+RUNTIME_RECEIPT_TTL = 30  # seconds between background refreshes; bounds staleness
+RUNTIME_RECEIPT_STALE_MULTIPLIER = 3  # receipt_stale fires after this many missed TTLs
+# Outer bound on one whole refresh pass (both git branches + the pyproject
+# read). Generous relative to the ~2x GIT_PROBE_TIMEOUT worst case per
+# branch (rev-parse then status, sequential, within _git_head_state) so it
+# only fires on a genuine hang, e.g. create_subprocess_exec itself wedging —
+# a scenario GIT_PROBE_TIMEOUT does NOT cover, since it only bounds
+# proc.communicate(), not process creation.
+RUNTIME_RECEIPT_REFRESH_TIMEOUT = GIT_PROBE_TIMEOUT * 3
 
 RUNTIME_RECEIPT: dict[str, Any] = {
-    "source_commit": None,          # sovereign_stack HEAD — the surface being served
-    "working_tree_dirty": None,     # tracked-file changes vs source_commit; None = unknown
+    "source_commit": None,               # git HEAD on disk, TTL-refreshed — what a NEW process would import; NOT proof of what sovereign-sse is running (see note above)
+    "source_commit_at_bridge_boot": None,  # frozen at this bridge process's first successful read — what THIS process actually imported
+    "working_tree_dirty": None,          # tracked-file changes vs source_commit; None = unknown
     "source_repo": None,
-    "bridge_commit": None,          # sovereign-bridge's OWN HEAD — do not confuse with source_commit
+    "bridge_commit": None,               # sovereign-bridge's OWN HEAD on disk, TTL-refreshed — do not confuse with source_commit
+    "bridge_commit_at_boot": None,       # frozen at this bridge process's first successful bridge-repo read — what THIS process actually EXECUTED
     "bridge_working_tree_dirty": None,
-    "service_start_time": None,
+    "service_start_time": None,          # BRIDGE PROCESS boot time (misnomer kept for back-compat)
+    "bridge_start_time": None,           # same value, honestly named — this is the bridge script's boot time
+    "version": None,                     # pyproject.toml version, TTL-refreshed together with source_commit (same AND-gate, same leave-on-failure rule)
+    "receipt_computed_at": None,         # last pass where BOTH source_commit AND version were read successfully — the joint freshness anchor
 }
 
 
@@ -484,7 +559,21 @@ async def _run_git(repo_root: Path, *args: str) -> str | None:
     """Run one git subcommand against repo_root, stdout stripped. Kills the
     subprocess on timeout so no zombie lingers — mirrors _probe_one's sntp
     handling exactly (same hazard, same fix). None on any failure: missing
-    binary, non-repo path, non-zero exit, or timeout."""
+    binary, non-repo path, non-zero exit, or timeout.
+
+    Now that this runs inside a long-lived background task
+    (_runtime_receipt_refresh_loop) that gets cancelled on every lifespan
+    shutdown/reload, a cancel landing while `proc.communicate()` is in
+    flight is a live scenario, not a theoretical one — asyncio.CancelledError
+    is a BaseException, NOT an Exception, so it does not route through the
+    except-Exception branch below. Without the dedicated branch, that leaves
+    the child git process orphaned (kill() never called) every time
+    cancellation lands mid-call. Kill it, THEN re-raise so cancellation still
+    propagates normally to the caller (task.cancel() must keep working).
+
+    proc.wait() after kill() is itself bounded (2s): a D-state child would
+    otherwise hang shutdown indefinitely even after SIGKILL is sent — cheap
+    insurance, not the expected path."""
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -495,11 +584,19 @@ async def _run_git(repo_root: Path, *args: str) -> str | None:
         if proc.returncode != 0:
             return None
         return out.decode("utf-8", "replace").strip()
+    except asyncio.CancelledError:
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except Exception:
+                pass
+        raise
     except (asyncio.TimeoutError, FileNotFoundError, Exception):
         if proc is not None and proc.returncode is None:
             try:
                 proc.kill()
-                await proc.wait()
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
             except Exception:
                 pass
         return None
@@ -527,19 +624,151 @@ async def _git_head_state(repo_root: Path | None) -> tuple[str | None, bool | No
 
 
 async def _compute_runtime_receipt() -> None:
-    """Populate RUNTIME_RECEIPT once. Called from lifespan before the app
-    starts serving — never per-request."""
-    RUNTIME_RECEIPT["service_start_time"] = datetime.now(timezone.utc).isoformat()
+    """Refresh RUNTIME_RECEIPT's git-derived + version fields. Called once
+    from lifespan before the app starts serving, then re-invoked every
+    RUNTIME_RECEIPT_TTL seconds by _runtime_receipt_refresh_loop (through the
+    single-flight wrapper _refresh_runtime_receipt, itself outer-bounded by
+    RUNTIME_RECEIPT_REFRESH_TIMEOUT — this function does no locking or
+    timeout of its own; callers own that). Never runs in the request path.
+
+    service_start_time / bridge_start_time are the BRIDGE PROCESS's boot
+    time, not a snapshot of the tree — stamped ONCE, the first time this
+    function ever runs (guarded on still-None), and never touched again by a
+    later TTL refresh; the process didn't restart just because the git
+    fields moved. source_commit_at_bridge_boot is stamped ONCE, on the first
+    time the stack git read itself succeeds (a separate guard — boot and
+    "first successful git read" are not always the same call if git is
+    transiently unavailable right at startup).
+
+    source_commit / working_tree_dirty / version / receipt_computed_at are
+    written ONLY when BOTH the stack git read AND the pyproject.toml version
+    read succeed IN THE SAME PASS — one joint freshness pledge, not two
+    independent ones (see the comment block above RUNTIME_RECEIPT for why: a
+    fixed-but-live source_commit next to a boot-frozen version would make
+    receipt_stale a lie about half the payload). A failure in EITHER read
+    leaves ALL of them exactly as they were — receipt_computed_at is "last
+    pass where both succeeded", not "last attempt" — so a dead refresher or
+    a stuck git process or an unreadable pyproject.toml shows up as growing
+    staleness (source_commit_age_seconds on the heartbeat payload), never as
+    a confident but wrong-timestamped reading. The module-level VERSION
+    global is updated in lockstep (see VERSION's own docstring-adjacent
+    comment) so /api/discover, which reads that global directly, goes live
+    for free — bridge_commit/bridge_working_tree_dirty follow their OWN
+    independent leave-on-failure rule, since they come from a separate git
+    call against a separate repo and have nothing to do with version."""
+    global VERSION
+    if RUNTIME_RECEIPT.get("service_start_time") is None:
+        boot_iso = datetime.now(timezone.utc).isoformat()
+        RUNTIME_RECEIPT["service_start_time"] = boot_iso
+        RUNTIME_RECEIPT["bridge_start_time"] = boot_iso
     RUNTIME_RECEIPT["source_repo"] = str(_STACK_REPO_ROOT) if _STACK_REPO_ROOT else None
-    bridge_root = _find_repo_root(Path(__file__).resolve().parent)
     (stack_sha, stack_dirty), (bridge_sha, bridge_dirty) = await asyncio.gather(
         _git_head_state(_STACK_REPO_ROOT),
-        _git_head_state(bridge_root),
+        _git_head_state(_BRIDGE_REPO_ROOT),
     )
-    RUNTIME_RECEIPT["source_commit"] = stack_sha
-    RUNTIME_RECEIPT["working_tree_dirty"] = stack_dirty
-    RUNTIME_RECEIPT["bridge_commit"] = bridge_sha
-    RUNTIME_RECEIPT["bridge_working_tree_dirty"] = bridge_dirty
+    # OFF THE EVENT LOOP. _pyproject_version does synchronous stat/open/tomllib
+    # I/O. Called inline it would block the loop, and — critically — the
+    # asyncio.wait_for in _refresh_runtime_receipt CANNOT bound a synchronous
+    # call: a blocked loop cannot fire its own timeout callback. Demonstrated: a
+    # 3s stall with a 0.5s timeout returned after 3.02s, the timeout never fired,
+    # and heartbeat latency went 24.8ms -> 2910ms. That is the event-loop freeze
+    # class that took the SSE down on 2026-07-10. to_thread makes the await
+    # cancellable, so wait_for can actually bound it and the loop stays live.
+    new_version = await asyncio.to_thread(_pyproject_version, _STACK_REPO_ROOT)
+
+    if stack_sha is not None and RUNTIME_RECEIPT.get("source_commit_at_bridge_boot") is None:
+        RUNTIME_RECEIPT["source_commit_at_bridge_boot"] = stack_sha
+
+    if stack_sha is not None and new_version is not None:
+        RUNTIME_RECEIPT["source_commit"] = stack_sha
+        RUNTIME_RECEIPT["working_tree_dirty"] = stack_dirty
+        RUNTIME_RECEIPT["version"] = new_version
+        VERSION = new_version
+        # THE FRESHNESS ANCHOR. Every age/staleness field on the heartbeat is
+        # derived from this one timestamp, and it is stamped ONLY here — inside
+        # the AND-gate, so it can never mark a read "just done" that did not
+        # actually succeed. (I deleted this line once while adding the app.version
+        # block below, and three gates caught it inside ten seconds. Leave it in
+        # the gate; do not hoist it.)
+        RUNTIME_RECEIPT["receipt_computed_at"] = datetime.now(timezone.utc).isoformat()
+        # Three PUBLIC version surfaces exist: /api/heartbeat, /api/discover, and
+        # /openapi.json (+ /docs). FastAPI captured VERSION BY VALUE at app
+        # construction and caches openapi_schema after first generation, so
+        # mutating the VERSION global alone silently desyncs the third one. Keep
+        # them in lockstep: a change whose whole purpose is version honesty must
+        # not leave a public endpoint reporting a different version than the
+        # heartbeat.
+        app.version = new_version
+        app.openapi_schema = None  # force regeneration on next /openapi.json
+
+    if bridge_sha is not None:
+        # Symmetry with the stack side. bridge_commit is TTL-live (git HEAD on
+        # disk); bridge_commit_at_boot is frozen at what THIS process actually
+        # imported. Without the boot anchor, a `git pull` in the bridge repo with
+        # no launchd restart makes bridge_commit advance to code this process has
+        # NEVER EXECUTED — which is the exact 2026-07-12 incident, relocated from
+        # source_commit to bridge_commit, and precisely during a deploy, the one
+        # moment anyone would check.
+        if RUNTIME_RECEIPT.get("bridge_commit_at_boot") is None:
+            RUNTIME_RECEIPT["bridge_commit_at_boot"] = bridge_sha
+        RUNTIME_RECEIPT["bridge_commit"] = bridge_sha
+        RUNTIME_RECEIPT["bridge_working_tree_dirty"] = bridge_dirty
+
+
+_runtime_receipt_refresh_in_flight = False
+
+
+async def _refresh_runtime_receipt() -> None:
+    """Single-flight wrapper around _compute_runtime_receipt, outer-bounded
+    by RUNTIME_RECEIPT_REFRESH_TIMEOUT.
+
+    Single-flight: if a refresh is already in flight, this call is a no-op —
+    the in-flight one will land a result at least as current as this call
+    would have, so stacking a second concurrent `git` pass would only double
+    the subprocess load for no freshness gain. A plain module-level bool,
+    not asyncio.Lock: the check-and-set below has no `await` between them,
+    so it is atomic under cooperative single-threaded scheduling, and it
+    sidesteps the hazard of reusing an asyncio.Lock across multiple
+    independent event loops (this module's own test suite drives async code
+    via repeated asyncio.run() calls, each with its own loop).
+
+    Outer timeout: _run_git bounds each individual `git` subprocess's
+    proc.communicate() via GIT_PROBE_TIMEOUT, but create_subprocess_exec
+    itself — the process-spawn step — sits OUTSIDE that bound. Without an
+    outer timeout here, a hang there would wedge _runtime_receipt_refresh_in_
+    flight permanently: the finally below would never run, so every future
+    tick of _runtime_receipt_refresh_loop would see the flag stuck True and
+    skip forever — an honest-looking degrade (age keeps growing,
+    receipt_stale correctly flips True) that can never self-heal. wait_for's
+    timeout cancels _compute_runtime_receipt, which propagates CancelledError
+    into whichever `git` call is stuck, hitting _run_git's own cancellation
+    branch (kills the child) — so this timeout and that branch cooperate."""
+    global _runtime_receipt_refresh_in_flight
+    if _runtime_receipt_refresh_in_flight:
+        return
+    _runtime_receipt_refresh_in_flight = True
+    try:
+        await asyncio.wait_for(_compute_runtime_receipt(), timeout=RUNTIME_RECEIPT_REFRESH_TIMEOUT)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        _runtime_receipt_refresh_in_flight = False
+
+
+async def _runtime_receipt_refresh_loop() -> None:
+    """Refresh the runtime receipt every RUNTIME_RECEIPT_TTL seconds. The
+    first compute already happened synchronously in lifespan before this
+    loop starts, so this loop sleeps first, then refreshes (inverted from
+    _clock_probe_loop's probe-first shape below, because that probe's first
+    read IS the point of not delaying boot on nothing; this receipt already
+    has a value from the synchronous boot-time compute). Never raises out —
+    a refresh failure just leaves the cache and waits for the next cycle."""
+    while True:
+        await asyncio.sleep(RUNTIME_RECEIPT_TTL)
+        try:
+            await _refresh_runtime_receipt()
+        except Exception:
+            pass
 
 
 # === Clock-trust self-attestation ===========================================
@@ -586,7 +815,20 @@ def _parse_sntp(text: str) -> tuple[float, float] | None:
 async def _probe_one(server: str) -> tuple[float, float] | None:
     """Query one NTP server READ-ONLY via sntp. Captures BOTH stdout+stderr and
     parses the combined text (stream placement varies across sntp builds). Kills
-    the subprocess on timeout so no zombie lingers. None on any failure."""
+    the subprocess on timeout so no zombie lingers. None on any failure.
+
+    2026-07-13: this is _run_git's structural twin and carried the IDENTICAL
+    cancellation gap — verified empirically, not assumed, while chasing a
+    PytestUnraisableExceptionWarning ("subprocess still running") in the
+    receipt test suite. Every `with TestClient(...)` receipt test starts
+    _clock_probe_loop via lifespan, which fires a REAL `sntp` subprocess over
+    the network (hundreds of ms to CLOCK_PROBE_TIMEOUT=6s latency) — a far
+    wider cancellation window than git's sub-millisecond process-creation
+    step. Neutralizing SNTP_BIN in the test fixture made the warning drop
+    from 8/30 stress runs to 0/30; restoring it brought it straight back —
+    that isolates the cause here, not in _run_git. Same fix as _run_git: a
+    dedicated CancelledError branch that kills the child before re-raising,
+    plus a bounded proc.wait() so a D-state child can't hang shutdown."""
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -597,11 +839,19 @@ async def _probe_one(server: str) -> tuple[float, float] | None:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=CLOCK_PROBE_TIMEOUT)
         combined = (out or b"").decode("utf-8", "replace") + "\n" + (err or b"").decode("utf-8", "replace")
         return _parse_sntp(combined)
+    except asyncio.CancelledError:
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except Exception:
+                pass
+        raise
     except (asyncio.TimeoutError, FileNotFoundError, Exception):
         if proc is not None and proc.returncode is None:
             try:
                 proc.kill()
-                await proc.wait()
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
             except Exception:
                 pass
         return None
@@ -636,21 +886,42 @@ async def _clock_probe_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Runtime-freshness receipt: local `git` calls, bounded by GIT_PROBE_TIMEOUT
-    # each, so awaited directly rather than probe-then-background (contrast the
-    # NTP probe below, which is network and can hang far longer).
-    await _compute_runtime_receipt()
+    # Runtime-freshness receipt: the FIRST compute is local `git` calls,
+    # bounded by GIT_PROBE_TIMEOUT each, so it's awaited directly rather than
+    # probe-then-background (contrast the NTP probe below, which is network
+    # and can hang far longer). After boot, a background task refreshes it
+    # every RUNTIME_RECEIPT_TTL seconds so it never drifts more than one TTL
+    # behind the tree it's reporting on — see the 2026-07-12 incident note
+    # above RUNTIME_RECEIPT.
+    # Go through _refresh_runtime_receipt, NOT _compute_runtime_receipt directly:
+    # the boot path needs the same RUNTIME_RECEIPT_REFRESH_TIMEOUT bound as every
+    # later tick. Calling compute() bare here left the one hazard that timeout
+    # exists for (create_subprocess_exec wedging, which sits outside
+    # GIT_PROBE_TIMEOUT) UNBOUNDED on startup — a wedged git spawn would hang
+    # launchd's start and the bridge would never begin serving at all.
+    await _refresh_runtime_receipt()
+    receipt_task = asyncio.create_task(_runtime_receipt_refresh_loop())
     # Start the read-only clock-drift probe daemon. It runs the first probe
     # itself (probe-then-sleep), so startup is NOT delayed waiting on sntp.
-    task = asyncio.create_task(_clock_probe_loop())
+    clock_task = asyncio.create_task(_clock_probe_loop())
     try:
         yield
     finally:
-        task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
+        # Cancel both cleanly before shutdown returns — an uncancelled
+        # background task here is a "Task was destroyed but it is pending"
+        # warning (or worse, a leaked subprocess mid-git-call) on every
+        # reload. The await itself is bounded (2s): both tasks now propagate
+        # CancelledError correctly (see _run_git's dedicated branch), so this
+        # should return almost immediately — the bound is defensive insurance
+        # against a pathological D-state git child that won't reap promptly
+        # even after SIGKILL, not the expected path.
+        receipt_task.cancel()
+        clock_task.cancel()
+        for task in (receipt_task, clock_task):
+            try:
+                await asyncio.wait_for(task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
 
 
 # === App ===
@@ -878,9 +1149,51 @@ async def heartbeat():
     else:
         clock_synced = False
 
+    # Runtime-freshness receipt: reads the TTL-refreshed RUNTIME_RECEIPT cache
+    # ONLY (see the comment block above RUNTIME_RECEIPT for why this never
+    # shells out in-request). The cache can be at most ~RUNTIME_RECEIPT_TTL
+    # seconds behind the tree in normal operation; source_commit_read_at /
+    # source_commit_age_seconds disclose exactly how behind, and
+    # receipt_stale flips True once the background refresher has fallen more
+    # than a few cycles behind (dead task, wedged git, unreadable
+    # pyproject.toml) — an honest "stale", never a confident lie about
+    # freshness it can't back up. RUNTIME_RECEIPT_STALE_MULTIPLIER is read
+    # HERE, at call time, not folded into a constant computed once at import
+    # — a monkeypatched RUNTIME_RECEIPT_TTL (tests use a tiny one) must
+    # actually change the threshold this request evaluates against, or the
+    # gate can never be driven to True and becomes a test that cannot fail.
+    receipt_read_at = RUNTIME_RECEIPT.get("receipt_computed_at")
+    receipt_age_seconds = None
+    if receipt_read_at:
+        try:
+            # Re-read the clock HERE, not `now`. `now` was captured at the top of
+            # this handler, BEFORE the `await get_tool_count()` above — an await
+            # that yields for ~20ms against the live SSE. The background refresher
+            # can (and does) land inside that yield and stamp receipt_computed_at
+            # LATER than `now`, which makes `now - receipt_computed_at` NEGATIVE
+            # on a receipt that is perfectly healthy. Measured: 28/40 heartbeats
+            # spuriously stale. `now` is still the right value for server_time_utc
+            # (that field means "when this response began"); it is the wrong value
+            # for age arithmetic against a timestamp that can move under it.
+            receipt_age_seconds = (
+                datetime.now(timezone.utc) - datetime.fromisoformat(receipt_read_at)
+            ).total_seconds()
+        except Exception:
+            receipt_age_seconds = None
+    receipt_stale_after = RUNTIME_RECEIPT_TTL * RUNTIME_RECEIPT_STALE_MULTIPLIER
+    if receipt_age_seconds is not None and receipt_age_seconds < 0:
+        # With the clock re-read above, the refresher-race can no longer produce
+        # this. A negative age now means the wall clock genuinely stepped BACKWARD
+        # (NTP correction, manual adjustment) since the last successful read. That
+        # is not evidence of freshness — it is evidence the clock moved under us.
+        # Treat as stale, never as "extra fresh".
+        receipt_stale = True
+    else:
+        receipt_stale = receipt_age_seconds is None or receipt_age_seconds > receipt_stale_after
+
     return {
         "status": "ok" if healthy else "degraded",
-        "version": VERSION,
+        "version": RUNTIME_RECEIPT.get("version") or VERSION,
         "tools": tool_count,
         "comms_messages": total_messages,
         "timestamp": now.timestamp(),
@@ -891,11 +1204,59 @@ async def heartbeat():
         "drift_measured_at": measured_at,
         "clock_probe_age_seconds": probe_age,
         "source_commit": RUNTIME_RECEIPT.get("source_commit"),
+        "source_commit_at_bridge_boot": RUNTIME_RECEIPT.get("source_commit_at_bridge_boot"),
         "working_tree_dirty": RUNTIME_RECEIPT.get("working_tree_dirty"),
+        "source_commit_read_at": receipt_read_at,
+        "source_commit_age_seconds": receipt_age_seconds,
+        "receipt_stale": receipt_stale,
         "service_start_time": RUNTIME_RECEIPT.get("service_start_time"),
+        "bridge_start_time": RUNTIME_RECEIPT.get("bridge_start_time"),
         "bridge_commit": RUNTIME_RECEIPT.get("bridge_commit"),
+        "bridge_commit_at_boot": RUNTIME_RECEIPT.get("bridge_commit_at_boot"),
         "bridge_working_tree_dirty": RUNTIME_RECEIPT.get("bridge_working_tree_dirty"),
-        "source_note": "version is read from sovereign_stack's pyproject.toml in the checked-out tree, NOT from installed package metadata (that metadata is a snapshot frozen at the last `pip install -e .` and can silently outlive a later `git checkout` — see 2026-07-11 postmortem). source_commit is sovereign_stack's git HEAD, the field that cannot lie the way a stale version string can; bridge_commit is this bridge script's OWN repo HEAD — do not confuse the two.",
+        "source_note": (
+            "version and source_commit are read together, on the same TTL pass, under the "
+            "SAME leave-on-failure rule — see receipt_stale below; this is deliberate, not an "
+            "oversight (a live source_commit next to a boot-frozen version would make "
+            "receipt_stale a lie about half the payload). version specifically comes from "
+            "sovereign_stack's pyproject.toml in the checked-out tree, NOT from installed "
+            "package metadata (that metadata is a snapshot frozen at the last `pip install -e .` "
+            "and can silently outlive a later `git checkout` — see 2026-07-11 postmortem); it "
+            "used to be resolved once at process import and never touched again, which is "
+            "mechanically just as capable of drifting as source_commit was — it simply hadn't, "
+            "yet, when the 2026-07-11 postmortem was written. NEITHER source_commit NOR version "
+            "is recomputed per-request: /api/heartbeat is unauthenticated and public, and a "
+            "per-request git spawn would be an unbounded-subprocess-spawn vector. Both refresh "
+            f"via a background task every RUNTIME_RECEIPT_TTL ({RUNTIME_RECEIPT_TTL}s). The "
+            "guarantee is BOUNDED staleness (<= a few TTLs in normal operation), not zero "
+            "staleness: source_commit_read_at / source_commit_age_seconds disclose exactly how "
+            "old this reading is, and receipt_stale tells you plainly when the background "
+            "refresher has fallen behind instead of silently serving a confident-looking but "
+            "outdated payload (2026-07-12 incident: source_commit ~20h stale with no field "
+            "disclosing it). That specific failure — a stale value with NO disclosure of its "
+            "age — is what the age fields exist to prevent; this receipt does not claim to have "
+            "'ruled out' staleness as such, and an earlier draft of this note that did was "
+            "wrong. "
+            "IMPORTANT — what this does NOT prove: source_commit is git HEAD ON DISK, i.e. what "
+            "a NEW process would import if started right now. source_commit_at_bridge_boot is "
+            "frozen at what THIS bridge process itself imported at its first successful read. "
+            "NEITHER field attests what sovereign-sse (the separate process that actually serves "
+            "the tools) is currently running — bridge.py and sovereign-sse have independent "
+            "process lifetimes, and if the tree moves without an sovereign-sse restart, "
+            "sovereign-sse keeps serving the pre-move code no matter how fresh source_commit "
+            "reads here. This receipt does not (yet) interrogate sovereign-sse directly. "
+            "The bridge repo carries the SAME pair, for the same reason: bridge_commit is this "
+            "bridge SCRIPT's own repo HEAD on disk (TTL-refreshed — so a `git pull` in the bridge "
+            "repo with no launchd restart WILL advance it to code this process has never "
+            "executed), while bridge_commit_at_boot is frozen at what this process actually "
+            "imported and IS running. During a deploy — the one moment anyone checks — those two "
+            "disagree, and bridge_commit_at_boot is the one describing the code that is answering "
+            "you. Do not confuse either with source_commit / source_commit_at_bridge_boot. "
+            "service_start_time and "
+            "bridge_start_time carry the identical value — service_start_time is kept for "
+            "back-compat, bridge_start_time is the honest name for what it actually is: the "
+            "BRIDGE PROCESS's boot time, not the sovereign-stack service's."
+        ),
         "welcome": (
             "You are through. The stack is alive."
             if healthy
