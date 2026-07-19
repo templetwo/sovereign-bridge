@@ -345,6 +345,16 @@ async def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.call_tool(tool_name, arguments=arguments)
+                # Fail closed on tool-level errors. The MCP SDK converts a
+                # handler exception into a NORMAL result carrying
+                # isError=True (Server.call_tool -> _make_error_result), and
+                # ClientSession.call_tool RETURNS it rather than raising —
+                # so the except below never sees it. Reading only .content
+                # here is how "[Errno 2] ..." was reported as ok:true while
+                # the write was lost (mesh-20260719, P1).
+                if getattr(result, "isError", False):
+                    text = result.content[0].text if result.content else "tool error (no detail)"
+                    return {"ok": False, "error": text, "failure_class": "tool"}
                 if result.content:
                     text = result.content[0].text
                     try:
@@ -369,7 +379,17 @@ async def call_mcp_tools_batch(calls: list[ToolCall]) -> list[dict]:
                 for call in calls:
                     try:
                         result = await session.call_tool(call.tool, arguments=call.arguments)
-                        if result.content:
+                        # Same fail-closed isError check as call_mcp_tool.
+                        if getattr(result, "isError", False):
+                            text = (
+                                result.content[0].text
+                                if result.content
+                                else "tool error (no detail)"
+                            )
+                            results.append(
+                                {"ok": False, "tool": call.tool, "error": text, "failure_class": "tool"}
+                            )
+                        elif result.content:
                             text = result.content[0].text
                             try:
                                 results.append({"ok": True, "tool": call.tool, "result": json.loads(text)})
