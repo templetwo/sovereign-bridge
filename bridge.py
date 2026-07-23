@@ -1175,6 +1175,7 @@ async def admin_list_tokens(
 # secret is missing (fail-closed).
 
 import arrival_gate as ag
+import approval_gate as apg
 from fastapi.responses import HTMLResponse, JSONResponse
 
 
@@ -1396,6 +1397,252 @@ async def arrival_admin_deny(
     outcome = ag.decide(body.get("arrival_request_id", ""), "deny", via="hq_admin")
     await _notify_decision(outcome)
     return outcome
+
+
+# === Approval gate (phone-tap connector-authorize swap) =====================
+# The Claude web connector's OAuth /authorize gate, moved off the operator
+# passphrase (CLAUDE_AUTHORIZE_SECRET, deleted stack-side) onto the SAME
+# ntfy-tap machinery as the arrival gate, but through a NEW approval-only
+# path: request -> ntfy push -> decision is ALWAYS a POST (correction #1,
+# reused) -> confirm flips approved->consumed exactly once. NO session token
+# is ever minted here (HQ req #7 / ruling #6-#8) — session_tokens.mint is
+# never imported or called anywhere in approval_gate.py. The SSE process
+# (clients/claude_bridge/oauth.py, sovereign-stack repo) is the only thing
+# that ever mints a code, and only after {approved:true} comes back from
+# POST /api/approval/confirm.
+#
+# Reuses ARRIVAL_GATE_ENABLED + ARRIVAL_DECIDE_SECRET verbatim (HQ ruling
+# #2) via the shared _gate_or_404() below. request/status/confirm are
+# master-BRIDGE_TOKEN-gated (HQ ruling #3: the caller is always the SSE
+# over loopback, never an arbitrary tokenless seat — unlike arrival's
+# public request endpoint). Only GET/POST /api/approval/decide are public,
+# reachable from Anthony's phone, HMAC-signed. No admin-approve twin exists
+# for this path (HQ ruling #6: phone-tap is the ONLY way in, no break-glass).
+
+
+class ApprovalCreateRequest(BaseModel):
+    client_id: str
+    redirect_uri: str
+    audience: Optional[str] = None
+    code: Optional[str] = None
+    summary: Optional[str] = None
+    # FIX 3 (post-verify): the REAL browser client IP, forwarded by the SSE
+    # from the /authorize request it received (cf-connecting-ip, else its own
+    # request.client.host). Without this the bridge only ever sees the SSE's
+    # own loopback address on this call, which collapsed every browser into
+    # one shared per-IP bucket — including Anthony's own attempts. Trusted
+    # because this whole route is already master-BRIDGE_TOKEN-gated loopback
+    # from the SSE (HQ ruling #3).
+    requester_ip: Optional[str] = None
+
+
+class ApprovalConfirmRequest(BaseModel):
+    approval_id: str
+
+
+# Fire-and-forget task registry (FIX 2, post-verify). asyncio.create_task
+# schedules a coroutine but does NOT keep a strong reference to the returned
+# Task anywhere — a well-documented asyncio gotcha (see the stdlib docs'
+# "Save a reference to the result" warning) where a task with no other
+# referrer can be garbage-collected mid-execution. Holding it in this set
+# until it finishes, then discarding via the done-callback, is what makes
+# "fire-and-forget" actually run to completion instead of "maybe-forget".
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _fire_and_forget(coro) -> None:
+    """Schedule `coro` as a detached background task that can never block or
+    affect the caller's response. The coroutine itself must swallow its own
+    exceptions — this function does not observe or report failures, by
+    design (that's what makes it fire-and-forget)."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+@app.post("/api/approval/request", status_code=201)
+async def approval_request(
+    req: ApprovalCreateRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    _gate_or_404()
+    check_auth(authorization)  # master-only (HQ ruling #3); never logs the token
+    # FIX 3 (post-verify): this call is loopback from the SSE, so
+    # request.client.host is ALWAYS 127.0.0.1 here — using it for the per-IP
+    # cap collapsed every browser (including Anthony's own attempts) into one
+    # shared bucket. Prefer the real browser IP the SSE forwards in the body;
+    # fall back to header/loopback only if the SSE hasn't been updated yet
+    # (keeps this route working stand-alone while the sovereign-stack half
+    # of this fix ships separately).
+    ip = req.requester_ip or request.headers.get("cf-connecting-ip") or (
+        request.client.host if request.client else None
+    )
+    try:
+        created = apg.create_approval(
+            client_id=req.client_id,
+            redirect_uri=req.redirect_uri,
+            audience=req.audience,
+            code=req.code,
+            summary=req.summary,
+            requester_ip=ip,
+        )
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": str(exc), "failure_class": "rate_limited"},
+        )
+    if not created.get("duplicate_of_recent_request"):
+        row = apg.get_approval(created["approval_id"]) or {}
+        notified = await _ntfy_publish(
+            apg.build_approval_ntfy_message({**created, **row}, _public_base())
+        )
+        created["notification_sent"] = notified
+        if not notified:
+            created["note"] = (
+                "Notification delivery failed or is unconfigured — the request "
+                "still exists, but there is no admin-approve fallback for the "
+                "connector path (phone-tap only, HQ ruling #6). Anthony must "
+                "reach his ntfy app directly."
+            )
+    return created
+
+
+@app.get("/api/approval/status/{aid}")
+async def approval_status(aid: str, authorization: str | None = Header(default=None)):
+    _gate_or_404()
+    check_auth(authorization)  # master-only; SSE proxies this for the browser poll
+    return apg.status_approval(aid)
+
+
+@app.post("/api/approval/confirm")
+async def approval_confirm(
+    req: ApprovalConfirmRequest, authorization: str | None = Header(default=None)
+):
+    _gate_or_404()
+    check_auth(authorization)  # master-only
+    result = apg.confirm_approval(req.approval_id)
+    # Optional provenance chronicle (HQ ruling #7): best-effort, guarded,
+    # NEVER on the critical path — a failed/slow chronicle write must not
+    # block or delay the auth response. Only fires on a real authorization.
+    #
+    # FIX 2 (post-verify): the atomic approved->consumed flip above has
+    # ALREADY committed by this point (the aid is burned) — this write is
+    # pure side-channel provenance with nothing downstream depending on it.
+    # It used to be `await`ed with no timeout: a merely SLOW write (not a
+    # failed one — failure was already swallowed) could block past the SSE's
+    # own httpx timeout, so the SSE gets no response, treats it as a 403, and
+    # the user has to restart with a fresh phone tap even though the approval
+    # itself fully succeeded. Detaching it via _fire_and_forget means this
+    # route returns `result` immediately after the flip; the write runs to
+    # completion (or fails silently) on its own time, never on this response.
+    if result.get("approved"):
+        async def _write_provenance() -> None:
+            try:
+                # Bounded even though nothing awaits this task: without a
+                # timeout, a call_mcp_tool that HANGS (vs. fails fast) would
+                # sit in _background_tasks forever — a slow leak, bounded
+                # only by how often the connector re-authorizes. 20s is
+                # generous next to the SSE's own ~10s httpx timeout on the
+                # calls THIS confirm response no longer has to wait behind.
+                await asyncio.wait_for(
+                    call_mcp_tool(
+                        "record_insight",
+                        {
+                            "content": (
+                                f"Connector authorize: client {result.get('client_id')} -> "
+                                f"{result.get('redirect_uri')}, code {result.get('code')}, "
+                                f"decided via {result.get('decided_via')} at {result.get('decided_at')}."
+                            ),
+                            "domain": "sovereign-stack,connector,authorize",
+                            "layer": "ground_truth",
+                            "intensity": 0.35,
+                            "verified_by": [
+                                {
+                                    "kind": "human",
+                                    "ref": f"approval decide aid={req.approval_id}",
+                                    "note": "the tap on Anthony's phone IS the human decision",
+                                }
+                            ],
+                        },
+                    ),
+                    timeout=20,
+                )
+            except Exception:
+                pass
+
+        _fire_and_forget(_write_provenance())
+    return result
+
+
+@app.get("/api/approval/decide")
+async def approval_decide_confirm(aid: str, action: str, exp: int, sig: str):
+    """Signed confirm page. GET never decides (review correction #1, reused
+    verbatim) — a link-preview fetcher hitting this URL sees a page, changes
+    nothing, mints nothing."""
+    _gate_or_404()
+    if not apg.verify_decide(aid, action, exp, sig):
+        raise HTTPException(status_code=403, detail="Invalid or expired decide link.")
+    row = apg.get_approval(aid)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Unknown approval request.")
+    # XSS guard: client_id / redirect_uri / audience / summary arrive from
+    # the (master-gated, but still SSE-relayed, ultimately claude.ai-shaped)
+    # request body and render in the page Anthony opens from his phone —
+    # escape every interpolated field, no exceptions (same discipline as
+    # arrival_decide_confirm).
+    import html as _html
+
+    if row["status"] != "pending":
+        return HTMLResponse(
+            apg.DECIDED_PAGE.format(
+                heading="Already decided",
+                code=_html.escape(row["code"]),
+                detail=_html.escape(f"status: {row['status']}"),
+                stamp=_html.escape(row.get("decided_at") or ""),
+            )
+        )
+    return HTMLResponse(
+        apg.CONFIRM_PAGE.format(
+            aid=_html.escape(aid),
+            action=_html.escape(action),
+            exp=exp,
+            sig=_html.escape(sig),
+            code=_html.escape(row["code"]),
+            client_id=_html.escape(row.get("client_id") or "unknown client"),
+            redirect_uri=_html.escape(row.get("redirect_uri") or ""),
+            audience=_html.escape(row.get("audience") or "(default)"),
+            label=_html.escape(action.capitalize()),
+        )
+    )
+
+
+@app.post("/api/approval/decide")
+async def approval_decide(aid: str, action: str, exp: int, sig: str):
+    """The decision — POST only, signed, single-use. Flips pending->approved
+    or pending->denied. NEVER mints — the SSE's subsequent POST /api/approval
+    /confirm is the only place {approved:true} is ever produced from, and
+    even that mints no session token (see module docstring)."""
+    _gate_or_404()
+    if not apg.verify_decide(aid, action, exp, sig):
+        raise HTTPException(status_code=403, detail="Invalid or expired decide link.")
+    outcome = apg.decide_approval(aid, action, via="ntfy_tap")
+    heading = {
+        "approved": "Approved — the connector will finish authorizing",
+        "denied": "Denied",
+        "already_decided": "Already decided",
+        "unknown_request": "Unknown request",
+    }.get(outcome["outcome"], outcome["outcome"])
+    import html as _html
+
+    return HTMLResponse(
+        apg.DECIDED_PAGE.format(
+            heading=_html.escape(heading),
+            code=_html.escape(outcome.get("code") or ""),
+            detail=_html.escape(f"outcome: {outcome['outcome']}"),
+            stamp=datetime.now(timezone.utc).isoformat(),
+        )
+    )
 
 
 # === Comms Endpoints ===
