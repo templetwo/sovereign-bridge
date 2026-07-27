@@ -905,7 +905,7 @@ def _build_tools_summary(names: list[str] | None, total: int | None) -> dict | N
     present = set(names)
     essential = [
         c for c in _ESSENTIAL_CANDIDATES
-        if c in present and st.tool_allowed(c, "read")
+        if c in present and st.tool_allowed(c, ["read"])
     ][:8]
     return {
         "total": total,

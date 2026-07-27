@@ -115,7 +115,7 @@ def test_essential_names_are_all_read_scope_and_never_sensitive(client, monkeypa
     assert essential, "expected a non-empty essential set for a healthy catalog"
     assert len(essential) <= 8
     for name in essential:
-        assert st.tool_allowed(name, "read"), f"{name} is not read-allowed"
+        assert st.tool_allowed(name, ["read"]), f"{name} is not read-allowed"
         assert name not in st.NEVER_TOOLS
         assert not name.startswith("guardian_")
         assert name not in ("set_policy", "designate_protected")
