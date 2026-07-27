@@ -404,15 +404,38 @@ async def call_mcp_tools_batch(calls: list[ToolCall]) -> list[dict]:
     return results
 
 
-async def get_tool_count() -> int:
+async def _list_tools_raw() -> list:
+    """The single MCP list_tools round-trip. Returns the raw list of tool
+    objects (each carrying .name / .description / .inputSchema). Raises on any
+    failure — callers decide how to degrade. This is the ONE fetch that both
+    GET /api/tools and the heartbeat inventory share, so a heartbeat can derive
+    its count AND its public summary without a second round-trip, and so tests
+    have a single mockable seam (there is no live SSE dependency in unit tests)."""
+    async with sse_client(MCP_SSE_URL, headers=_MCP_SSE_HEADERS) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            listed = await session.list_tools()
+            return listed.tools
+
+
+async def get_tool_inventory() -> dict:
+    """One fetch, two derivations. {"count": int, "names": list[str]} on success;
+    fail-closed to {"count": -1, "names": None} on any failure so a caller can
+    never mistake a failed fetch for an empty-but-complete catalog. The heartbeat
+    reads BOTH the count and the public tools_summary off this single call."""
     try:
-        async with sse_client(MCP_SSE_URL, headers=_MCP_SSE_HEADERS) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                tools = await session.list_tools()
-                return len(tools.tools)
+        tools = await _list_tools_raw()
+        names = [t.name for t in tools]
+        return {"count": len(names), "names": names}
     except Exception:
-        return -1
+        return {"count": -1, "names": None}
+
+
+async def get_tool_count() -> int:
+    """Back-compat thin wrapper: the integer count, derived from the single
+    inventory fetch. Kept so any external caller keeps its int contract; the
+    heartbeat itself calls get_tool_inventory() directly (one fetch, both values)."""
+    return (await get_tool_inventory())["count"]
 
 
 # === Comms ===
@@ -839,6 +862,66 @@ async def discover():
     }
 
 
+# Public-safe orientation set for the heartbeat summary. These are CANDIDATES
+# only — a name appears in tools_summary.essential ONLY if it is BOTH present in
+# the live catalog AND passes st.tool_allowed(name, "read") at runtime. That
+# runtime guard (not this list) is what guarantees no write/session/guardian/
+# NEVER tool can ever surface here, even if someone later edits the candidates.
+# where_did_i_leave_off is deliberately in the set but is filtered OUT by the
+# guard (it consumes handoffs, so it is unmapped/master-only, not read-scope);
+# it is surfaced instead in next_if_no_token as prose, never as a named tool.
+_ESSENTIAL_CANDIDATES = (
+    "where_did_i_leave_off",
+    "arrive_lineage",
+    "start_here",
+    "my_toolkit",
+    "recall_insights",
+    "current_policies",
+    "inspect_claim",
+    "compass_check",
+)
+
+
+def _classify_tool_scope(name: str) -> str:
+    """read / write / session per the scope tables, else 'other'. NEVER_TOOLS
+    and unmapped tools land in 'other' as a COUNT only — never a name."""
+    scope = st.TOOL_SCOPES.get(name)
+    return scope if scope in ("read", "write", "session") else "other"
+
+
+def _build_tools_summary(names: list[str] | None, total: int | None) -> dict | None:
+    """Public (no-auth) human-readable catalog summary for the heartbeat.
+
+    Fail-closed: if the fetch failed (names is None) or the count is the
+    sentinel (< 0), return None — never fabricate a summary that claims a
+    completeness it does not have. Names beyond `essential` are never exposed;
+    by_scope is counts only. `total` is threaded through so it is BYTE-identical
+    to the top-level `tools` int (and equals sum(by_scope) since count==len(names))."""
+    if names is None or total is None or total < 0:
+        return None
+    by_scope = {"read": 0, "write": 0, "session": 0, "other": 0}
+    for n in names:
+        by_scope[_classify_tool_scope(n)] += 1
+    present = set(names)
+    essential = [
+        c for c in _ESSENTIAL_CANDIDATES
+        if c in present and st.tool_allowed(c, "read")
+    ][:8]
+    return {
+        "total": total,
+        "by_scope": by_scope,
+        "essential": essential,
+        "note": (
+            "Counts are the full catalog; the essential names are a safe "
+            "read-scope subset, not the whole toolset."
+        ),
+        "next_if_no_token": (
+            "No token yet? Call arrive_lineage for the gentlest arrival, or "
+            "where_did_i_leave_off for the full boot ritual."
+        ),
+    }
+
+
 @app.get("/api/heartbeat")
 async def heartbeat():
     """Liveness check, no auth. The shape an arriving instance hits first.
@@ -852,12 +935,15 @@ async def heartbeat():
     # P0.1 — single atomic clock read, FIRST, before anything that can fail.
     now = datetime.now(timezone.utc)
 
-    # P0.3 — bound the upstream MCP call. Timeout/error => -1 => degraded path,
-    # but the handler still reaches its return with the datetime intact.
+    # P0.3 — bound the upstream MCP call. Timeout/error => sentinel => degraded
+    # path, but the handler still reaches its return with the datetime intact.
+    # ONE fetch: get_tool_inventory() yields both the int count AND the names
+    # the public tools_summary is built from — no second round-trip.
     try:
-        tool_count = await asyncio.wait_for(get_tool_count(), timeout=HEARTBEAT_TOOL_TIMEOUT)
+        inventory = await asyncio.wait_for(get_tool_inventory(), timeout=HEARTBEAT_TOOL_TIMEOUT)
     except Exception:
-        tool_count = -1
+        inventory = {"count": -1, "names": None}
+    tool_count = inventory.get("count", -1)
 
     # P0.2 — quick unread count across channels (informational). Guard EACH
     # file read: a missing/corrupt/non-UTF8/permission failure must not sink
@@ -902,6 +988,7 @@ async def heartbeat():
         "status": "ok" if healthy else "degraded",
         "version": VERSION,
         "tools": tool_count,
+        "tools_summary": _build_tools_summary(inventory.get("names"), tool_count),
         "comms_messages": total_messages,
         "timestamp": now.timestamp(),
         "server_time_utc": now.isoformat(),
@@ -1044,18 +1131,26 @@ async def list_tools(name: str | None = None, authorization: str | None = Header
     """List tools. Each entry carries a compact `signature` (required/optional
     fields) so the schema is obvious at a glance. Pass ?name=<tool> to get that
     one tool's full description + complete inputSchema (types, enums, defaults)."""
-    check_auth(authorization)
+    # Session tokens are ALLOWED here but only ever see their own scope's tools
+    # (FIX-4). ctx is None for the master token (full catalog, unchanged) or a
+    # resolved session context {"status":"ok","scope":[...],...}.
+    ctx = check_auth(authorization, allow_session=True)
     # Network fetch only inside the try/async-with; raising an HTTPException here
     # would be wrapped by sse_client's anyio TaskGroup into an ExceptionGroup and
-    # masked as a 502, so the 404/shape handling happens AFTER the context exits.
+    # masked as a 502, so the filtering / 404 / shape handling happens AFTER the
+    # context exits.
     try:
-        async with sse_client(MCP_SSE_URL, headers=_MCP_SSE_HEADERS) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                listed = await session.list_tools()
+        raw_tools = await _list_tools_raw()
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
-    items = sorted(listed.tools, key=lambda x: x.name)
+    items = sorted(raw_tools, key=lambda x: x.name)
+    # FIX-4: a scoped session token sees ONLY the tools its scope allows — never
+    # the full catalog, never NEVER_TOOLS. Filtering happens BEFORE the ?name=
+    # lookup so an out-of-scope / never / unmapped tool falls through to the same
+    # 404 as a genuinely-unknown tool (hide existence: 404, not 403). The master
+    # token (ctx is None) skips this branch entirely — behavior byte-identical.
+    if ctx is not None and ctx.get("status") == "ok":
+        items = [t for t in items if st.tool_allowed(t.name, ctx["scope"])]
     if name:
         match = next((t for t in items if t.name == name), None)
         if match is None:

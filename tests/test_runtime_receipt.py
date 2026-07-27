@@ -280,10 +280,10 @@ def _isolate(monkeypatch, tmp_path):
         },
     )
 
-    async def fake_count():
-        return 82
+    async def fake_inventory():
+        return {"count": 82, "names": [f"tool_{i}" for i in range(82)]}
 
-    monkeypatch.setattr(bridge, "get_tool_count", fake_count)
+    monkeypatch.setattr(bridge, "get_tool_inventory", fake_inventory)
 
 
 def test_heartbeat_reports_cached_runtime_receipt(monkeypatch):

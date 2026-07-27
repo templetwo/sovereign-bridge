@@ -6,8 +6,10 @@ upstream tool count is down, hangs, the comms scan hits a corrupt file, or an
 unanticipated exception is raised. clock_synced is a three-state signal whose
 empty/stale/egress-down case maps to the STRING "unknown", never False.
 
-Mock seams: bridge.COMMS_DIR (-> tmp_path), bridge.get_tool_count,
-bridge.CLOCK_PROBE, bridge.HEARTBEAT_TOOL_TIMEOUT. All time/state mocks are
+Mock seams: bridge.COMMS_DIR (-> tmp_path), bridge.get_tool_inventory
+(the single list_tools fetch the heartbeat derives both its int count and its
+public tools_summary from), bridge.CLOCK_PROBE, bridge.HEARTBEAT_TOOL_TIMEOUT.
+All time/state mocks are
 function-scoped via monkeypatch (auto-teardown) — nothing leaks across tests.
 """
 
@@ -49,9 +51,9 @@ def client():
 
 def _ok_count(monkeypatch, n=82):
     async def fake():
-        return n
+        return {"count": n, "names": [f"tool_{i}" for i in range(n)]}
 
-    monkeypatch.setattr(bridge, "get_tool_count", fake)
+    monkeypatch.setattr(bridge, "get_tool_inventory", fake)
 
 
 # --- datetime delivery / consistency ----------------------------------------
@@ -101,9 +103,9 @@ def test_existing_fields_present(client, monkeypatch):
 
 def test_datetime_present_when_tool_count_negative(client, monkeypatch):
     async def fake():
-        return -1
+        return {"count": -1, "names": None}
 
-    monkeypatch.setattr(bridge, "get_tool_count", fake)
+    monkeypatch.setattr(bridge, "get_tool_inventory", fake)
     b = client.get("/api/heartbeat").json()
     assert b["status"] == "degraded"
     assert b["tools"] == -1
@@ -114,7 +116,7 @@ def test_datetime_present_when_tool_count_raises(client, monkeypatch):
     async def boom():
         raise RuntimeError("upstream exploded")
 
-    monkeypatch.setattr(bridge, "get_tool_count", boom)
+    monkeypatch.setattr(bridge, "get_tool_inventory", boom)
     b = client.get("/api/heartbeat").json()
     assert b["status"] == "degraded"
     assert b["tools"] == -1
@@ -128,9 +130,9 @@ def test_datetime_present_when_tool_count_hangs(client, monkeypatch):
 
     async def hang():
         await asyncio.sleep(5.0)
-        return 82
+        return {"count": 82, "names": [f"tool_{i}" for i in range(82)]}
 
-    monkeypatch.setattr(bridge, "get_tool_count", hang)
+    monkeypatch.setattr(bridge, "get_tool_inventory", hang)
     b = client.get("/api/heartbeat").json()
     assert b["status"] == "degraded"
     assert b["tools"] == -1
