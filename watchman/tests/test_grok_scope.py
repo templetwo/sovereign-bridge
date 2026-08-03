@@ -45,9 +45,7 @@ def test_filesystem_items_outrank_comms_under_the_cap(
     fake, log = make_fake_cosmic(tmp_path, good_reply_for([ref]))
     env = watchman_sweep.run_sweep(sov_root, cosmic_bin=fake, **fetchers)
     assert env["grok_scope"]["classified"] == 1
-    judged = [
-        i["digest_id"] for i in (env.get("grok_reply") or {}).get("items", [])
-    ]
+    judged = [i["digest_id"] for i in (env.get("grok_reply") or {}).get("items", [])]
     item_by_id = {i["digest_id"]: i for i in env["items"]}
     assert judged and item_by_id[judged[0]]["surface"] != "comms", (
         "the one classified slot goes to the filesystem signal, not backlog"

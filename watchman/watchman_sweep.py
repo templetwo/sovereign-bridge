@@ -1059,9 +1059,7 @@ def run_sweep(
                 "classified": len(for_grok),
                 "mechanical_only": len(items) - len(for_grok),
             }
-            digest = {
-                k: envelope[k] for k in ("sweep_id", "surfaces", "counts")
-            }
+            digest = {k: envelope[k] for k in ("sweep_id", "surfaces", "counts")}
             digest["items"] = for_grok
             try:
                 rc, stdout, stderr = invoke_cosmic(
