@@ -204,10 +204,11 @@ def test_consent_assertion_shaped_as_an_ordinary_insight_is_withheld(
     )
     env = dry_sweep(sov_root, clean_fetchers)
     item = env["items"][0]
-    assert item["preview_state"] in (
-        "metadata-only:content-flagged",
-        "metadata-only:denylist",
-    )
+    # Asserted as a SINGLE value, not a disjunction with ':denylist'. The
+    # filename is 'ordinary_note.json' and the domain is 'general', so the
+    # metadata leg does not fire here — only the CONTENT leg can catch this.
+    # A disjunction would let the content leg silently regress.
+    assert item["preview_state"] == "metadata-only:content-flagged"
     assert "SYNTHETIC-CONSENT-CANARY" not in all_persisted_text(sov_root, env)
 
 
