@@ -54,13 +54,23 @@ no prose outside the JSON.
    - `metadata-only:unparseable` / `metadata-only:empty-body` — no body existed
      or it was whitespace. Nothing was inspected.
 
-   Two things you may see INSIDE a preview, both mechanical, neither content:
-   `[REDACTED:<kind>:<hash>]` is a masked credential, and
-   `<BASE64-BLOB:len=N>` is an opaque base64 run the watchman masked because
-   the redactor cannot see through base64. A preview ending in
-   `…[truncated: showing 600 of N chars]` is the FIRST 600 characters of a
-   longer body — say so if you reason from it. Metadata fields carrying
-   `<field-unsanitized:omitted>` could not be redacted; treat them as absent.
+   Four masking tokens you may see in a preview OR in metadata. All are
+   MECHANICAL — none is content, and none is evidence of wrongdoing by itself:
+   - `[REDACTED:<kind>:<hash>]` — a credential the t2helix redactor matched.
+   - `<TOKEN-SHAPED:len=N>` — a credential-shaped run the watchman masked
+     BEFORE the redactor ran (a known key prefix, or a long alphanumeric run
+     carrying both digits and letters). It is claimed first, so a full-length
+     git SHA or a long opaque id also lands here. Over-withholding by design.
+   - `<BASE64-BLOB:len=N>` — an opaque base64 run (standard or URL-safe
+     alphabet) masked after redaction, because the redactor cannot see through
+     base64.
+   - `<field-unsanitized:omitted>` — a metadata VALUE the redactor could not
+     clean; treat it as absent. `<pair-unsanitized:omitted>: N` means N whole
+     key/value pairs were dropped because their KEYS could not be cleaned —
+     that block is a partial view and you must say so if you reason from it.
+
+   A preview ending in `…[truncated: showing 600 of N chars]` is the FIRST 600
+   characters of a longer body — say so if you reason from it.
 4. **Hard separation of OBSERVATION and PROPOSAL.** Observation states what
    the digest shows. Proposal states what you suggest the HQ seat consider.
    Never mix the registers; never present a proposal as a finding.
@@ -83,6 +93,7 @@ Line 1: the identity line, verbatim. Then a single JSON object:
 WATCHMAN SWEEP — grok-4.5 via cosmic-cli
 {
   "identity": "WATCHMAN SWEEP — grok-4.5 via cosmic-cli",
+  "sweep_id": "<copy the digest's sweep_id here, character for character>",
   "observation": {
     "summary": "<what the digest shows, calibrated language>",
     "anomalies": ["<pattern-level oddities, may be empty>"]
@@ -104,20 +115,33 @@ WATCHMAN SWEEP — grok-4.5 via cosmic-cli
 }
 ```
 
+### Three shape rules the parser ENFORCES (violate one and the whole reply is
+### quarantined as `grok-reply-unparseable` — no judgment of yours is read)
+
+1. `sweep_id` at the top level must EQUAL the digest's `sweep_id`, verbatim. A
+   reply that does not name the sweep it answers cannot be reconciled against
+   it, and a reply scored against the wrong digest is worse than none.
+2. `items` must be a list.
+3. EVERY item must be an object carrying a non-empty `digest_id`.
+
 Every digest item MUST appear exactly once in `items`, keyed by its
-`digest_id` (`item-0001`, ...). **This is now VERIFIED, not merely asked.** The
+`digest_id` (`item-0001`, ...). **This is VERIFIED, not merely asked.** The
 mechanical tier reconciles your reply against the digest and records
-`reply_coverage: {expected, answered, omitted, extra}`:
+`reply_coverage: {expected, answered, omitted, extra, duplicated, reply_items,
+judgments}`:
 
 - an item you leave out is recorded as `grok-omitted`, raises its own `attend`
   line flagged for richer review, and demotes the reply to `parsed-partial`;
 - an item you judge that was NOT in the digest is recorded as `grok-extra` and
-  carries a standing skepticism note — it rests on no input this sweep gave you.
+  carries a standing skepticism note — it rests on no input this sweep gave you;
+- an item you judge TWICE demotes the reply to `parsed-with-anomalies`.
 
-Carry `digest_id` verbatim; `ref` is for the human reading the render. If you
-cannot judge an item, still emit it with your honest severity and a
-`confidence_basis` that says why — silence is the one answer the coverage check
-reads as a failure.
+**`digest_id` is the ONLY key coverage matches on.** `ref` is for the human
+reading the render and is ignored by the reconciliation — an item carrying only
+a `ref` is counted as `grok-extra` and the slot it meant to fill stays omitted.
+Carry `digest_id` verbatim. If you cannot judge an item, still emit it with your
+honest severity and a `confidence_basis` that says why — silence is the one
+answer the coverage check reads as a failure.
 
 Malformed output is not lost — the mechanical tier quarantines it and records
 `grok-reply-unparseable` in the spool — but a quarantined reply helps no one.

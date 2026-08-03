@@ -22,12 +22,17 @@ Envelope honesty rules (the fail-open class is the one we hunt):
     from the spool alone cannot miscount.
   - an unparseable Grok reply is recorded as 'grok-reply-unparseable' with the
     raw kept in a quarantine file — never silently dropped.
-  - reply_coverage states expected/answered/omitted/extra, and every omitted or
-    extra item raises its own 'attend' line HERE so severity_ceiling reflects
-    the omission. A reply that does not cover the digest is 'parsed-partial',
-    never 'parsed'.
+  - reply_coverage states expected/answered/omitted/extra/duplicated and the
+    arithmetic behind them, and every omitted, extra or duplicated item raises
+    its own 'attend' line HERE so severity_ceiling reflects it. A reply that
+    does not cover the digest is 'parsed-partial'; one that covers it but
+    judges an item twice is 'parsed-with-anomalies'. Only an exact cover is
+    'parsed'.
   - the instrument reports its own blindness: N consecutive sweeps in which
     every preview attempt failed sanitization raise an 'urgent' line.
+  - a sweep that raised AFTER collection is recorded with sweep_error and its
+    own 'attend' line; its high-water mark was not advanced, so the filesystem
+    deltas re-fire next sweep (comms does not — see the README residual).
 """
 
 import json
@@ -58,16 +63,50 @@ def mechanical_lines(envelope):
     these lines exist to prevent.
     """
     lines = []
-    for name, info in (envelope.get("surfaces") or {}).items():
-        if not info.get("ok", False):
-            lines.append(
-                {
-                    "severity": "attend",
-                    "ref": f"surface:{name}",
-                    "reason": f"surface could not be read: {info.get('error', 'unknown error')}",
-                    "source": "mechanical",
-                }
-            )
+    # Surface errors come from the envelope's own mechanically-named list when
+    # it exists. Walking the SANITIZED surfaces block instead would lose every
+    # one of these the moment that block collapses under a dead redactor — a
+    # fail-open in the reporting path. The walk stays as a fallback for older
+    # envelopes, and skips anything that is not dict-shaped.
+    entries = envelope.get("surface_errors")
+    if entries is None:
+        entries = [
+            {"surface": name, "error": info.get("error", "unknown error")}
+            for name, info in (envelope.get("surfaces") or {}).items()
+            if isinstance(info, dict) and not info.get("ok", False)
+        ]
+    for entry in entries:
+        lines.append(
+            {
+                "severity": "attend",
+                "ref": f"surface:{entry.get('surface')}",
+                "reason": (
+                    "surface could not be read: "
+                    f"{entry.get('error') or 'unknown error'}"
+                ),
+                "source": "mechanical",
+            }
+        )
+
+    # A sweep that failed after collection. The high-water mark was NOT
+    # advanced, so the filesystem deltas re-fire; the reader must be told that
+    # this envelope is a partial view of a sweep that did not finish.
+    if envelope.get("sweep_error"):
+        lines.append(
+            {
+                "severity": "attend",
+                "ref": "sweep:partial-failure",
+                "reason": (
+                    "the sweep raised after collection and did not finish: "
+                    f"{envelope['sweep_error']}. The high-water mark was NOT "
+                    "advanced, so filesystem deltas re-fire next sweep "
+                    "(at-least-once). Comms messages are NOT covered — they "
+                    "were already marked read server-side during collection."
+                ),
+                "source": "mechanical",
+                "flagged_for_richer_review": True,
+            }
+        )
 
     # The eyes policy file itself. Anything other than a clean load is an
     # instrument condition the reader must be told about — the old loader
@@ -171,7 +210,9 @@ def mechanical_lines(envelope):
                 "digest_id": dup.get("digest_id"),
                 "reason": (
                     f"grok-duplicate: judged {dup.get('times')} times; the "
-                    f"directive requires exactly once"
+                    f"directive requires exactly once. The reply is recorded as "
+                    f"'parsed-with-anomalies' — its judgments are present but "
+                    f"its accounting does not match the digest"
                 ),
                 "source": "grok-duplicate",
                 "flagged_for_richer_review": True,
@@ -263,6 +304,12 @@ def render_latest(envelope):
     lines.append("| surface | ok | detail |")
     lines.append("|---|---|---|")
     for name, info in surfaces.items():
+        if not isinstance(info, dict):
+            # The surfaces block is sanitized like any other metadata, so a
+            # dead redactor collapses it to a pair-omitted counter. Render what
+            # is there and say so rather than crashing the whole render.
+            lines.append(f"| {name} | ? | (unsanitizable: {info}) |")
+            continue
         ok = "yes" if info.get("ok") else "**NO**"
         detail = info.get("error") or info.get("note") or ""
         lines.append(f"| {name} | {ok} | {detail} |")
@@ -277,6 +324,11 @@ def render_latest(envelope):
         + (", ".join(f"{k}={v}" for k, v in meta_only.items() if v) or "0")
     )
     lines.append(f"- eyes policy: {envelope.get('policy_state', '?')}")
+    if envelope.get("surfaces_sanitized") is False:
+        lines.append(
+            "- surfaces block: **NOT sanitized** — the redactor could not clean "
+            "it, so its strings were withheld rather than shown"
+        )
     lines.append(f"- grok_invoked: {envelope.get('grok_invoked', False)}")
     lines.append(
         f"- grok_process_state: {envelope.get('grok_process_state', 'not-attempted')}"
@@ -289,7 +341,10 @@ def render_latest(envelope):
         lines.append(
             f"- reply_coverage: expected={coverage.get('expected')} "
             f"answered={coverage.get('answered')} "
-            f"omitted={coverage.get('omitted')} extra={coverage.get('extra')}"
+            f"omitted={coverage.get('omitted')} extra={coverage.get('extra')} "
+            f"duplicated={coverage.get('duplicated')} "
+            f"(reply carried {coverage.get('reply_items')} item(s): "
+            f"{coverage.get('judgments')} matched + {coverage.get('extra')} extra)"
         )
     blind = envelope.get("blindness") or {}
     if blind.get("sanitizer_attempts"):
@@ -322,14 +377,18 @@ def render_latest(envelope):
     if items:
         lines.append("## Delta items")
         lines.append("")
+        # KEYED ON digest_id ONLY (H5, the render-side twin of the coverage
+        # rule). `ref` is attacker-derived, so keying on it let a reply attach a
+        # judgment to an item it never named — and the render was the surface a
+        # human actually reads. An item Grok omitted now renders as omitted,
+        # never with someone else's judgment borrowed onto it.
         reply_by_key = {}
         if reply:
             for it in reply.get("items", []) if isinstance(reply, dict) else []:
                 if not isinstance(it, dict):
                     continue
-                for key in ("digest_id", "ref"):
-                    if it.get(key):
-                        reply_by_key.setdefault(it[key], it)
+                if it.get("digest_id"):
+                    reply_by_key.setdefault(it["digest_id"], it)
         for item in items:
             ref = item.get("ref", "?")
             head = (
@@ -339,7 +398,7 @@ def render_latest(envelope):
                 f"preview={item.get('preview_state', '?')}"
             )
             lines.append(head)
-            judged = reply_by_key.get(item.get("digest_id")) or reply_by_key.get(ref)
+            judged = reply_by_key.get(item.get("digest_id"))
             if judged:
                 flag = (
                     " · flagged for richer review"

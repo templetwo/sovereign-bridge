@@ -23,7 +23,14 @@ from conftest import all_persisted_text, dead_script, write_proposal
 # the shape the t2helix Bash gate correctly PAUSEs on.
 SYNTH_KEY = "sk-" + "SYNTHMETA" + ("0" * 20)
 SYNTH_B64_INNER = "sk-" + "SYNTHB64" + ("0" * 21)
-SYNTH_B64 = "c2stU1lOVEhCNjQwMDAwMDAwMDAwMDAwMDAwMDAwMDA"  # 43 base64 chars
+# 43 chars, STANDARD alphabet, carrying '+' and '/'. Those two characters split
+# the pre-pass's bare-alnum rule, so this run survives to the post-redaction
+# base64 mask — which is the leg this fixture exists to exercise.
+SYNTH_B64 = "c2stU1lOVEhCNjQ+MDAwMDAwMDAwM/AwMDAwMDAwMDA"
+# 43 chars, URL-SAFE alphabet ('-' and '_'). Same reasoning.
+SYNTH_B64_URLSAFE = "c2stU1lOVEhCNjQ-MDAwMDAwMDAwM_AwMDAwMDAwMDA"
+# 43 chars, PURE alnum: claimed by the L7 pre-pass instead, and labelled so.
+SYNTH_B64_PURE = "c2stU1lOVEhCNjQwMDAwMDAwMDAwMDAwMDAwMDAwMDA"
 
 SYNTH_BIOMED_UNDECLARED = (
     "Routine ops note. Reviewing the run we noticed the SYNTHETIC-REDTEAM-MARKER "
@@ -74,7 +81,11 @@ def test_secret_in_declared_domain_never_reaches_a_persisted_byte(
     assert SYNTH_KEY not in item["declared_domain"], (
         "the raw key survived in the metadata handed to the mind"
     )
-    assert "[REDACTED:" in item["declared_domain"]
+    # UPDATED for the L7 pre-pass: 'sk-' + 29 tail characters is claimed by the
+    # watchman-side mask before the redactor sees it, so the typed token here is
+    # <TOKEN-SHAPED:len=N> rather than [REDACTED:...]. The field is still masked;
+    # only the label changed, and the label names which stage caught it.
+    assert f"<TOKEN-SHAPED:len={len(SYNTH_KEY)}>" in item["declared_domain"]
     assert SYNTH_KEY not in all_persisted_text(sov_root, env)
     assert SYNTH_KEY not in prompt_text(sov_root)
 
@@ -147,11 +158,21 @@ def test_metadata_fields_are_length_capped_with_an_explicit_marker(
     assert f"of {len(long_domain)} chars]" in item["declared_domain"]
 
 
-def test_metadata_redactor_failure_omits_the_field_it_cannot_clean(
+def test_metadata_redactor_failure_drops_every_pair_it_cannot_name(
     sov_root, clean_fetchers, tmp_path
 ):
-    """FAIL CLOSED, never verbatim. If the redactor cannot clean a metadata
-    field, the field is replaced by a typed token that says so."""
+    """FAIL CLOSED, never verbatim — and UPDATED for the L1 key ruling.
+
+    A dead redactor cannot clean KEYS either, and a key that cannot be cleaned
+    cannot be named, so the whole pair drops and the block carries a COUNT of
+    how many were dropped. The count (not a bare marker) is what stops two
+    dropped pairs from colliding on one token key and losing one silently.
+
+    CONSEQUENCE, asserted rather than discovered later: with the redactor wholly
+    down the metadata block collapses. That is fail-closed and it is loud (the
+    standing-blind detector escalates in the same sweep), but a reader must be
+    able to tell a collapsed block from an empty surface — hence the count.
+    """
     canary = "SYNTHETIC-METAFIELD-CANARY"
     write_proposal(
         sov_root,
@@ -166,9 +187,35 @@ def test_metadata_redactor_failure_omits_the_field_it_cannot_clean(
         sanitize_kwargs={"script_path": dead_script(tmp_path)},
     )
     item = env["items"][0]
-    assert item["tool"] == "<field-unsanitized:omitted>"
     assert item["metadata_sanitized"] is False
+    assert item["<pair-unsanitized:omitted>"] >= 1
+    assert "tool" not in item, "an unnameable key must not survive as a key"
     assert canary not in all_persisted_text(sov_root, env)
+
+
+def test_a_single_field_the_redactor_blanks_becomes_the_field_token(tmp_path):
+    """The per-FIELD token still has a live path: the batch succeeds, but one
+    value comes back blank from a non-blank input. scrub of non-empty text is
+    never empty, so that field alone is treated as unclean — the pair survives
+    (its key cleaned fine) and only the value is withheld."""
+    import sanitizer
+
+    blanker = tmp_path / "blank_one.js"
+    blanker.write_text(
+        "let b=[];process.stdin.on('data',c=>b.push(c));"
+        "process.stdin.on('end',()=>{"
+        "const v=JSON.parse(Buffer.concat(b).toString('utf8'));"
+        "process.stdout.write(JSON.stringify("
+        "v.map(s => String(s).includes('SYNTH-BLANK-ME') ? '' : String(s))));"
+        "process.exit(0);});\n"
+    )
+    safe, ok = sanitizer.sanitize_metadata(
+        {"queue": "grok_bridge", "tool": "SYNTH-BLANK-ME-please"},
+        script_path=blanker,
+    )
+    assert ok is True
+    assert safe["queue"] == "grok_bridge"
+    assert safe["tool"] == "<field-unsanitized:omitted>"
 
 
 # ======================================= finding 2: the denylist CONTENT leg
@@ -305,22 +352,56 @@ def test_homoglyph_in_a_body_term_is_also_folded(sov_root, clean_fetchers):
 # ================================================= finding 6: base64 blobs
 
 
-def test_base64_runs_are_masked_before_truncation(sov_root, clean_fetchers):
+@pytest.mark.parametrize(
+    "blob",
+    [
+        pytest.param(SYNTH_B64, id="standard-alphabet"),
+        pytest.param(SYNTH_B64_URLSAFE, id="urlsafe-alphabet"),
+    ],
+)
+def test_base64_runs_are_masked_before_truncation(sov_root, clean_fetchers, blob):
     """Watchman-side mitigation of an UPSTREAM t2helix limit: no pattern in
     lib/secrets.js decodes base64, and the watchman's exposure differs in kind
     from the helix's — the helix persists locally, the watchman ships the
-    preview to a third-party model."""
+    preview to a third-party model.
+
+    BOTH ALPHABETS, exactly: standard ('+' '/') and URL-safe ('-' '_'). The
+    urlsafe case is the one that used to walk straight through: the old run
+    regex was [A-Za-z0-9+/]{40,}, so a '-' or '_' split the run into segments
+    all shorter than 40 and nothing matched at all."""
     write_proposal(
         sov_root,
         "grok_bridge",
         "b64.json",
-        content=f"synthetic payload blob={SYNTH_B64} end",
+        content=f"synthetic payload blob={blob} end",
     )
     env = dry_sweep(sov_root, clean_fetchers)
     item = env["items"][0]
     assert item["preview_state"] == "sanitized"
-    assert f"<BASE64-BLOB:len={len(SYNTH_B64)}>" in item["preview"]
-    assert SYNTH_B64 not in all_persisted_text(sov_root, env)
+    assert f"<BASE64-BLOB:len={len(blob)}>" in item["preview"]
+    assert blob not in all_persisted_text(sov_root, env)
+
+
+def test_a_pure_alnum_base64_run_is_claimed_by_the_token_pre_pass(
+    sov_root, clean_fetchers
+):
+    """Two masks, one guarantee — and the label says which stage caught it.
+
+    A base64 run using none of '+/-_' is indistinguishable from a long opaque
+    identifier, so the L7 pre-pass claims it first and labels it TOKEN-SHAPED.
+    Asserted so the two rules cannot quietly swap coverage without a test
+    noticing which one is actually firing."""
+    write_proposal(
+        sov_root,
+        "grok_bridge",
+        "b64pure.json",
+        content=f"synthetic payload blob={SYNTH_B64_PURE} end",
+    )
+    env = dry_sweep(sov_root, clean_fetchers)
+    item = env["items"][0]
+    assert item["preview_state"] == "sanitized"
+    assert f"<TOKEN-SHAPED:len={len(SYNTH_B64_PURE)}>" in item["preview"]
+    assert SYNTH_B64_PURE not in all_persisted_text(sov_root, env)
 
 
 # ============================================== finding 7: whitespace preview

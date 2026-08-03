@@ -94,11 +94,22 @@ def test_denylist_floor_tool_and_names(sov_root, clean_fetchers, tmp_path):
     assert env["counts"]["items_metadata_only"]["denylist"] == 3
 
 
-def test_floor_survives_an_emptied_policy_file(tmp_path):
+def test_floor_survives_a_policy_that_denies_almost_nothing(tmp_path):
+    """UPDATED for the L2 strictness ruling. This used to write an ALL-empty
+    policy and assert 'loaded'; an all-empty policy now falls to the floor (see
+    test_an_all_empty_policy_falls_to_the_floor). The property under test here
+    is different and still worth guarding: a policy that validates and denies
+    almost nothing must STILL not be able to switch the protected/consent floor
+    off, so the file keeps exactly one entry and empties the rest."""
     empty_policy = tmp_path / "eyes_policy.json"
     empty_policy.write_text(
         json.dumps(
-            {"denylist_queues": [], "denylist_tools": [], "denylist_domains": []}
+            {
+                "denylist_queues": [],
+                "denylist_tools": [],
+                "denylist_domains": ["some-unrelated-synthetic-domain"],
+                "content_terms": [],
+            }
         )
     )
     policy, state = sanitizer.load_policy(empty_policy)
@@ -200,6 +211,19 @@ def test_garbage_file_yields_metadata_only(sov_root, clean_fetchers, tmp_path):
 
 @needs_t2helix
 def test_synthetic_secrets_become_type_tokens(sov_root, clean_fetchers):
+    """UPDATED for the L7 pre-pass, and the update matters.
+
+    The watchman now masks token-shaped runs BEFORE handing anything to the
+    redactor, so the two prefix-bearing keys are claimed by the pre-pass and
+    render as <TOKEN-SHAPED:len=N> rather than [REDACTED:sk-key:...]. Both
+    still leave, and neither plaintext travels.
+
+    THE `secret-assign` LEG IS LOAD-BEARING AND MUST STAY: 'SYNTH-not-real-
+    000111' carries no known prefix and is far short of the 32-char bare-run
+    rule, so the pre-pass leaves it alone and only the t2helix redactor can
+    catch it. It is now the ONLY assertion in this suite proving the redactor
+    actually ran and was not silently bypassed — delete it and a broken node
+    path becomes invisible here."""
     body = (
         f"synthetic config dump: {SYNTH_ASSIGN}\n"
         f"key one {SYNTH_SK_KEY} and key two {SYNTH_AWS_KEY} end\n"
@@ -211,9 +235,11 @@ def test_synthetic_secrets_become_type_tokens(sov_root, clean_fetchers):
     item = env["items"][0]
     assert item["preview_state"] == "sanitized"
     preview = item["preview"]
-    assert "[REDACTED:sk-key:" in preview
-    assert "[REDACTED:aws-akid:" in preview
-    assert "[REDACTED:secret-assign:" in preview
+    assert f"<TOKEN-SHAPED:len={len(SYNTH_SK_KEY)}>" in preview
+    assert f"<TOKEN-SHAPED:len={len(SYNTH_AWS_KEY)}>" in preview
+    assert "[REDACTED:secret-assign:" in preview, (
+        "the t2helix redactor did not run — this is the only leg that proves it"
+    )
     persisted = all_persisted_text(sov_root, env)
     for raw in (SYNTH_SK_KEY, SYNTH_AWS_KEY, "SYNTH-not-real-000111"):
         assert raw not in persisted, (

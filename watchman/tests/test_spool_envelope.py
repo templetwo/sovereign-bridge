@@ -7,6 +7,7 @@ import shutil
 
 import watchman_sweep
 from conftest import (
+    SWEEP_ID_PLACEHOLDER,
     good_reply_for,
     invocations,
     make_fake_cosmic,
@@ -113,11 +114,12 @@ def test_parse_tolerates_banner_and_fences():
         "WATCHMAN SWEEP — grok-4.5 via cosmic-cli\n"
         "```json\n"
         '{"identity": "WATCHMAN SWEEP — grok-4.5 via cosmic-cli", '
+        '"sweep_id": "20260803T010203Z", '
         '"observation": {"summary": "s", "anomalies": []}, '
         '"proposal": {"summary": "n", "actions_proposed": []}, "items": []}\n'
         "```\n"
     )
-    parsed, identity = watchman_sweep.parse_grok_reply(wrapped)
+    parsed, identity = watchman_sweep.parse_grok_reply(wrapped, "20260803T010203Z")
     assert identity is True
     assert parsed["observation"]["summary"] == "s"
 
@@ -128,6 +130,7 @@ def test_urgent_reply_raises_the_ceiling(sov_root, clean_fetchers, tmp_path):
     reply = "WATCHMAN SWEEP — grok-4.5 via cosmic-cli\n" + json.dumps(
         {
             "identity": "WATCHMAN SWEEP — grok-4.5 via cosmic-cli",
+            "sweep_id": SWEEP_ID_PLACEHOLDER,
             "observation": {
                 "summary": "high-risk item",
                 "anomalies": ["cadence spike"],
@@ -138,6 +141,7 @@ def test_urgent_reply_raises_the_ceiling(sov_root, clean_fetchers, tmp_path):
             },
             "items": [
                 {
+                    "digest_id": "item-0001",
                     "ref": ref,
                     "severity": "urgent",
                     "reason": "declared high risk, unfamiliar pattern",

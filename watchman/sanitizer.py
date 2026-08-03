@@ -11,10 +11,12 @@ A body preview travels ONLY when every gate passes:
 
   (a) the item is not denylisted (protected/consent floor + eyes_policy.json),
       checked against BOTH the raw and the sanitized metadata, homoglyph-folded;
-  (b) the t2helix redaction subprocess succeeded within its timeout;
-  (c) the source file was parseable enough to yield a body at all;
-  (d) the redacted body is not whitespace-only;
-  (e) the redacted body carries no eyes-policy sensitive-content term.
+  (b) no token in the sanitized metadata mixes Unicode scripts;
+  (c) the t2helix redaction subprocess succeeded within its timeout;
+  (d) the source file was parseable enough to yield a body at all;
+  (e) the redacted body is not whitespace-only;
+  (f) the redacted body carries no eyes-policy sensitive-content term and no
+      mixed-script token.
 
 Preview states:
   'sanitized'                       — preview present, redacted
@@ -54,13 +56,89 @@ SANITIZER_TIMEOUT_S = 2.0
 # typed token — never the verbatim value. Fail closed, and SAY so.
 UNSANITIZED_TOKEN = "<field-unsanitized:omitted>"
 
+# A dict KEY whose redaction could not be completed takes the WHOLE PAIR with
+# it: the key cannot be named safely, so key and value both drop and the dict
+# carries a count of how many pairs were dropped under this token. A count (not
+# a bare marker) because two dropped pairs would otherwise collide on one key
+# and the second would vanish silently — the silent-partial class.
+PAIR_UNSANITIZED_TOKEN = "<pair-unsanitized:omitted>"
+
 # Runs of base64-alphabet characters this long or longer are replaced with
 # '<BASE64-BLOB:len=N>' in previews. Watchman-side mitigation of an UPSTREAM
 # t2helix limit: no pattern in lib/secrets.js decodes base64, and the watchman's
 # exposure differs in kind from the helix's — the helix persists locally, the
 # watchman ships the preview to a third-party model.
+#
+# TWO ALPHABETS, exactly: standard ('+' '/') and URL-safe ('-' '_'), including
+# runs that mix them. Base32, base85, and custom alphabets are NOT covered and
+# are a named residual in the README.
 BASE64_RUN_MIN = 40
-_BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/]{%d,}={0,2}" % BASE64_RUN_MIN)
+_BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/_-]{%d,}={0,2}" % BASE64_RUN_MIN)
+
+# ---------------------------------------------------------------- token pre-pass
+#
+# WATCHMAN-SIDE MITIGATION OF AN UPSTREAM GAP, and it does not close it.
+#
+# t2helix's lib/secrets.js anchors its patterns on \b — '\\bsk-[A-Za-z0-9_-]{16,}',
+# '\\bghp_[A-Za-z0-9]{20,}\\b', '\\bAKIA[0-9A-Z]{16}\\b'. A WORD character
+# (letter, digit, or '_') on the anchored side therefore defeats the match.
+# Measured against the live table, not assumed:
+#     'OPENAI_sk-<28>'  -> passes scrub UNCHANGED
+#     'MYKEYsk-<28>'    -> passes scrub UNCHANGED
+#     '123sk-<28>'      -> passes scrub UNCHANGED
+#     'ghp_<30>_backup' -> passes scrub UNCHANGED
+#     'AKIA<16>TAIL'    -> passes scrub UNCHANGED
+# Punctuation-glued forms are NOT affected and are caught upstream correctly:
+# '/sk-…', 'token=sk-…', 'file.sk-….bak' all redact.
+#
+# The watchman cannot fix the helix from here, so it masks token-shaped runs
+# itself, UNANCHORED, BEFORE handing anything to the redactor — previews AND
+# metadata. THE UPSTREAM GAP REMAINS OPEN and is flagged for the Grok helm: a
+# word-glued credential still passes t2helix's own write-path scrub straight
+# into the helix chronicle. This pre-pass protects the watchman's egress only.
+TOKEN_PREFIXES = (
+    "sk-",
+    "sk_live_",
+    "sk_test_",
+    "pk_live_",
+    "rk_live_",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "gitlab_pat_",
+    "glpat-",
+    "xai-",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "xoxr-",
+    "xoxs-",
+    "AKIA",
+    "ASIA",
+    "AIza",
+    "ya29.",
+    "shpat_",
+    "shpss_",
+    "npm_",
+    "dckr_pat_",
+    "hf_",
+)
+TOKEN_TAIL_MIN = 16
+BARE_TOKEN_MIN = 32
+TOKEN_SHAPED_TOKEN = "<TOKEN-SHAPED:len=%d>"
+
+_PREFIXED_TOKEN_RE = re.compile(
+    "(?:"
+    + "|".join(re.escape(p) for p in TOKEN_PREFIXES)
+    + r")[A-Za-z0-9_-]{%d,}" % TOKEN_TAIL_MIN
+)
+# "high-entropy" here is a STATED mechanical rule, not Shannon entropy: a run of
+# BARE_TOKEN_MIN+ [A-Za-z0-9] that carries at least one digit AND at least one
+# letter. A long run of one repeated letter is therefore NOT masked.
+_BARE_TOKEN_RE = re.compile(r"[A-Za-z0-9]{%d,}" % BARE_TOKEN_MIN)
 
 # The non-configurable floor. eyes_policy.json can only ADD to this — nothing
 # in a config file can turn the protected/consent gate off.
@@ -197,6 +275,10 @@ def fold(text) -> str:
     NFKC (collapses fullwidth/compatibility forms) + casefold + a small
     confusables map. Applied to both needle and haystack so a lookalike
     codepoint cannot walk past a denylist term.
+
+    This is the FAST PATH for pure-single-script lookalike folding only. It is
+    NOT the mixed-script defence — see mixed_script(), which must run on RAW
+    text because fold() has already erased the evidence.
     """
     if text is None:
         return ""
@@ -204,16 +286,103 @@ def fold(text) -> str:
     return s.translate(_CONFUSABLE_TABLE).casefold()
 
 
+# ---------------------------------------------------------------- mixed script
+
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _script_of(ch: str) -> str:
+    """The Unicode script family of one character, from its NAME prefix.
+
+    Dependency-free: 'CYRILLIC SMALL LETTER O' -> 'CYRILLIC', 'LATIN SMALL
+    LETTER A' -> 'LATIN', 'CJK UNIFIED IDEOGRAPH-4E00' -> 'CJK'. Unnamed
+    codepoints come back as 'UNKNOWN' (unicodedata.name RAISES without a
+    default — that default is load-bearing).
+    """
+    name = unicodedata.name(ch, "")
+    if not name:
+        return "UNKNOWN"
+    return name.split(" ", 1)[0]
+
+
+def mixed_script(text) -> bool:
+    """True when any word-token's LETTERS come from more than one script.
+
+    THIS RUNS ON RAW TEXT. It must never be handed fold()ed input: fold()
+    applies the confusables map, so a Cyrillic 'о' has already become a Latin
+    'o' and the mixed-script evidence is gone. A test with a canary built from
+    MAPPED confusables ('соnfig') guards that ordering — it goes red the moment
+    anyone folds first.
+
+    The map (fold) catches pure-single-script lookalikes it happens to know.
+    THIS catches the actual attack shape — an ASCII word with one foreign
+    codepoint spliced in — by construction, for every script, without a map.
+    Non-letters (digits, '-', '_', '…') are ignored, so masking tokens and
+    truncation markers never trip it.
+    """
+    if not text:
+        return False
+    for token in _WORD_RE.findall(str(text)):
+        scripts = set()
+        for ch in token:
+            if not unicodedata.category(ch).startswith("L"):
+                continue
+            scripts.add(_script_of(ch))
+            if len(scripts) > 1:
+                return True
+    return False
+
+
+def any_mixed_script(value) -> bool:
+    """mixed_script() over every string anywhere in a structure."""
+    return any(mixed_script(s) for s in _iter_strings(value))
+
+
 # ---------------------------------------------------------------- text shaping
+
+
+def mask_token_shaped(text: str) -> str:
+    """Mask credential-shaped runs BEFORE the redactor ever sees them.
+
+    Two rules, both UNANCHORED so a glued credential cannot hide behind a word
+    boundary the way it does on t2helix's own write path:
+
+      1. a known prefix (TOKEN_PREFIXES) followed by TOKEN_TAIL_MIN+ characters
+         of [A-Za-z0-9_-], anywhere — glued, dotted, slashed, inside a URL;
+      2. a bare run of BARE_TOKEN_MIN+ [A-Za-z0-9] carrying at least one digit
+         AND at least one letter.
+
+    Both become '<TOKEN-SHAPED:len=N>'. Over-withholding is accepted: rule 2
+    also eats full-length git SHAs and other long alnum identifiers, which is
+    why the heartbeat surface reports SHORT commits.
+    """
+    if not text:
+        return text
+
+    def _prefixed(m):
+        return TOKEN_SHAPED_TOKEN % len(m.group(0))
+
+    def _bare(m):
+        run = m.group(0)
+        if not (any(c.isdigit() for c in run) and any(c.isalpha() for c in run)):
+            return run
+        return TOKEN_SHAPED_TOKEN % len(run)
+
+    return _BARE_TOKEN_RE.sub(_bare, _PREFIXED_TOKEN_RE.sub(_prefixed, text))
 
 
 def mask_base64_blobs(text: str) -> str:
     """Replace runs of BASE64_RUN_MIN+ base64-alphabet chars with a typed token.
 
-    Applied to PREVIEWS ONLY (HQ's scoping). Metadata fields are redacted and
-    capped at METADATA_FIELD_CHARS instead — masking there would eat 40-char
-    git SHAs out of the heartbeat mismatch detail, which is the one field HQ
-    reads that surface for.
+    Both alphabets: standard ('+' '/') and URL-safe ('-' '_'), including runs
+    that mix them.
+
+    Applied to PREVIEWS ONLY, and it runs AFTER redaction, so it catches what
+    the pre-pass left. A pure-alnum base64 run is claimed first by
+    mask_token_shaped() and renders as '<TOKEN-SHAPED:len=N>'; a run carrying
+    '+', '/', '-' or '_' survives the pre-pass (those characters split the bare
+    alnum rule) and lands here as '<BASE64-BLOB:len=N>'. Two labels, one
+    guarantee: neither form travels in the clear.
     """
     if not text:
         return text
@@ -247,14 +416,42 @@ def cap_field(value: str) -> str:
 def _validate_policy(raw):
     """Strict schema check. Returns the normalized policy or raises ValueError.
 
-    Every field is TYPE-CHECKED, never coerced. The old loader ran a list
-    comprehension over whatever it found, so `"denylist_queues":
-    "antigravity_connector"` (a plausible hand-edit typo, brackets dropped)
-    iterated the STRING into single characters and silently stopped denying the
-    antigravity queue while still reporting policy_state 'loaded'.
+    Four gates, each earned by a plausible hand-edit that used to pass:
+
+      1. every field is TYPE-CHECKED, never coerced — `"denylist_queues":
+         "antigravity_connector"` (brackets dropped) iterated the STRING into
+         single characters and silently stopped denying the antigravity queue
+         while still reporting policy_state 'loaded';
+      2. WRONG NESTING is rejected — a dict where a list belongs, or a list of
+         non-strings;
+      3. UNKNOWN KEYS are rejected, which is what catches a singular-key typo
+         (`denylist_domain`): the typo'd key used to be ignored and the real
+         key defaulted to empty, so the policy read as loaded and denied
+         nothing. Keys beginning with '_' are comments and are allowed — the
+         shipped eyes_policy.json carries a `_comment`, and a validator that
+         rejected it would close the eyes on every production sweep;
+      4. at least ONE recognized key must be present, and the policy must deny
+         SOMETHING. A file that parses to all-empty denylists AND empty
+         content_terms is not a plausible intent — an eyes policy with no eyes
+         is a config that was truncated, emptied, or half-written, so it falls
+         to the floor rather than being honoured.
     """
     if not isinstance(raw, dict):
         raise ValueError(f"policy root must be an object, got {type(raw).__name__}")
+
+    unknown = [
+        k
+        for k in raw
+        if k not in POLICY_LIST_KEYS and not (isinstance(k, str) and k.startswith("_"))
+    ]
+    if unknown:
+        raise ValueError(f"unknown policy key(s): {sorted(map(str, unknown))}")
+    if not any(k in raw for k in POLICY_LIST_KEYS):
+        raise ValueError(
+            "policy declares none of "
+            f"{list(POLICY_LIST_KEYS)} — nothing recognized to enforce"
+        )
+
     policy = {}
     for key in POLICY_LIST_KEYS:
         if key not in raw:
@@ -271,6 +468,11 @@ def _validate_policy(raw):
                 )
             entries.append(entry.lower())
         policy[key] = entries
+
+    if not any(policy[key] for key in POLICY_LIST_KEYS):
+        raise ValueError(
+            "policy denies nothing: every denylist and content_terms is empty"
+        )
     return policy
 
 
@@ -386,6 +588,10 @@ def run_redactor(
     Returns (redacted_text, 'sanitized') on success, (None, 'sanitizer-failed')
     on ANY failure — non-zero exit, timeout, spawn error, or empty output for
     non-empty input. The failure path never returns the raw body.
+
+    The watchman-side token pre-pass (mask_token_shaped) runs BEFORE the
+    subprocess, so a glued credential t2helix's boundary-anchored scrub would
+    miss is already a '<TOKEN-SHAPED:len=N>' by the time scrub() sees it.
     """
     if script_path is None:
         script_path = _SCRIPT_PATH
@@ -393,7 +599,7 @@ def run_redactor(
         node_bin = resolve_node_bin()
     if t2helix_root is None:
         t2helix_root = default_t2helix_root()
-    window = body[:SANITIZER_INPUT_WINDOW]
+    window = mask_token_shaped(body[:SANITIZER_INPUT_WINDOW])
     env = dict(os.environ)
     env["T2HELIX_ROOT"] = str(t2helix_root)
     try:
@@ -437,7 +643,9 @@ def run_redactor_batch(
         node_bin = resolve_node_bin()
     if t2helix_root is None:
         t2helix_root = default_t2helix_root()
-    payload = json.dumps([str(v)[:SANITIZER_INPUT_WINDOW] for v in values])
+    payload = json.dumps(
+        [mask_token_shaped(str(v)[:SANITIZER_INPUT_WINDOW]) for v in values]
+    )
     env = dict(os.environ)
     env["T2HELIX_ROOT"] = str(t2helix_root)
     try:
@@ -466,55 +674,95 @@ def run_redactor_batch(
 # ---------------------------------------------------------------- metadata
 
 
-def _collect_string_paths(node, prefix, paths, values):
+def _collect_string_paths(node, out):
+    """EVERY string in a metadata structure — dict KEYS INCLUDED — in a fixed
+    traversal order (key, then that key's value). The rebuild pass walks the
+    identical order, so the two stay in lockstep without carrying paths.
+
+    Keys used to be skipped entirely: a dict key was copied verbatim into the
+    digest handed to xAI. No surface produces attacker-controlled keys TODAY
+    (every metadata key in _extract_meta, scan_comms and the `detail` blocks is
+    a literal), so this is defence in depth, not a live leak closed.
+    """
     if isinstance(node, str):
-        paths.append(tuple(prefix))
-        values.append(node)
+        out.append(node)
     elif isinstance(node, dict):
         for k, v in node.items():
-            _collect_string_paths(v, prefix + [k], paths, values)
-    elif isinstance(node, list):
-        for i, v in enumerate(node):
-            _collect_string_paths(v, prefix + [i], paths, values)
+            if isinstance(k, str):
+                out.append(k)
+            _collect_string_paths(v, out)
+    elif isinstance(node, (list, tuple)):
+        for v in node:
+            _collect_string_paths(v, out)
 
 
-def _set_path(root, path, value):
-    node = root
-    for step in path[:-1]:
-        node = node[step]
-    node[path[-1]] = value
+def _safe_string(raw: str, redacted, ok: bool):
+    """(safe_value, field_ok) for one string. Fail closed, never verbatim."""
+    if not ok or not isinstance(redacted, str):
+        return UNSANITIZED_TOKEN, False
+    if raw.strip() and not redacted.strip():
+        # scrub of non-empty text is never empty — treat as a failure of THIS
+        # field rather than trusting the blank.
+        return UNSANITIZED_TOKEN, False
+    return cap_field(redacted), True
 
 
-def sanitize_metadata(meta: dict, **redactor_kwargs):
+def _rebuild_sanitized(node, feed, ok):
+    """Rebuild `node` consuming redacted strings from `feed` in collect order."""
+    if isinstance(node, str):
+        value, _ = _safe_string(node, next(feed), ok)
+        return value
+    if isinstance(node, dict):
+        rebuilt = {}
+        dropped = 0
+        for k, v in node.items():
+            if isinstance(k, str):
+                safe_key, key_ok = _safe_string(k, next(feed), ok)
+            else:
+                safe_key, key_ok = k, True
+            # The value is consumed EITHER WAY: the feed must stay in lockstep
+            # with the collect order even for a pair we are about to drop.
+            safe_value = _rebuild_sanitized(v, feed, ok)
+            if not key_ok or safe_key in rebuilt:
+                # A key we could not clean cannot be named, and two distinct
+                # keys that redact to the same string would silently overwrite
+                # one another. Both drop the whole pair and are COUNTED.
+                dropped += 1
+                continue
+            rebuilt[safe_key] = safe_value
+        if dropped:
+            rebuilt[PAIR_UNSANITIZED_TOKEN] = dropped
+        return rebuilt
+    if isinstance(node, (list, tuple)):
+        return [_rebuild_sanitized(v, feed, ok) for v in node]
+    return copy.deepcopy(node)
+
+
+def sanitize_metadata(meta, **redactor_kwargs):
     """Return (sanitized_meta, ok).
 
-    EVERY string metadata field — at any depth — runs through the same redactor
-    as previews, then is capped at METADATA_FIELD_CHARS with an explicit
-    truncation marker. This closes the leak-hunt's headline finding: metadata
-    was copied VERBATIM out of untrusted files and board messages and travelled
-    to xAI in argv, in the prompt, and into the spool. A field whose redaction
-    could not be completed becomes UNSANITIZED_TOKEN — never the raw value.
+    EVERY string — at any depth, KEYS AND VALUES — runs through the same
+    redactor as previews, then is capped at METADATA_FIELD_CHARS with an
+    explicit truncation marker. This closes the leak-hunt's headline finding:
+    metadata was copied VERBATIM out of untrusted files and board messages and
+    travelled to xAI in argv, in the prompt, and into the spool.
+
+    A VALUE whose redaction could not be completed becomes UNSANITIZED_TOKEN.
+    A KEY whose redaction could not be completed takes its whole pair with it
+    (PAIR_UNSANITIZED_TOKEN carries the count). CONSEQUENCE, stated plainly:
+    when the redactor is wholly down every key fails, so the block collapses to
+    `{'<pair-unsanitized:omitted>': N}`. That is fail-closed and loud — the
+    standing-blind detector escalates to urgent in the same sweep — but a
+    reader must not mistake a collapsed block for an empty surface.
     """
-    paths, values = [], []
-    _collect_string_paths(meta, [], paths, values)
-    safe = copy.deepcopy(meta)
+    values = []
+    _collect_string_paths(meta, values)
     if not values:
-        return safe, True
+        return copy.deepcopy(meta), True
     redacted, state = run_redactor_batch(values, **redactor_kwargs)
     ok = state == "sanitized" and redacted is not None
-    for i, path in enumerate(paths):
-        if ok:
-            value = redacted[i]
-            if values[i].strip() and not value.strip():
-                # scrub of non-empty text is never empty — treat as a failure
-                # of THIS field rather than trusting the blank.
-                value = UNSANITIZED_TOKEN
-            else:
-                value = cap_field(value)
-        else:
-            value = UNSANITIZED_TOKEN
-        _set_path(safe, path, value)
-    return safe, ok
+    feed = iter(redacted if ok else [None] * len(values))
+    return _rebuild_sanitized(meta, feed, ok), ok
 
 
 # ---------------------------------------------------------------- decision
@@ -531,6 +779,13 @@ def preview_for(body, meta: dict, policy: dict, **redactor_kwargs):
         return None, "metadata-only:denylist"
     if body is None:
         return None, "metadata-only:unparseable"
+    if any_mixed_script(meta):
+        # MIXED SCRIPT FAILS CLOSED. Checked here, before the subprocess, so a
+        # mixed-script item's body is never handed to the redactor either.
+        # NOTE the precise scope: this is the CONTENT leg, so it only fires on
+        # an item that would otherwise have produced a preview — a denylisted
+        # or unparseable item short-circuits above and keeps its own state.
+        return None, "metadata-only:content-flagged"
     redacted, state = run_redactor(body, **redactor_kwargs)
     if state != "sanitized" or redacted is None:
         return None, "metadata-only:sanitizer-failed"
@@ -539,7 +794,8 @@ def preview_for(body, meta: dict, policy: dict, **redactor_kwargs):
         # Nothing was actually inspected — counting this as 'previewed' would
         # inflate the coverage number with empty reads.
         return None, "metadata-only:empty-body"
-    if content_flagged(masked, policy):
-        # The CONTENT leg: sensitivity that was never declared in metadata.
+    if content_flagged(masked, policy) or mixed_script(masked):
+        # The CONTENT leg: sensitivity that was never declared in metadata, and
+        # any mixed-script token in the redacted window.
         return None, "metadata-only:content-flagged"
     return truncate_with_marker(masked, PREVIEW_CHARS, len(body)), "sanitized"

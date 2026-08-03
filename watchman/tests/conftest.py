@@ -125,10 +125,16 @@ GOOD_REPLY_TEMPLATE = """WATCHMAN SWEEP — grok-4.5 via cosmic-cli
 {envelope}
 """
 
+# The fake cosmic substitutes the real sweep_id for this placeholder, exactly as
+# a real Grok reply must echo the digest's sweep_id. The parser now REJECTS a
+# reply whose sweep_id does not match, so a canned literal would quarantine.
+SWEEP_ID_PLACEHOLDER = "__SWEEP_ID__"
 
-def good_reply_for(refs):
+
+def good_reply_for(refs, *, sweep_id=SWEEP_ID_PLACEHOLDER):
     envelope = {
         "identity": "WATCHMAN SWEEP — grok-4.5 via cosmic-cli",
+        "sweep_id": sweep_id,
         "observation": {
             "summary": "Digest shows routine proposal traffic; metadata consistent with normal cadence.",
             "anomalies": [],
@@ -136,8 +142,8 @@ def good_reply_for(refs):
         "proposal": {"summary": "nothing", "actions_proposed": []},
         "items": [
             {
-                # digest_id is the mechanical key reply coverage reconciles on;
-                # ref is kept because the parser also matches tolerantly by ref.
+                # digest_id is the ONLY key reply coverage reconciles on; ref is
+                # carried for the human render and is ignored by the check.
                 "digest_id": f"item-{i:04d}",
                 "ref": r,
                 "severity": "info",
@@ -152,14 +158,38 @@ def good_reply_for(refs):
 
 
 def make_fake_cosmic(tmp_path, reply_text, exit_code=0):
-    """A recording stand-in for cosmic-cli: logs each invocation, emits the
-    canned reply. Returns (bin_path, invocation_log_path)."""
+    """A recording stand-in for cosmic-cli: logs each invocation, reads the
+    sweep_id out of the prompt it was handed, and emits the canned reply with
+    SWEEP_ID_PLACEHOLDER substituted. Returns (bin_path, invocation_log_path).
+
+    The stand-in parses the prompt rather than being told the sweep_id because
+    the sweep_id is minted from the clock inside run_sweep — a test cannot know
+    it in advance, and a real Grok is in exactly the same position.
+    """
     log = tmp_path / "cosmic_invocations.log"
     reply = tmp_path / "cosmic_reply.txt"
     reply.write_text(reply_text, encoding="utf-8")
     script = tmp_path / "fake-cosmic"
     script.write_text(
-        f'#!/bin/sh\necho invoked >> "{log}"\ncat "{reply}"\nexit {exit_code}\n'
+        f"""#!{sys.executable}
+import json, pathlib, sys
+
+pathlib.Path({str(log)!r}).open("a").write("invoked\\n")
+prompt = sys.argv[2] if len(sys.argv) > 2 else ""
+sweep_id = ""
+marker = "## DELTA DIGEST (input)"
+if marker in prompt:
+    blob = prompt.split(marker, 1)[1].split("```")[1]
+    if blob.startswith("json"):
+        blob = blob.split("\\n", 1)[1]
+    try:
+        sweep_id = json.loads(blob).get("sweep_id", "")
+    except Exception:
+        sweep_id = ""
+text = pathlib.Path({str(reply)!r}).read_text(encoding="utf-8")
+sys.stdout.write(text.replace({SWEEP_ID_PLACEHOLDER!r}, sweep_id))
+sys.exit({exit_code})
+"""
     )
     script.chmod(0o755)
     return str(script), log

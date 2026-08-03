@@ -35,6 +35,8 @@ live sweep, so every dry byte lands in a dry-run-only file.
 """
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import subprocess
@@ -123,6 +125,38 @@ def save_state(root, state):
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
     tmp.replace(p)
+
+
+def sweep_lock_path(root):
+    return Path(root) / "watchman" / "sweep.lock"
+
+
+@contextlib.contextmanager
+def sweep_lock(root):
+    """Single-instance gate: yields True when this invocation holds the lock.
+
+    launchd fires this script on BOTH a WatchPaths trigger and a StartInterval,
+    so two sweeps can overlap on a busy queue. Two live sweeps race the same
+    high-water state file and can each half-advance it — an overlap is a
+    silent-data-loss shape, not a performance one. flock is per open file
+    description, so a second invocation (even in the same process) is refused
+    and must do NOTHING.
+    """
+    p = sweep_lock_path(root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(p), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def log_line(root, text, *, dry_run=False):
@@ -491,21 +525,42 @@ def invoke_cosmic(prompt, *, cosmic_bin):
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def _looks_like_watchman_envelope(parsed) -> bool:
-    """Shape check before a parsed object is accepted as Grok's reply.
+def _looks_like_watchman_envelope(parsed, expected_sweep_id) -> bool:
+    """STRICT shape check before a parsed object is accepted as Grok's reply.
 
-    Reply coverage (below) is now load-bearing, so 'first parseable object
-    wins' is no longer harmless: a banner fragment that happens to be
-    JSON-shaped would win and coverage would report 0 answered / N omitted,
-    firing N false attend lines about an omission that never happened."""
+    Reply coverage is load-bearing, so 'first parseable object wins' is not
+    harmless: a banner fragment that happens to be JSON-shaped would win and
+    coverage would report 0 answered / N omitted, firing N false attend lines
+    about an omission that never happened.
+
+    Three requirements, all mandatory:
+      - the reply's `sweep_id` EQUALS the digest's. A reply that does not name
+        the sweep it answers cannot be reconciled against it — a stale reply,
+        a replayed one, or a hallucinated envelope would otherwise be scored
+        against the wrong digest;
+      - `items` is a list;
+      - every item is a dict bearing a non-empty `digest_id` — the only key
+        coverage matches on.
+
+    Anything else is grok-reply-unparseable and is quarantined intact.
+    """
     if not isinstance(parsed, dict):
         return False
-    if "items" in parsed:
-        return True
-    return "observation" in parsed and "proposal" in parsed
+    if parsed.get("sweep_id") != expected_sweep_id:
+        return False
+    items = parsed.get("items")
+    if not isinstance(items, list):
+        return False
+    for item in items:
+        if not isinstance(item, dict):
+            return False
+        digest_id = item.get("digest_id")
+        if not isinstance(digest_id, str) or not digest_id.strip():
+            return False
+    return True
 
 
-def parse_grok_reply(raw: str):
+def parse_grok_reply(raw: str, expected_sweep_id):
     """Extract the strict-JSON envelope from a reply that may carry the
     identity line, a CLI banner, or code fences around it. Returns
     (parsed_dict_or_None, identity_line_present)."""
@@ -540,7 +595,7 @@ def parse_grok_reply(raw: str):
                     candidate = text[start : i + 1]
                     try:
                         parsed = json.loads(candidate)
-                        if _looks_like_watchman_envelope(parsed):
+                        if _looks_like_watchman_envelope(parsed, expected_sweep_id):
                             return parsed, identity_present
                     except json.JSONDecodeError:
                         pass
@@ -557,13 +612,18 @@ def compute_reply_coverage(items, reply):
     'parsed', and severity_ceiling — computed only over the items Grok
     returned — read as complete triage. Visible by eye, absent by field.
 
-    Coverage keys on `digest_id`, a mechanical label the watchman mints
-    (item-0001, ...) and no untrusted input can influence, so the accounting
-    holds even when every metadata field failed sanitization. A reply item that
-    carries only `ref` is still matched, tolerantly, by ref.
+    Coverage keys on `digest_id` ONLY — a mechanical label the watchman mints
+    (item-0001, ...) that no untrusted input can influence, so the accounting
+    holds even when every metadata field failed sanitization.
+
+    THE `ref` FALLBACK IS GONE. `ref` is attacker-derived (it is built from a
+    filename or a board message id), so matching on it let a reply claim an
+    expected slot by echoing a string the item's own source controls, and a
+    truncated-or-redacted ref could match the wrong item. A reply item without
+    a valid `digest_id` is grok-extra and can never claim a slot; the slot it
+    tried to claim stays omitted and raises its own attend line.
     """
     expected = {it["digest_id"]: it.get("ref") for it in items}
-    by_ref = {it.get("ref"): it["digest_id"] for it in items if it.get("ref")}
     reply_items = []
     if isinstance(reply, dict) and isinstance(reply.get("items"), list):
         reply_items = [r for r in reply["items"] if isinstance(r, dict)]
@@ -573,8 +633,6 @@ def compute_reply_coverage(items, reply):
     for r in reply_items:
         did = r.get("digest_id")
         if did not in expected:
-            did = by_ref.get(r.get("ref"))
-        if did is None:
             extra.append(
                 {
                     "digest_id": sanitizer.cap_field(str(r.get("digest_id") or "")),
@@ -595,14 +653,35 @@ def compute_reply_coverage(items, reply):
         if n > 1
     ]
     return {
+        # Arithmetic a reader can check without trusting the label:
+        #   expected    == answered + omitted
+        #   reply_items == judgments + extra
         "expected": len(expected),
         "answered": len(hits),
         "omitted": len(omitted),
         "extra": len(extra),
+        "duplicated": len(duplicated),
+        "reply_items": len(reply_items),
+        "judgments": sum(hits.values()),
         "omitted_refs": omitted,
         "extra_refs": extra,
         "duplicated_refs": duplicated,
     }
+
+
+def reply_state_for(coverage):
+    """The label, derived from the same numbers a reader can check.
+
+    'parsed' is reserved for a reply that covers the digest exactly once each.
+    Duplicates used to leave the label at 'parsed' while duplicated_refs was
+    non-empty and an attend line fired — label and arithmetic disagreeing is
+    the fail-open shape this whole build hunts.
+    """
+    if coverage["omitted"] or coverage["extra"]:
+        return "parsed-partial"
+    if coverage["duplicated"]:
+        return "parsed-with-anomalies"
+    return "parsed"
 
 
 def quarantine_reply(root, sweep_id, stdout, stderr):
@@ -659,20 +738,26 @@ def run_sweep(
     policy, policy_state = sanitizer.load_policy(policy_path)
 
     surfaces = {}
-    raw_items = []  # (meta, body) pairs
+    raw_items = []  # (surface_name, meta, body) triples
+
+    def collect(surface_name, pairs):
+        # The surface NAME is attached mechanically at collection time and is
+        # the single source items_by_surface is later counted from (H6).
+        for meta, body in pairs:
+            raw_items.append((surface_name, meta, body))
 
     surfaces["pending_writes"], pw_items, pw_seen = scan_pending_writes(root, state)
-    raw_items.extend(pw_items)
+    collect("pending_writes", pw_items)
     surfaces["halts"], halt_items, halt_seen = scan_halts(root, state)
-    raw_items.extend(halt_items)
+    collect("halts", halt_items)
     surfaces["handoffs"], ho_items, unconsumed = scan_handoffs(root, state)
-    raw_items.extend(ho_items)
+    collect("handoffs", ho_items)
     surfaces["heartbeat"], hb_items, hb_state = scan_heartbeat(
         state, heartbeat_fetch=heartbeat_fetch, git_head_fn=git_head_fn
     )
-    raw_items.extend(hb_items)
+    collect("heartbeat", hb_items)
     surfaces["comms"], comms_items = scan_comms(comms_fetch=comms_fetch)
-    raw_items.extend(comms_items)
+    collect("comms", comms_items)
 
     # Sanitize. Metadata always travels — but SANITIZED: every string field
     # runs through the same redactor as previews and is capped, because
@@ -693,7 +778,7 @@ def run_sweep(
     sanitizer_attempts = 0
     sanitizer_failures = 0
     failed_refs = set()
-    for index, (meta, body) in enumerate(raw_items, start=1):
+    for index, (surface_name, meta, body) in enumerate(raw_items, start=1):
         safe_meta, meta_ok = sanitizer.sanitize_metadata(meta, **sanitize_kwargs)
         if sanitizer.denylisted(meta, policy):
             preview, preview_state = None, "metadata-only:denylist"
@@ -705,6 +790,7 @@ def run_sweep(
         # Mechanical, never attacker-derived: reply coverage keys on this, so
         # it must survive total sanitizer failure and stay unique.
         item["digest_id"] = f"item-{index:04d}"
+        item["surface"] = surface_name
         item["metadata_sanitized"] = meta_ok
         item["body_bytes"] = (
             len(body.encode("utf-8", errors="replace"))
@@ -791,8 +877,6 @@ def run_sweep(
     state["blind_streak"] = blind_streak
     state["last_sweep"] = started_at
     state["sweeps"] = int(state.get("sweeps", 0)) + 1
-    if not dry_run:
-        save_state(root, state)
 
     if not items and not surface_errors:
         log_line(
@@ -801,16 +885,50 @@ def run_sweep(
             f"grok not invoked",
             dry_run=dry_run,
         )
+        if not dry_run:
+            save_state(root, state)
         return None
+
+    # COUNTS COME FROM ONE SOURCE: the final items list. They used to be read
+    # back out of each scanner's self-reported surface['items'], a second
+    # source that can disagree with the first — a surface that raised
+    # mid-iteration could report a count for items that never made it into the
+    # digest, and items_by_surface would not sum to items_seen with nothing
+    # saying why.
+    by_surface = {name: 0 for name in SURFACE_NAMES}
+    for it in items:
+        by_surface[it["surface"]] = by_surface.get(it["surface"], 0) + 1
+    for name, count in by_surface.items():
+        if isinstance(surfaces.get(name), dict):
+            surfaces[name]["items"] = count
 
     counts = {
         "items_seen": len(items),
         "items_previewed": previewed,
         "items_metadata_only": meta_only_counts,
-        "items_by_surface": {
-            name: int(info.get("items", 0) or 0) for name, info in surfaces.items()
-        },
+        "items_by_surface": by_surface,
     }
+
+    # THE SURFACES BLOCK TRAVELS TOO, so it is sanitized like any other
+    # metadata. Its strings are not house-authored: a surface `error` is an
+    # OSError message carrying a filesystem path, and a `note` carries commit
+    # hashes and counts read off the wire. All of it goes into the digest handed
+    # to Grok, into the spool, and into latest.md — and none of it used to see
+    # the redactor.
+    safe_surfaces, surfaces_ok = sanitizer.sanitize_metadata(
+        surfaces, **sanitize_kwargs
+    )
+
+    # Surface errors are reported from the surface NAME (a house literal), with
+    # the sanitized error text alongside. Deriving the attend lines from the
+    # sanitized block's SHAPE would lose them entirely when that block collapses
+    # under a dead redactor — a fail-open in the reporting path.
+    def _sanitized_error(name):
+        node = safe_surfaces.get(name) if isinstance(safe_surfaces, dict) else None
+        if isinstance(node, dict) and isinstance(node.get("error"), str):
+            return node["error"]
+        return sanitizer.UNSANITIZED_TOKEN
+
     envelope = {
         "kind": "watchman-sweep",
         "sweep_id": sweep_id,
@@ -818,7 +936,13 @@ def run_sweep(
         "finished_at": now_iso(),
         "root": str(root),
         "dry_run": bool(dry_run),
-        "surfaces": surfaces,
+        "surfaces": safe_surfaces,
+        "surfaces_sanitized": surfaces_ok,
+        "surface_errors": [
+            {"surface": name, "error": _sanitized_error(name)}
+            for name in SURFACE_NAMES
+            if not surfaces.get(name, {}).get("ok")
+        ],
         "counts": counts,
         "policy_state": policy_state,
         "policy_path": str(policy_path) if policy_path else None,
@@ -837,92 +961,127 @@ def run_sweep(
         "quarantine_file": None,
     }
 
-    if items and sweep_blind:
-        # Every item that reached the redactor failed. There is no sanitized
-        # content to classify — waking Grok would spend a real call on a digest
-        # the instrument itself cannot see. Same shape as the surface-errors
-        # path: report the instrument, do not wake the mind.
-        envelope["grok_reply_state"] = "not-invoked-sweep-blind"
-        log_line(
-            root,
-            f"sweep {sweep_id} — {len(items)} deltas but the sanitizer failed on "
-            f"all {sanitizer_attempts} attempt(s); grok not invoked, "
-            f"blind_streak={blind_streak}/{threshold}",
-            dry_run=dry_run,
-        )
-    elif items and dry_run:
-        envelope["grok_reply_state"] = "dry-run"
-        prompt_file = Path(root) / "watchman" / f"{sweep_id}.dry-run-prompt.txt"
-        prompt_file.parent.mkdir(parents=True, exist_ok=True)
-        digest = {k: envelope[k] for k in ("sweep_id", "surfaces", "counts", "items")}
-        prompt_file.write_text(build_prompt(digest), encoding="utf-8")
-        envelope["dry_run_prompt_file"] = str(prompt_file)
-        log_line(
-            root,
-            f"sweep {sweep_id} DRY RUN — {len(items)} deltas, grok NOT invoked",
-            dry_run=dry_run,
-        )
-    elif items:
-        digest = {k: envelope[k] for k in ("sweep_id", "surfaces", "counts", "items")}
-        try:
-            rc, stdout, stderr = invoke_cosmic(
-                build_prompt(digest), cosmic_bin=cosmic_bin
+    sweep_error = None
+
+    def mind_phase():
+        if items and sweep_blind:
+            # Every item that reached the redactor failed. There is no sanitized
+            # content to classify — waking Grok would spend a real call on a
+            # digest the instrument itself cannot see. Same shape as the
+            # surface-errors path: report the instrument, do not wake the mind.
+            envelope["grok_reply_state"] = "not-invoked-sweep-blind"
+            log_line(
+                root,
+                f"sweep {sweep_id} — {len(items)} deltas but the sanitizer failed "
+                f"on all {sanitizer_attempts} attempt(s); grok not invoked, "
+                f"blind_streak={blind_streak}/{threshold}",
+                dry_run=dry_run,
             )
-            # A process ran. Only here does grok_invoked become true.
-            envelope["grok_invoked"] = True
-            envelope["grok_process_state"] = "spawned"
-            parsed, identity_present = parse_grok_reply(stdout if rc == 0 else "")
-            if rc != 0 or parsed is None:
-                qfile = quarantine_reply(root, sweep_id, stdout, stderr)
+        elif items and dry_run:
+            envelope["grok_reply_state"] = "dry-run"
+            prompt_file = Path(root) / "watchman" / f"{sweep_id}.dry-run-prompt.txt"
+            prompt_file.parent.mkdir(parents=True, exist_ok=True)
+            digest = {
+                k: envelope[k] for k in ("sweep_id", "surfaces", "counts", "items")
+            }
+            prompt_file.write_text(build_prompt(digest), encoding="utf-8")
+            envelope["dry_run_prompt_file"] = str(prompt_file)
+            log_line(
+                root,
+                f"sweep {sweep_id} DRY RUN — {len(items)} deltas, grok NOT invoked",
+                dry_run=dry_run,
+            )
+        elif items:
+            digest = {
+                k: envelope[k] for k in ("sweep_id", "surfaces", "counts", "items")
+            }
+            try:
+                rc, stdout, stderr = invoke_cosmic(
+                    build_prompt(digest), cosmic_bin=cosmic_bin
+                )
+                # A process ran. Only here does grok_invoked become true.
+                envelope["grok_invoked"] = True
+                envelope["grok_process_state"] = "spawned"
+                parsed, identity_present = parse_grok_reply(
+                    stdout if rc == 0 else "", sweep_id
+                )
+                if rc != 0 or parsed is None:
+                    qfile = quarantine_reply(root, sweep_id, stdout, stderr)
+                    envelope["grok_reply_state"] = "grok-reply-unparseable"
+                    envelope["quarantine_file"] = str(qfile)
+                else:
+                    envelope["grok_reply"] = parsed
+                    envelope["grok_identity_line_present"] = identity_present
+                    coverage = compute_reply_coverage(items, parsed)
+                    envelope["reply_coverage"] = coverage
+                    # A reply that does not cover the digest exactly once each is
+                    # NOT 'parsed'. The state says which, and the mechanical tier
+                    # raises an attend line per omitted / extra / duplicated item
+                    # so severity_ceiling cannot understate.
+                    envelope["grok_reply_state"] = reply_state_for(coverage)
+            except subprocess.TimeoutExpired as e:
+                # The process DID spawn; it just never answered in time.
+                envelope["grok_invoked"] = True
+                envelope["grok_process_state"] = "spawned"
+                qfile = quarantine_reply(
+                    root, sweep_id, "", f"invocation timed out: {e}"
+                )
                 envelope["grok_reply_state"] = "grok-reply-unparseable"
                 envelope["quarantine_file"] = str(qfile)
-            else:
-                envelope["grok_reply"] = parsed
-                envelope["grok_identity_line_present"] = identity_present
-                coverage = compute_reply_coverage(items, parsed)
-                envelope["reply_coverage"] = coverage
-                # A reply that does not cover the digest is NOT 'parsed'. The
-                # state says which, and the mechanical tier raises an attend
-                # line per omitted item so severity_ceiling cannot understate.
-                envelope["grok_reply_state"] = (
-                    "parsed"
-                    if coverage["omitted"] == 0 and coverage["extra"] == 0
-                    else "parsed-partial"
-                )
-        except subprocess.TimeoutExpired as e:
-            # The process DID spawn; it just never answered in time.
-            envelope["grok_invoked"] = True
-            envelope["grok_process_state"] = "spawned"
-            qfile = quarantine_reply(root, sweep_id, "", f"invocation timed out: {e}")
-            envelope["grok_reply_state"] = "grok-reply-unparseable"
-            envelope["quarantine_file"] = str(qfile)
-        except OSError as e:
-            # No process ever ran (missing binary, permission, ENOENT). Saying
-            # 'invoked' here claims spend that did not happen.
-            envelope["grok_invoked"] = False
-            envelope["grok_process_state"] = "spawn-failed"
-            qfile = quarantine_reply(root, sweep_id, "", f"invocation failed: {e}")
-            envelope["grok_reply_state"] = "grok-spawn-failed"
-            envelope["grok_spawn_error"] = str(e)
-            envelope["quarantine_file"] = str(qfile)
-        log_line(
-            root,
-            f"sweep {sweep_id} — {len(items)} deltas, "
-            f"grok_process={envelope['grok_process_state']}, "
-            f"reply={envelope['grok_reply_state']}",
-            dry_run=dry_run,
+            except OSError as e:
+                # No process ever ran (missing binary, permission, ENOENT).
+                # Saying 'invoked' here claims spend that did not happen.
+                envelope["grok_invoked"] = False
+                envelope["grok_process_state"] = "spawn-failed"
+                qfile = quarantine_reply(root, sweep_id, "", f"invocation failed: {e}")
+                envelope["grok_reply_state"] = "grok-spawn-failed"
+                envelope["grok_spawn_error"] = str(e)
+                envelope["quarantine_file"] = str(qfile)
+            log_line(
+                root,
+                f"sweep {sweep_id} — {len(items)} deltas, "
+                f"grok_process={envelope['grok_process_state']}, "
+                f"reply={envelope['grok_reply_state']}",
+                dry_run=dry_run,
+            )
+        else:
+            # Surface errors only: mechanical envelope, no semantic content to
+            # classify — the attend line is about the instrument itself.
+            log_line(
+                root,
+                f"sweep {sweep_id} — 0 deltas but surface errors: "
+                f"{', '.join(surface_errors)}; grok not invoked",
+                dry_run=dry_run,
+            )
+
+    # AT-LEAST-ONCE, and the ordering that buys it. Anything that raises between
+    # collection and the spool write leaves the high-water mark exactly where it
+    # was, so the deltas re-fire next sweep. The state save used to run BEFORE
+    # this phase: a crash in the mind phase consumed the deltas and the next
+    # sweep went quiet — the work was gone and nothing said so.
+    #
+    # SCOPE, stated exactly: at-least-once covers the FILESYSTEM surfaces
+    # (pending_writes, halts) and the two counter surfaces, which re-derive from
+    # disk. It does NOT cover comms — `mark_read_as` is applied server-side
+    # during collection, so those messages are already consumed and will not
+    # re-fire. That gap is named in the README, not papered over here.
+    try:
+        mind_phase()
+    except Exception as e:  # noqa: BLE001 — deliberately broad; see above
+        sweep_error = sanitizer.cap_field(
+            sanitizer.mask_token_shaped(f"{type(e).__name__}: {e}")
         )
-    else:
-        # Surface errors only: mechanical envelope, no semantic content to
-        # classify — the attend line is about the instrument itself.
+        envelope["sweep_error"] = sweep_error
         log_line(
             root,
-            f"sweep {sweep_id} — 0 deltas but surface errors: "
-            f"{', '.join(surface_errors)}; grok not invoked",
+            f"sweep {sweep_id} — PARTIAL FAILURE after collection: {sweep_error}; "
+            f"high-water NOT advanced, filesystem deltas re-fire next sweep",
             dry_run=dry_run,
         )
 
     spool_writer.write_sweep(root, envelope, dry_run=dry_run)
+    if not dry_run and sweep_error is None:
+        save_state(root, state)
     return envelope
 
 
@@ -944,7 +1103,15 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     root = resolve_root(args.root)
-    envelope = run_sweep(root, dry_run=args.dry_run, cosmic_bin=args.cosmic_bin)
+    with sweep_lock(root) as acquired:
+        if not acquired:
+            # An overlapping invocation touches NOTHING: no scan, no state, no
+            # spool, no cosmic. One honest line so the skip is visible, and
+            # exit 0 so launchd does not treat a correct skip as a failure.
+            log_line(root, "sweep already live, skipping", dry_run=args.dry_run)
+            print("watchman: sweep already live, skipping")
+            return 0
+        envelope = run_sweep(root, dry_run=args.dry_run, cosmic_bin=args.cosmic_bin)
     if envelope is None:
         print("watchman: quiet sweep — no deltas, grok not invoked")
     else:
