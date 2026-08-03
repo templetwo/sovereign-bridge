@@ -133,6 +133,27 @@ def mechanical_lines(envelope):
             }
         )
 
+    # The mind resting is the spend loop broken — say so, urgently.
+    mind = envelope.get("mind") or {}
+    if mind.get("resting"):
+        lines.append(
+            {
+                "severity": "urgent",
+                "ref": "instrument:mind",
+                "reason": (
+                    f"THE MIND IS RESTING: {mind['failure_streak']} consecutive "
+                    f"spawned-but-unsaved grok failure(s) (threshold "
+                    f"{mind['threshold']}) — the spend loop is broken, grok is "
+                    f"not being invoked, and mechanical digests continue "
+                    f"landing here. Repair the grok phase (check the "
+                    f"quarantine files), then run watchman_sweep.py "
+                    f"--reset-mind."
+                ),
+                "source": "mechanical",
+                "flagged_for_richer_review": True,
+            }
+        )
+
     # The instrument reporting its own blindness.
     blind = envelope.get("blindness") or {}
     if blind.get("streak", 0) >= blind.get("threshold", 0) > 0:

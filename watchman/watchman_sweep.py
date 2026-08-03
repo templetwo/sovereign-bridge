@@ -70,12 +70,28 @@ IDENTITY_LINE = "WATCHMAN SWEEP — grok-4.5 via cosmic-cli"
 # let a counter in one spool line be the only signal.
 BLIND_STREAK_DEFAULT = 3
 
+# Mind-rest guard (closure-round residual R4, fixed by HQ before the gate).
+# A failure raised AFTER invoke_cosmic returns leaves the xAI spend made but
+# the high-water unsaved, so the same deltas re-fire and re-spend every sweep
+# — the scribe-greeting spend loop in a new costume. After N consecutive
+# spawned-but-unsaved failures the watchman rests the mind phase: mechanical
+# digests keep landing in the spool (nothing is lost, the seat still sees
+# every item), Grok is not invoked, and an urgent instrument line says so.
+MIND_REST_DEFAULT = 3
+
 
 def blind_streak_threshold():
     try:
         return max(1, int(os.environ.get("WATCHMAN_BLIND_STREAK_N", "")))
     except ValueError:
         return BLIND_STREAK_DEFAULT
+
+
+def mind_rest_threshold():
+    try:
+        return max(1, int(os.environ.get("WATCHMAN_MIND_REST_N", "")))
+    except ValueError:
+        return MIND_REST_DEFAULT
 
 
 def now_iso():
@@ -827,6 +843,8 @@ def run_sweep(
     sweep_blind = sanitizer_attempts > 0 and sanitizer_failures == sanitizer_attempts
     threshold = blind_streak_threshold()
     prev_streak = int(state.get("blind_streak", 0) or 0)
+    prev_mind_streak = int(state.get("mind_failure_streak", 0) or 0)
+    mind_resting = prev_mind_streak >= mind_rest_threshold()
     if sweep_blind:
         blind_streak = prev_streak + 1
     elif sanitizer_attempts > 0:
@@ -947,6 +965,11 @@ def run_sweep(
         "policy_state": policy_state,
         "policy_path": str(policy_path) if policy_path else None,
         "blindness": blindness,
+        "mind": {
+            "failure_streak": prev_mind_streak,
+            "threshold": mind_rest_threshold(),
+            "resting": mind_resting,
+        },
         "items": items,
         "grok_invoked": False,
         # Three states, because 'invoked' was stamped True even when no process
@@ -989,6 +1012,21 @@ def run_sweep(
             log_line(
                 root,
                 f"sweep {sweep_id} DRY RUN — {len(items)} deltas, grok NOT invoked",
+                dry_run=dry_run,
+            )
+        elif items and mind_resting:
+            # Spend breaker. The streak only counts spawned-but-unsaved
+            # failures — real xAI calls whose deltas re-fired. Resting consumes
+            # the deltas MECHANICALLY (items land in the spool, state saves),
+            # so the loop breaks without losing a single item; the seat reads
+            # the mechanical digest itself until --reset-mind after repair.
+            envelope["grok_reply_state"] = "not-invoked-mind-resting"
+            log_line(
+                root,
+                f"sweep {sweep_id} — {len(items)} deltas but the mind is "
+                f"RESTING after {prev_mind_streak} spawned-but-unsaved "
+                f"failure(s) (threshold {mind_rest_threshold()}); grok not "
+                f"invoked, no spend; run --reset-mind after repair",
                 dry_run=dry_run,
             )
         elif items:
@@ -1078,6 +1116,23 @@ def run_sweep(
             f"high-water NOT advanced, filesystem deltas re-fire next sweep",
             dry_run=dry_run,
         )
+        if not dry_run and envelope["grok_process_state"] == "spawned":
+            # The spend happened and the deltas will re-fire: that pairing is
+            # the loop. Persist ONLY the streak — a fresh load keeps the
+            # un-advanced high-water exactly as it is on disk.
+            fresh = load_state(root)
+            fresh["mind_failure_streak"] = prev_mind_streak + 1
+            save_state(root, fresh)
+            envelope["mind"]["failure_streak"] = prev_mind_streak + 1
+
+    if sweep_error is None:
+        if envelope["grok_process_state"] == "spawned":
+            # A spawn that completed the whole sweep proves the mind path
+            # works again; anything else (resting, blind, spawn-failed, no
+            # items) is not evidence either way, so the streak holds.
+            state["mind_failure_streak"] = 0
+        else:
+            state["mind_failure_streak"] = prev_mind_streak
 
     spool_writer.write_sweep(root, envelope, dry_run=dry_run)
     if not dry_run and sweep_error is None:
@@ -1100,9 +1155,20 @@ def main(argv=None):
         "A dry run can never blind a subsequent live sweep.",
     )
     ap.add_argument("--cosmic-bin", default=None, help="override cosmic-cli path")
+    ap.add_argument(
+        "--reset-mind",
+        action="store_true",
+        help="zero the mind-rest failure streak (after repairing the grok "
+        "phase) so the next sweep invokes cosmic again",
+    )
     args = ap.parse_args(argv)
 
     root = resolve_root(args.root)
+    if args.reset_mind:
+        fresh = load_state(root)
+        fresh["mind_failure_streak"] = 0
+        save_state(root, fresh)
+        print("mind-rest streak reset to 0")
     with sweep_lock(root) as acquired:
         if not acquired:
             # An overlapping invocation touches NOTHING: no scan, no state, no

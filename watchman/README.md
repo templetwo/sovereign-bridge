@@ -213,6 +213,16 @@ withholds every body and looks exactly like a quiet night.
   (Filesystem surfaces only — the comms high-water is server-side
   `mark_read_as`, so a comms message read during a blind sweep is already
   consumed. See RESIDUAL RISK #4; not fixed here.)
+- **The mind rests before it loops.** At-least-once semantics re-fire deltas
+  whose sweep failed after collection — which, when the failure lands AFTER
+  `invoke_cosmic` returns, would re-spend a real xAI call every sweep on the
+  same deltas (the scribe-greeting spend loop in a new costume; closure-round
+  residual R4, closed by HQ pre-gate). After `WATCHMAN_MIND_REST_N` (default 3)
+  consecutive spawned-but-unsaved failures the watchman rests the mind phase:
+  mechanical digests keep landing in the spool (no item is lost — the seat
+  reads them directly), Grok is not invoked, an urgent `instrument:mind` line
+  says so, and `--reset-mind` re-arms after repair. A completed spawn resets
+  the streak; a spawn that never ran does not count toward it.
 - **Reply coverage.** The directive commands that every digest item appear
   exactly once; the mechanical tier *verifies* it. The envelope carries
   `reply_coverage: {expected, answered, omitted, extra, duplicated,
