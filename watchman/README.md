@@ -132,6 +132,13 @@ What the mind may see was decided by the seat that holds the post: Option C is
   lives here. **The upstream gap is unclosed and is flagged for the Grok helm**:
   a base64-wrapped secret still passes t2helix's own write-path scrub into the
   helix chronicle.
+  **What the widened class now ALSO eats:** `-` and `_` are in the character
+  class, so any contiguous kebab- or snake-cased identifier of 40+ characters
+  is masked. This house's vocabulary is full of them —
+  `pol_20260712_law-10-the-nuisance-baseline-a-gate-must` masks to
+  `<BASE64-BLOB:len=53>`. Those were legible before this round. Accepted as
+  over-withholding; `directive.md` tells Grok the token may be an identifier
+  rather than an encoded payload.
 - **Token-shaped pre-pass, UNANCHORED, before the redactor ever runs** —
   applied to previews AND to metadata. Two rules, both producing
   `<TOKEN-SHAPED:len=N>`:
@@ -162,10 +169,25 @@ What the mind may see was decided by the seat that holds the post: Option C is
   renders as `<TOKEN-SHAPED:len=N>`, not `<BASE64-BLOB:…>`); the base64 mask
   runs after redaction and catches runs carrying `+ / - _` that the bare-alnum
   rule splits on. Two labels, one guarantee: neither form travels in the clear.
+  **What rule 1 also eats:** the prefixes are UNANCHORED by design, so `sk-`
+  fires inside ordinary words — `task-`, `risk-`, `disk-`, `desk-` followed by
+  16+ `[A-Za-z0-9_-]` all mask. `task-management-board-20260803` becomes
+  `ta<TOKEN-SHAPED:len=28>`. Grok will see this constantly; the directive tells
+  it the token may be a long identifier rather than a credential.
   **Consequence for receipts:** a full-length sha256 or git SHA is masked in
   BOTH previews and metadata now (rule 2 eats it), so neither surface will give
   you a digest. Read it from the source artifact. The heartbeat surface is
   unaffected in practice because it reports SHORT commits.
+
+- **The content gate reads the RAW window as well as the masked one.** Both
+  masks above run UPSTREAM of `content_flagged`, so a sensitive term living
+  inside a run they claim would be gone before the gate could see it —
+  `domain-biomedical-assay-protocol-reference-2026` is one 47-char run.
+  Nothing would LEAK (the run is masked), but the item would silently lose its
+  `content-flagged` state, and that state is what sets
+  `flagged_for_richer_review`. Fail-closed on disclosure, fail-open on
+  signalling. The gate therefore runs against the pre-mask window too, which is
+  strictly tightening: it can only add flags.
 - Every item carries its `preview_state`, its `digest_id`, its `surface`, and
   `body_bytes`; the envelope counts `items_previewed` vs `items_metadata_only`
   per reason and `items_by_surface`, so a partial view can never read as a full

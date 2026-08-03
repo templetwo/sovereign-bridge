@@ -794,8 +794,28 @@ def preview_for(body, meta: dict, policy: dict, **redactor_kwargs):
         # Nothing was actually inspected — counting this as 'previewed' would
         # inflate the coverage number with empty reads.
         return None, "metadata-only:empty-body"
-    if content_flagged(masked, policy) or mixed_script(masked):
+    # THE CONTENT LEG READS THE RAW WINDOW AS WELL AS THE MASKED ONE, and that
+    # is not belt-and-braces — the masks BLIND this gate otherwise.
+    # mask_token_shaped runs inside run_redactor and mask_base64_blobs runs
+    # above, both UPSTREAM of here, so a sensitive term living inside a masked
+    # run is gone before the gate can see it:
+    #     'domain-biomedical-assay-protocol-reference-2026'
+    #        -> one 47-char base64-alphabet run -> <BASE64-BLOB:len=47>
+    #     'biomedicalassay2026protocolreference00'
+    #        -> one 38-char high-entropy run    -> <TOKEN-SHAPED:len=38>
+    # Nothing LEAKS either way (the run is masked), but the item silently loses
+    # its 'content-flagged' state — and that state is what sets
+    # flagged_for_richer_review, the second net. Fail-closed on disclosure,
+    # fail-OPEN on signalling, which is the exact shape this build hunts.
+    # Reading the raw window is strictly tightening and can only add flags.
+    raw_window = body[:SANITIZER_INPUT_WINDOW]
+    if (
+        content_flagged(masked, policy)
+        or mixed_script(masked)
+        or content_flagged(raw_window, policy)
+        or mixed_script(raw_window)
+    ):
         # The CONTENT leg: sensitivity that was never declared in metadata, and
-        # any mixed-script token in the redacted window.
+        # any mixed-script token — checked before AND after masking.
         return None, "metadata-only:content-flagged"
     return truncate_with_marker(masked, PREVIEW_CHARS, len(body)), "sanitized"

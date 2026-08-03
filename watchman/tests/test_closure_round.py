@@ -19,7 +19,6 @@ from conftest import (
     SWEEP_ID_PLACEHOLDER,
     all_persisted_text,
     good_reply_for,
-    invocations,
     make_fake_cosmic,
     write_proposal,
 )
@@ -294,6 +293,44 @@ def test_a_pure_single_script_word_is_a_documented_residual_not_a_hit():
     assert _state_for("routine café résumé note, synthetic") == "sanitized"
     # ...and the map is what covers the single-script case it happens to know:
     assert "o" in sanitizer.fold("о")
+
+
+@pytest.mark.parametrize(
+    "body,why",
+    [
+        pytest.param(
+            "note about domain-biomedical-assay-protocol-reference-2026 here",
+            "a 47-char kebab run the widened base64 class swallows whole",
+            id="eaten-by-base64-mask",
+        ),
+        pytest.param(
+            "ref biomedicalassay2026protocolreference00 here",
+            "a 38-char high-entropy run the L7 pre-pass swallows whole",
+            id="eaten-by-token-pre-pass",
+        ),
+    ],
+)
+def test_a_masked_run_cannot_hide_a_content_term_from_the_gate(body, why):
+    """THE ONE TEST IN THIS ROUND THAT CATCHES A DEFECT THE ROUND ITSELF
+    INTRODUCED.
+
+    Its provenance is the opposite of every other test here, and the difference
+    is the point: it is GREEN on cf428bf (the old tree got this right), RED on
+    the first closure commit 9019c92, and green again now. Measured, not
+    assumed — on cf428bf both probes return metadata-only:content-flagged.
+
+    L6 widened the base64 class to [A-Za-z0-9+/_-] and L7 added a pre-pass, and
+    BOTH run upstream of the content gate. A sensitive term living inside a run
+    those masks claim is therefore gone before content_flagged() reads it.
+    Nothing LEAKS — the run is masked either way — but the item silently loses
+    its metadata-only:content-flagged state, and that state is what sets
+    flagged_for_richer_review. Fail-closed on disclosure, fail-OPEN on
+    signalling: the README calls that flag 'the second net', and this turned it
+    off for a whole class of items with nothing saying so.
+
+    The gate reads the RAW window as well as the masked one. That is strictly
+    tightening: it can only add flags, never remove one."""
+    assert _state_for(body) == "metadata-only:content-flagged", why
 
 
 def test_masking_tokens_and_markers_never_trip_the_mixed_script_check():
@@ -852,6 +889,9 @@ def test_the_lock_is_released_so_the_next_invocation_runs(
 
     assert watchman_sweep.main(["--root", str(sov_root)]) == 0
     assert (sov_root / "watchman" / "state.json").exists()
-    # Second invocation acquires cleanly and runs again.
+    # Second invocation acquires cleanly and runs again — proven by the log
+    # gaining a real sweep line rather than a skip line.
     assert watchman_sweep.main(["--root", str(sov_root)]) == 0
-    assert invocations(tmp_path / "never-written.log") == 0
+    log = (sov_root / "watchman" / "watchman.log").read_text()
+    assert "sweep already live, skipping" not in log
+    assert len(log.strip().splitlines()) == 2

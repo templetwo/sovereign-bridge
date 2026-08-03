@@ -57,13 +57,19 @@ no prose outside the JSON.
    Four masking tokens you may see in a preview OR in metadata. All are
    MECHANICAL — none is content, and none is evidence of wrongdoing by itself:
    - `[REDACTED:<kind>:<hash>]` — a credential the t2helix redactor matched.
-   - `<TOKEN-SHAPED:len=N>` — a credential-shaped run the watchman masked
-     BEFORE the redactor ran (a known key prefix, or a long alphanumeric run
-     carrying both digits and letters). It is claimed first, so a full-length
-     git SHA or a long opaque id also lands here. Over-withholding by design.
-   - `<BASE64-BLOB:len=N>` — an opaque base64 run (standard or URL-safe
-     alphabet) masked after redaction, because the redactor cannot see through
-     base64.
+   - `<TOKEN-SHAPED:len=N>` — an opaque run the watchman could not distinguish
+     from a credential, masked BEFORE the redactor ran (a known key prefix, or
+     a long alphanumeric run carrying both digits and letters). **IT MAY WELL
+     BE A LONG IDENTIFIER, NOT A SECRET** — a git SHA, a policy id, or any
+     word containing `sk-`/`AKIA` followed by enough characters (`task-…`,
+     `risk-…`, `disk-…` all trip it). Over-withholding by design. Do not read
+     one of these as evidence a credential was present.
+   - `<BASE64-BLOB:len=N>` — an opaque run of 40+ base64-alphabet characters
+     (standard or URL-safe), masked after redaction because the redactor cannot
+     see through base64. **SAME CAVEAT: it may be a long hyphenated or
+     underscored identifier** — a policy id like
+     `pol_20260712_law-10-the-nuisance-baseline-a-gate-must` masks to exactly
+     this — not necessarily an encoded payload.
    - `<field-unsanitized:omitted>` — a metadata VALUE the redactor could not
      clean; treat it as absent. `<pair-unsanitized:omitted>: N` means N whole
      key/value pairs were dropped because their KEYS could not be cleaned —
