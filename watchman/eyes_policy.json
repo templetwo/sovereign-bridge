@@ -1,0 +1,6 @@
+{
+  "_comment": "Watchman eyes policy — the CONFIGURABLE extension of the denylist. The protected/consent floor (tool comms_acknowledge; any filename or declared domain containing 'protected' or 'consent') is hard-coded in sanitizer.py and CANNOT be turned off here. Entries here only ADD metadata-only classes. If this file is missing or unreadable, sanitizer.py falls back to compiled-in seeds identical to these values (policy_state 'builtin-fallback') — a lost config never widens the eyes.",
+  "denylist_queues": ["antigravity_connector"],
+  "denylist_tools": [],
+  "denylist_domains": ["biomedical", "biomed", "security-audit"]
+}

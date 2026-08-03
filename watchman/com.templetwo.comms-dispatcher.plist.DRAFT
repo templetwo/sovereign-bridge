@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  DRAFT — NOT LOADED. Loading this plist replaces the live comms-dispatcher
+  and is Anthony's gate. Do not copy into ~/Library/LaunchAgents, do not
+  `launchctl load/bootstrap`, without his explicit go.
+
+  This is the SUCCESSOR plist for the watchman, kept under the SAME label as
+  the dispatcher it replaces — addresses outlast occupants. The old
+  comms_dispatcher.py polling loop retires only when Anthony holds that
+  ceremony; until then this file stays a .DRAFT.
+
+  Shape: launchd is the ear (mechanical, free). WatchPaths fire the sweep on
+  sound from the three proposal queues and the halts dir; StartInterval 1800
+  is the slow heartbeat sweep; ThrottleInterval 60 keeps a chatty queue from
+  stampeding. The sweep itself only wakes Grok (cosmic-cli ask) when deltas
+  exist — the LLM wakes on sound, never on the clock.
+
+  Paths assume the watchman/ dir lives in the merged ~/sovereign-bridge tree.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.templetwo.comms-dispatcher</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/tony_studio/sovereign-stack/venv/bin/python3</string>
+        <string>/Users/tony_studio/sovereign-bridge/watchman/watchman_sweep.py</string>
+    </array>
+
+    <key>WatchPaths</key>
+    <array>
+        <string>/Users/tony_studio/.sovereign/grok_bridge/pending_writes</string>
+        <string>/Users/tony_studio/.sovereign/openai_bridge/pending_writes</string>
+        <string>/Users/tony_studio/.sovereign/antigravity_connector/pending_writes</string>
+        <string>/Users/tony_studio/.sovereign/daemons/halts</string>
+    </array>
+
+    <!-- Slow sweep heartbeat: every 30 minutes even with no filesystem sound,
+         so the bridge-heartbeat, handoff-count, and comms-board surfaces
+         (which WatchPaths cannot hear) still get swept. -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <!-- Floor between launches: a burst of queue writes coalesces into one
+         sweep per minute at most. -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <!-- One baseline sweep at load to seed high-water state. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/tony_studio/.sovereign/watchman/launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/tony_studio/.sovereign/watchman/launchd.err</string>
+</dict>
+</plist>
