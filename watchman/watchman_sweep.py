@@ -547,12 +547,19 @@ def build_prompt(digest):
 
 
 def invoke_cosmic(prompt, *, cosmic_bin):
-    """One-shot `cosmic-cli ask` — no agent loop, no tools, no enactment lane."""
+    """One-shot `cosmic-cli ask` — no agent loop, no tools, no enactment lane.
+
+    COLUMNS: cosmic renders through a console that hard-wraps at terminal
+    width (80 when piped), injecting raw newlines INSIDE JSON string
+    literals — Grok's first live reply was perfect and unparseable at once
+    (baptism, 2026-08-03). A huge COLUMNS disables the wrap at the source.
+    """
     proc = subprocess.run(
         [cosmic_bin, "ask", prompt],
         capture_output=True,
         text=True,
         timeout=COSMIC_TIMEOUT_S,
+        env={**os.environ, "COLUMNS": "4000"},
     )
     return proc.returncode, proc.stdout, proc.stderr
 
