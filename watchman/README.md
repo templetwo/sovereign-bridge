@@ -32,24 +32,104 @@ could not be read is REPORTED in the envelope, never silently omitted:
 What the mind may see was decided by the seat that holds the post: Option C is
 **Grok's own proposal**, adopted by HQ with fail-closed tightenings.
 
-- **Metadata always travels** — queue, filename, tool, commit_target, declared
-  risk_level, timestamp, size, age.
+- **Metadata always travels — but SANITIZED.** Every string metadata field (at
+  any depth, including nested `detail`) runs through the SAME redactor as
+  previews and is capped at 200 chars with an explicit truncation marker. A
+  field the redactor could not clean becomes `<field-unsanitized:omitted>` —
+  never the raw value. Metadata is copied out of untrusted files and board
+  messages and is handed to a third-party model in argv, in the prompt, and in
+  the spool; treating it as inherently safe was the leak-hunt's headline
+  finding.
 - **Preview** = first 600 chars of the body, run through the t2helix redaction
   patterns (`~/t2helix/lib/secrets.js` via `sanitize_preview.js` — the same
   single source of truth as the helix write path; the table is loaded, never
   copied, so the eyes can never drift from the helix).
-- **Fail-closed, all three directions:**
-  1. Denylist → metadata-only, no preview ever: protected/consent-shaped items
-     (tool `comms_acknowledge`, any filename or declared domain containing
-     `protected`/`consent` — a hard-coded floor no config can switch off),
-     plus `eyes_policy.json` (seeded: the antigravity queue; biomedical and
-     security-audit domains).
-  2. Sanitizer subprocess error, 2s timeout, or non-zero exit → metadata-only,
+- **Fail-closed, in every direction:**
+  1. **Denylist — DECLARATION leg** → metadata-only, no preview ever:
+     protected/consent-shaped items (tool `comms_acknowledge`, `protected` or
+     `consent` anywhere in an item's metadata — a hard-coded floor no config
+     can switch off), plus `eyes_policy.json` (seeded: the antigravity queue;
+     biomedical and security-audit domains).
+  2. **Denylist — CONTENT leg** → `metadata-only:content-flagged`. After
+     redaction, the wide window is matched against `content_terms` from
+     `eyes_policy.json`. The declaration leg only catches sensitivity the
+     writer declared; a biomed body filed under `domain=general` previewed in
+     full, and the comms surface (`tool=None`, `declared_domain=None`) had no
+     reachable denylist key at all. **Over-withholding is accepted by design**
+     — Grok's mandatory flag-for-richer-review covers what a withheld preview
+     costs.
+  3. Sanitizer subprocess error, 2s timeout, or non-zero exit → metadata-only,
      `preview_state='metadata-only:sanitizer-failed'`, recorded honestly.
-  3. Unknown/unparseable file → metadata-only, `preview_state='metadata-only:unparseable'`.
-- Every item carries its `preview_state`; the envelope counts
-  `items_previewed` vs `items_metadata_only` per reason, so a partial view can
-  never read as a full one.
+  4. Unknown/unparseable file → `metadata-only:unparseable`; whitespace-only
+     body → `metadata-only:empty-body` (and NOT counted as previewed — nothing
+     was inspected).
+  5. Eyes policy **strictly validated**: every listed key must be a list of
+     strings. A file that exists but does not validate closes the eyes
+     completely (`floor-fallback`, metadata-only for everything) and raises an
+     attend line about the file. A missing file falls back to compiled-in seeds
+     identical to the shipped ones (`builtin-fallback`) and still says so.
+- **Homoglyph folding.** All denylist and content matching runs on NFKC-
+  normalized, casefolded text with a confusables map applied to both needle and
+  haystack. One Cyrillic codepoint (`prоtected`) used to walk past a floor
+  described as un-turn-off-able. The folded form is used for MATCHING ONLY and
+  is never persisted.
+- **base64 blobs.** Runs of 40+ base64-alphabet characters in a preview are
+  replaced with `<BASE64-BLOB:len=N>` before truncation. This is a
+  **watchman-side mitigation of an UPSTREAM t2helix limit**: no pattern in
+  `lib/secrets.js` decodes base64, so a base64-wrapped credential scrubs clean.
+  The watchman's exposure differs in kind from the helix's — the helix persists
+  locally, the watchman ships the preview off-machine to xAI — which is why the
+  mitigation lives here. **The upstream gap is unclosed and is flagged for the
+  Grok helm**: a base64-wrapped secret still passes t2helix's own write-path
+  scrub into the helix chronicle. Consequence to expect: a sha256 receipt in a
+  body renders as `<BASE64-BLOB:len=64>`. That is over-withholding by design,
+  but receipts are load-bearing in this house, so read the item's metadata (not
+  the preview) when you need the digest.
+- Every item carries its `preview_state`, its `digest_id`, and `body_bytes`;
+  the envelope counts `items_previewed` vs `items_metadata_only` per reason and
+  `items_by_surface`, so a partial view can never read as a full one.
+
+## The instrument reports itself
+
+Fail-closed is not enough on its own: a watchman whose redactor cannot run
+withholds every body and looks exactly like a quiet night.
+
+- **Standing-blind detector.** N consecutive sweeps (default 3,
+  `WATCHMAN_BLIND_STREAK_N`) in which *every* preview attempt failed
+  sanitization raise an `urgent` spool line naming the watchman's own
+  blindness. A fully-blind sweep does **not** wake Grok — there is nothing
+  sanitized to classify, so spending a call on it would be theatre.
+- **Node resolution.** launchd does not inherit a login shell's PATH and node
+  lives under `/opt/homebrew`. Chain: `WATCHMAN_NODE_BIN` →
+  `/opt/homebrew/bin/node` → `/usr/local/bin/node` → `node`. The DRAFT plist
+  also sets `PATH` and `WATCHMAN_NODE_BIN` explicitly.
+- **Sanitizer failures are re-examined.** An item whose preview failed does not
+  advance its high-water mark, so it comes back once the redactor is repaired.
+  Previously a transient breakage blinded the watchman to those items forever.
+  (Filesystem surfaces only — the comms high-water is server-side
+  `mark_read_as`, so a comms message read during a blind sweep is already
+  consumed. Noted as a residual, not fixed here.)
+- **Reply coverage.** The directive commands that every digest item appear
+  exactly once; now the mechanical tier *verifies* it. The envelope carries
+  `reply_coverage: {expected, answered, omitted, extra}`; an omitted item
+  raises its own `attend` line (`grok-omitted`, flagged for richer review), an
+  invented one is recorded as `grok-extra` with a standing skepticism note, and
+  either demotes the reply to `parsed-partial`. Coverage keys on `digest_id`, a
+  mechanical label no untrusted input can influence, so the accounting holds
+  even when every metadata field failed sanitization.
+- **`grok_invoked` means a process ran.** `grok_process_state` is one of
+  `spawned` / `spawn-failed` / `not-attempted`. A missing binary used to be
+  stamped as an invocation, so a reader auditing spend from the spool alone
+  would have miscounted.
+
+## `--dry-run` mutates NOTHING
+
+No high-water state write, no `mark_read_as`, no append to the production spool
+or log. Dry output goes to `dry-run-spool.jsonl`, `latest.dry-run.md`,
+`watchman.dry-run.log`, and `<sweep>.dry-run-prompt.txt`. **A dry run can never
+blind a subsequent live sweep** — previously it consumed filesystem deltas, so
+the "first live sweep is a baptism" expectation was silently defeated by the
+demo this README itself invites.
 
 ## The phone rule
 
@@ -77,9 +157,10 @@ Demo without any of that (and without a Grok call):
 ~/sovereign-stack/venv/bin/python3 watchman/watchman_sweep.py --dry-run
 ```
 
-Dry-run performs the full mechanical sweep read-only (comms read omits
-`mark_read_as`, so nothing is mutated), never invokes cosmic, and saves the
-prompt that WOULD have gone to Grok next to the spool.
+Dry-run performs the full mechanical sweep read-only, never invokes cosmic, and
+saves the prompt that WOULD have gone to Grok. It is safe to run against the
+real root before the plist is ever loaded: it consumes nothing, so the baseline
+sweep still sees the full backlog.
 
 ## Retirement note for comms_dispatcher.py
 

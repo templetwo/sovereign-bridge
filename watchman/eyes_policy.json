@@ -1,6 +1,33 @@
 {
-  "_comment": "Watchman eyes policy — the CONFIGURABLE extension of the denylist. The protected/consent floor (tool comms_acknowledge; any filename or declared domain containing 'protected' or 'consent') is hard-coded in sanitizer.py and CANNOT be turned off here. Entries here only ADD metadata-only classes. If this file is missing or unreadable, sanitizer.py falls back to compiled-in seeds identical to these values (policy_state 'builtin-fallback') — a lost config never widens the eyes.",
+  "_comment": "Watchman eyes policy — the CONFIGURABLE extension of the denylist. TWO LEGS. The DECLARATION leg (denylist_queues / denylist_tools / denylist_domains) reads what the writer declared. The CONTENT leg (content_terms) reads the REDACTED body and the sanitized metadata, homoglyph-folded — because sensitivity is not always self-declared. The protected/consent floor (tool comms_acknowledge; 'protected' or 'consent' anywhere in an item's metadata) is hard-coded in sanitizer.py and CANNOT be turned off here. Entries here only ADD metadata-only classes. Schema is STRICTLY validated: every listed key must be a list of strings. A missing file falls back to compiled-in seeds identical to these values (policy_state 'builtin-fallback'); a file that exists but does not validate closes the eyes completely (policy_state 'floor-fallback', metadata-only for everything) and raises an attend line about this file. Over-withholding is accepted by design — Grok's flag-for-richer-review covers what a withheld preview costs.",
   "denylist_queues": ["antigravity_connector"],
   "denylist_tools": [],
-  "denylist_domains": ["biomedical", "biomed", "security-audit"]
+  "denylist_domains": ["biomedical", "biomed", "security-audit"],
+  "content_terms": [
+    "consent",
+    "protected",
+    "privileged",
+    "confidential",
+    "off the record",
+    "do not share",
+    "personally identifiable",
+    "medical record",
+    "diagnosis",
+    "prescription",
+    "social security",
+    "date of birth",
+    "biomedical",
+    "biomed",
+    "plasmid",
+    "titer",
+    "assay",
+    "pathogen",
+    "virulence",
+    "biosafety",
+    "select agent",
+    "gene synthesis",
+    "nucleotide sequence",
+    "in vitro",
+    "reverse genetics"
+  ]
 }

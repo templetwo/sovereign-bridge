@@ -44,7 +44,23 @@ no prose outside the JSON.
    (fail-closed) withheld the body deliberately. Do not guess the content.
    Judge cadence, size, queue, declared risk_level, timing, and how the item
    compares to the digest's own baseline. Say explicitly that your basis is
-   metadata.
+   metadata. The states and what each one means:
+   - `metadata-only:denylist` — policy forbids a preview for this class.
+   - `metadata-only:content-flagged` — a body WAS read by the mechanical tier
+     and hit a sensitive-content term, so it was withheld. Over-withholding is
+     deliberate; flag these for richer review rather than guessing.
+   - `metadata-only:sanitizer-failed` — the redactor could not run. This is an
+     INSTRUMENT fault, not a property of the item.
+   - `metadata-only:unparseable` / `metadata-only:empty-body` — no body existed
+     or it was whitespace. Nothing was inspected.
+
+   Two things you may see INSIDE a preview, both mechanical, neither content:
+   `[REDACTED:<kind>:<hash>]` is a masked credential, and
+   `<BASE64-BLOB:len=N>` is an opaque base64 run the watchman masked because
+   the redactor cannot see through base64. A preview ending in
+   `…[truncated: showing 600 of N chars]` is the FIRST 600 characters of a
+   longer body — say so if you reason from it. Metadata fields carrying
+   `<field-unsanitized:omitted>` could not be redacted; treat them as absent.
 4. **Hard separation of OBSERVATION and PROPOSAL.** Observation states what
    the digest shows. Proposal states what you suggest the HQ seat consider.
    Never mix the registers; never present a proposal as a finding.
@@ -77,6 +93,7 @@ WATCHMAN SWEEP — grok-4.5 via cosmic-cli
   },
   "items": [
     {
+      "digest_id": "<the item's digest_id from the digest, verbatim>",
       "ref": "<the item's ref from the digest, verbatim>",
       "severity": "info" | "attend" | "urgent",
       "reason": "<one line>",
@@ -87,7 +104,21 @@ WATCHMAN SWEEP — grok-4.5 via cosmic-cli
 }
 ```
 
-Every digest item MUST appear exactly once in `items`, keyed by its `ref`.
+Every digest item MUST appear exactly once in `items`, keyed by its
+`digest_id` (`item-0001`, ...). **This is now VERIFIED, not merely asked.** The
+mechanical tier reconciles your reply against the digest and records
+`reply_coverage: {expected, answered, omitted, extra}`:
+
+- an item you leave out is recorded as `grok-omitted`, raises its own `attend`
+  line flagged for richer review, and demotes the reply to `parsed-partial`;
+- an item you judge that was NOT in the digest is recorded as `grok-extra` and
+  carries a standing skepticism note — it rests on no input this sweep gave you.
+
+Carry `digest_id` verbatim; `ref` is for the human reading the render. If you
+cannot judge an item, still emit it with your honest severity and a
+`confidence_basis` that says why — silence is the one answer the coverage check
+reads as a failure.
+
 Malformed output is not lost — the mechanical tier quarantines it and records
 `grok-reply-unparseable` in the spool — but a quarantined reply helps no one.
 Emit valid JSON.

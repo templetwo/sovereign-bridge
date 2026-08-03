@@ -29,6 +29,21 @@
         <string>/Users/tony_studio/sovereign-bridge/watchman/watchman_sweep.py</string>
     </array>
 
+    <!-- launchd does NOT inherit a login shell's PATH. node lives under
+         /opt/homebrew and is invisible to `node` resolved off the default
+         PATH, which would turn the watchman's eyes off the moment this plist
+         loads (every preview -> metadata-only:sanitizer-failed) with no
+         signal. sanitizer.py resolves WATCHMAN_NODE_BIN -> /opt/homebrew/bin/node
+         -> /usr/local/bin/node -> node; PATH here is belt-and-braces for the
+         `git` call in the heartbeat surface. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>WATCHMAN_NODE_BIN</key>
+        <string>/opt/homebrew/bin/node</string>
+    </dict>
+
     <key>WatchPaths</key>
     <array>
         <string>/Users/tony_studio/.sovereign/grok_bridge/pending_writes</string>

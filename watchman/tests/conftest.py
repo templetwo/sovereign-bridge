@@ -84,6 +84,33 @@ def write_handoff(root, name, *, consumed_at=None):
     return p
 
 
+def all_persisted_text(sov_root, envelope=None):
+    """EVERY byte under <root>/watchman/, at any depth, plus the envelope the
+    caller would report.
+
+    A RECURSIVE GLOB, deliberately, not an enumerated file list. An enumerated
+    list stops seeing output the moment a new file appears — dry-run routing
+    added three — and a leak assertion that stops looking passes for the wrong
+    reason. Enumerated exclusions are blind by construction.
+    """
+    chunks = []
+    if envelope is not None:
+        chunks.append(json.dumps(envelope, default=str, ensure_ascii=False))
+    wd = Path(sov_root) / "watchman"
+    if wd.is_dir():
+        for p in sorted(wd.rglob("*")):
+            if p.is_file():
+                chunks.append(p.read_text(encoding="utf-8", errors="replace"))
+    return "\n".join(chunks)
+
+
+def dead_script(tmp_path, name="dead_redactor.js"):
+    """A redactor that always fails — the fail-closed lever for tests."""
+    p = tmp_path / name
+    p.write_text("process.exit(2);\n")
+    return p
+
+
 @pytest.fixture
 def clean_fetchers():
     """Bridge surfaces answering cleanly with matching commits and no comms."""
@@ -109,13 +136,16 @@ def good_reply_for(refs):
         "proposal": {"summary": "nothing", "actions_proposed": []},
         "items": [
             {
+                # digest_id is the mechanical key reply coverage reconciles on;
+                # ref is kept because the parser also matches tolerantly by ref.
+                "digest_id": f"item-{i:04d}",
                 "ref": r,
                 "severity": "info",
                 "reason": "routine low-risk proposal, consistent with baseline",
                 "flagged_for_richer_review": False,
                 "confidence_basis": "sanitized preview read directly",
             }
-            for r in refs
+            for i, r in enumerate(refs, start=1)
         ],
     }
     return GOOD_REPLY_TEMPLATE.format(envelope=json.dumps(envelope, indent=2))

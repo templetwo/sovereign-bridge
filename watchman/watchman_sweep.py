@@ -28,6 +28,10 @@ line to <root>/watchman/watchman.log, exit 0, cosmic NOT invoked, no spool
 entry. Deltas: build the sanitized digest, wake Grok, spool the envelope.
 Surface errors alone: spool an envelope with grok_invoked=false and a
 mechanical 'attend' line about the surface itself.
+
+--dry-run MUTATES NOTHING: no high-water state write, no mark_read_as, and no
+append to the production spool/log. A dry run must never blind a subsequent
+live sweep, so every dry byte lands in a dry-run-only file.
 """
 
 import argparse
@@ -57,6 +61,19 @@ INSTANCE_ID = "watchman"
 
 DIRECTIVE_PATH = Path(__file__).resolve().parent / "directive.md"
 IDENTITY_LINE = "WATCHMAN SWEEP — grok-4.5 via cosmic-cli"
+
+# Standing-blind detector: N consecutive sweeps in which EVERY item that
+# reached the redactor came back 'sanitizer-failed' means the eyes are off and
+# nobody has noticed. The instrument must report its own blindness rather than
+# let a counter in one spool line be the only signal.
+BLIND_STREAK_DEFAULT = 3
+
+
+def blind_streak_threshold():
+    try:
+        return max(1, int(os.environ.get("WATCHMAN_BLIND_STREAK_N", "")))
+    except ValueError:
+        return BLIND_STREAK_DEFAULT
 
 
 def now_iso():
@@ -108,8 +125,11 @@ def save_state(root, state):
     tmp.replace(p)
 
 
-def log_line(root, text):
-    p = Path(root) / "watchman" / "watchman.log"
+def log_line(root, text, *, dry_run=False):
+    """Append one heartbeat line. A dry run writes to its OWN log so that
+    'the dry run mutated nothing a live sweep reads' is literally true."""
+    name = "watchman.dry-run.log" if dry_run else "watchman.log"
+    p = Path(root) / "watchman" / name
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "a", encoding="utf-8") as f:
         f.write(f"{now_iso()} {text}\n")
@@ -227,6 +247,7 @@ def scan_pending_writes(root: Path, state: dict):
     if errors:
         surface["ok"] = False
         surface["error"] = "; ".join(errors)
+    surface["items"] = len(items)
     return surface, items, seen
 
 
@@ -244,6 +265,7 @@ def scan_halts(root: Path, state: dict):
     except OSError as e:
         surface["ok"] = False
         surface["error"] = str(e)
+    surface["items"] = len(items)
     return surface, items, seen
 
 
@@ -273,6 +295,7 @@ def scan_handoffs(root: Path, state: dict):
     except OSError as e:
         surface["ok"] = False
         surface["error"] = str(e)
+        surface["items"] = 0
         return surface, items, state.get("handoffs_unconsumed")
     prev = state.get("handoffs_unconsumed")
     surface["note"] = f"unconsumed={unconsumed}"
@@ -296,6 +319,7 @@ def scan_handoffs(root: Path, state: dict):
             },
         }
         items.append((meta, None))
+    surface["items"] = len(items)
     return surface, items, unconsumed
 
 
@@ -359,6 +383,7 @@ def scan_heartbeat(state: dict, *, heartbeat_fetch, git_head_fn):
     except Exception as e:
         surface["ok"] = False
         surface["error"] = str(e)
+    surface["items"] = len(items)
     return surface, items, hb_state
 
 
@@ -390,19 +415,19 @@ def scan_comms(*, comms_fetch):
     try:
         data = comms_fetch()
         messages = data.get("messages", []) or []
-        surface["note"] = f"unread={len(messages)}"
+        self_sent = 0
+        malformed = 0
         if len(messages) >= COMMS_READ_LIMIT:
             # count == requested limit means the board may hold MORE unread
             # than this sweep saw. Say so — a capped read must never present
             # itself as a complete one (the silent-partial class).
-            surface["note"] += (
-                f" (capped at limit={COMMS_READ_LIMIT}, possibly partial)"
-            )
             surface["possibly_partial"] = True
         for m in messages:
             if not isinstance(m, dict):
+                malformed += 1
                 continue
             if m.get("sender") == INSTANCE_ID:
+                self_sent += 1
                 continue
             content = m.get("content")
             body = content if isinstance(content, str) else json.dumps(content)
@@ -421,6 +446,21 @@ def scan_comms(*, comms_fetch):
                 "sender": m.get("sender"),
             }
             items.append((meta, body))
+        # Count reconciliation: the note used to say 'unread=N' while N
+        # included messages the sweep then dropped, so the note and items_seen
+        # disagreed by the skipped count with nothing saying why.
+        surface["unread"] = len(messages)
+        surface["self_sent_excluded"] = self_sent
+        surface["malformed_excluded"] = malformed
+        surface["items"] = len(items)
+        surface["note"] = (
+            f"unread={len(messages)} → items={len(items)} "
+            f"(self-sent excluded={self_sent}, malformed excluded={malformed})"
+        )
+        if surface.get("possibly_partial"):
+            surface["note"] += (
+                f" (capped at limit={COMMS_READ_LIMIT}, possibly partial)"
+            )
     except Exception as e:
         surface["ok"] = False
         surface["error"] = str(e)
@@ -451,6 +491,20 @@ def invoke_cosmic(prompt, *, cosmic_bin):
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def _looks_like_watchman_envelope(parsed) -> bool:
+    """Shape check before a parsed object is accepted as Grok's reply.
+
+    Reply coverage (below) is now load-bearing, so 'first parseable object
+    wins' is no longer harmless: a banner fragment that happens to be
+    JSON-shaped would win and coverage would report 0 answered / N omitted,
+    firing N false attend lines about an omission that never happened."""
+    if not isinstance(parsed, dict):
+        return False
+    if "items" in parsed:
+        return True
+    return "observation" in parsed and "proposal" in parsed
+
+
 def parse_grok_reply(raw: str):
     """Extract the strict-JSON envelope from a reply that may carry the
     identity line, a CLI banner, or code fences around it. Returns
@@ -459,7 +513,8 @@ def parse_grok_reply(raw: str):
         return None, False
     identity_present = IDENTITY_LINE in raw
     text = raw.replace("```json", "```")
-    # Balanced-brace scan from each '{' — first complete object that parses wins.
+    # Balanced-brace scan from each '{' — first complete object that parses AND
+    # carries the envelope shape wins.
     start = text.find("{")
     while start != -1:
         depth = 0
@@ -485,13 +540,69 @@ def parse_grok_reply(raw: str):
                     candidate = text[start : i + 1]
                     try:
                         parsed = json.loads(candidate)
-                        if isinstance(parsed, dict):
+                        if _looks_like_watchman_envelope(parsed):
                             return parsed, identity_present
                     except json.JSONDecodeError:
                         pass
                     break
         start = text.find("{", start + 1)
     return None, identity_present
+
+
+def compute_reply_coverage(items, reply):
+    """Verify EVERY digest item appears exactly once in Grok's reply.
+
+    The directive commands it ('Every digest item MUST appear exactly once');
+    nothing verified it. A reply that omits the hot item was accepted as
+    'parsed', and severity_ceiling — computed only over the items Grok
+    returned — read as complete triage. Visible by eye, absent by field.
+
+    Coverage keys on `digest_id`, a mechanical label the watchman mints
+    (item-0001, ...) and no untrusted input can influence, so the accounting
+    holds even when every metadata field failed sanitization. A reply item that
+    carries only `ref` is still matched, tolerantly, by ref.
+    """
+    expected = {it["digest_id"]: it.get("ref") for it in items}
+    by_ref = {it.get("ref"): it["digest_id"] for it in items if it.get("ref")}
+    reply_items = []
+    if isinstance(reply, dict) and isinstance(reply.get("items"), list):
+        reply_items = [r for r in reply["items"] if isinstance(r, dict)]
+
+    hits = {}
+    extra = []
+    for r in reply_items:
+        did = r.get("digest_id")
+        if did not in expected:
+            did = by_ref.get(r.get("ref"))
+        if did is None:
+            extra.append(
+                {
+                    "digest_id": sanitizer.cap_field(str(r.get("digest_id") or "")),
+                    "ref": sanitizer.cap_field(str(r.get("ref") or "")),
+                }
+            )
+            continue
+        hits[did] = hits.get(did, 0) + 1
+
+    omitted = [
+        {"digest_id": did, "ref": ref}
+        for did, ref in expected.items()
+        if did not in hits
+    ]
+    duplicated = [
+        {"digest_id": did, "ref": expected[did], "times": n}
+        for did, n in hits.items()
+        if n > 1
+    ]
+    return {
+        "expected": len(expected),
+        "answered": len(hits),
+        "omitted": len(omitted),
+        "extra": len(extra),
+        "omitted_refs": omitted,
+        "extra_refs": extra,
+        "duplicated_refs": duplicated,
+    }
 
 
 def quarantine_reply(root, sweep_id, stdout, stderr):
@@ -563,16 +674,52 @@ def run_sweep(
     surfaces["comms"], comms_items = scan_comms(comms_fetch=comms_fetch)
     raw_items.extend(comms_items)
 
-    # Sanitize: metadata always; preview only through the eyes policy.
+    # Sanitize. Metadata always travels — but SANITIZED: every string field
+    # runs through the same redactor as previews and is capped, because
+    # metadata is copied out of untrusted files and board messages and is
+    # handed to a third-party model in argv, in the prompt, and in the spool.
+    # The denylist is evaluated against BOTH the raw and the sanitized
+    # metadata: redaction can coarse-mask a whole field, and a denylist term
+    # must not be able to disappear into a mask and open the eyes.
     items = []
-    meta_only_counts = {"denylist": 0, "sanitizer-failed": 0, "unparseable": 0}
+    meta_only_counts = {
+        "denylist": 0,
+        "sanitizer-failed": 0,
+        "unparseable": 0,
+        "empty-body": 0,
+        "content-flagged": 0,
+    }
     previewed = 0
-    for meta, body in raw_items:
-        preview, preview_state = sanitizer.preview_for(
-            body, meta, policy, **sanitize_kwargs
+    sanitizer_attempts = 0
+    sanitizer_failures = 0
+    failed_refs = set()
+    for index, (meta, body) in enumerate(raw_items, start=1):
+        safe_meta, meta_ok = sanitizer.sanitize_metadata(meta, **sanitize_kwargs)
+        if sanitizer.denylisted(meta, policy):
+            preview, preview_state = None, "metadata-only:denylist"
+        else:
+            preview, preview_state = sanitizer.preview_for(
+                body, safe_meta, policy, **sanitize_kwargs
+            )
+        item = dict(safe_meta)
+        # Mechanical, never attacker-derived: reply coverage keys on this, so
+        # it must survive total sanitizer failure and stay unique.
+        item["digest_id"] = f"item-{index:04d}"
+        item["metadata_sanitized"] = meta_ok
+        item["body_bytes"] = (
+            len(body.encode("utf-8", errors="replace"))
+            if isinstance(body, str)
+            else None
         )
-        item = dict(meta)
         item["preview_state"] = preview_state
+        if body is not None and preview_state not in (
+            "metadata-only:denylist",
+            "metadata-only:unparseable",
+        ):
+            sanitizer_attempts += 1
+            if preview_state == "metadata-only:sanitizer-failed":
+                sanitizer_failures += 1
+                failed_refs.add(meta.get("ref"))
         if preview is not None:
             item["preview"] = preview
             previewed += 1
@@ -587,33 +734,72 @@ def run_sweep(
 
     surface_errors = [n for n, s in surfaces.items() if not s.get("ok")]
 
-    # High-water state update happens regardless of outcome — the mechanical
-    # heartbeat is written even when grok is not invoked.
+    # Standing-blind detection. A sweep is BLIND when every item that actually
+    # reached the redactor came back 'sanitizer-failed'. Blindness is
+    # fail-closed (no body leaks) but it turns the eyes off SILENTLY, so the
+    # instrument reports itself.
+    sweep_blind = sanitizer_attempts > 0 and sanitizer_failures == sanitizer_attempts
+    threshold = blind_streak_threshold()
+    prev_streak = int(state.get("blind_streak", 0) or 0)
+    if sweep_blind:
+        blind_streak = prev_streak + 1
+    elif sanitizer_attempts > 0:
+        blind_streak = 0
+    else:
+        # No attempts this sweep: no evidence either way. Leaving the streak
+        # untouched errs toward reporting blindness, which is the safe side.
+        blind_streak = prev_streak
+    blindness = {
+        "sweep_blind": sweep_blind,
+        "streak": blind_streak,
+        "threshold": threshold,
+        "sanitizer_attempts": sanitizer_attempts,
+        "sanitizer_failures": sanitizer_failures,
+    }
+
+    # High-water state update happens regardless of Grok's outcome — the
+    # mechanical heartbeat is written even when grok is not invoked — EXCEPT
+    # under --dry-run, which must mutate nothing a live sweep reads.
+    #
+    # HOLDBACK: a file whose preview failed sanitization does NOT advance its
+    # high-water mark, so it is re-examined once the sanitizer is repaired. A
+    # transient breakage used to blind the watchman to those items PERMANENTLY
+    # (state advanced regardless of preview outcome; the repaired sweep saw an
+    # unchanged file and went quiet).
     new_files = dict(state.get("files", {}))
+    pw_keep = {k: v for k, v in pw_seen.items() if k not in failed_refs}
+    halt_keep = {k: v for k, v in halt_seen.items() if k not in failed_refs}
     if surfaces["pending_writes"]["ok"] or pw_seen:
         for k in [k for k in new_files if any(k.startswith(q + "/") for q in QUEUES)]:
             if surfaces["pending_writes"]["ok"] and k not in pw_seen:
                 del new_files[k]
-        new_files.update(pw_seen)
+        for k in failed_refs:
+            new_files.pop(k, None)
+        new_files.update(pw_keep)
     if surfaces["halts"]["ok"]:
         for k in [k for k in new_files if k.startswith("daemons/halts/")]:
             if k not in halt_seen:
                 del new_files[k]
-        new_files.update(halt_seen)
+        for k in failed_refs:
+            new_files.pop(k, None)
+        new_files.update(halt_keep)
     state["files"] = new_files
     if surfaces["handoffs"]["ok"]:
         state["handoffs_unconsumed"] = unconsumed
     if surfaces["heartbeat"]["ok"]:
         state["heartbeat"] = hb_state
+    state["blind_streak"] = blind_streak
     state["last_sweep"] = started_at
     state["sweeps"] = int(state.get("sweeps", 0)) + 1
-    save_state(root, state)
+    if not dry_run:
+        save_state(root, state)
 
     if not items and not surface_errors:
         log_line(
             root,
             f"sweep {sweep_id} quiet — 5 surfaces ok, 0 deltas; state touched, "
             f"grok not invoked",
+            dry_run=dry_run,
         )
         return None
 
@@ -621,6 +807,9 @@ def run_sweep(
         "items_seen": len(items),
         "items_previewed": previewed,
         "items_metadata_only": meta_only_counts,
+        "items_by_surface": {
+            name: int(info.get("items", 0) or 0) for name, info in surfaces.items()
+        },
     }
     envelope = {
         "kind": "watchman-sweep",
@@ -632,15 +821,36 @@ def run_sweep(
         "surfaces": surfaces,
         "counts": counts,
         "policy_state": policy_state,
+        "policy_path": str(policy_path) if policy_path else None,
+        "blindness": blindness,
         "items": items,
         "grok_invoked": False,
+        # Three states, because 'invoked' was stamped True even when no process
+        # ever ran: an OSError on a missing binary looked identical in the
+        # spool to a real call that came back garbage. A reader auditing spend
+        # from spool.jsonl alone would have miscounted.
+        "grok_process_state": "not-attempted",
         "grok_model": "grok-4.5",
         "grok_reply": None,
         "grok_reply_state": "not-invoked",
+        "reply_coverage": None,
         "quarantine_file": None,
     }
 
-    if items and dry_run:
+    if items and sweep_blind:
+        # Every item that reached the redactor failed. There is no sanitized
+        # content to classify — waking Grok would spend a real call on a digest
+        # the instrument itself cannot see. Same shape as the surface-errors
+        # path: report the instrument, do not wake the mind.
+        envelope["grok_reply_state"] = "not-invoked-sweep-blind"
+        log_line(
+            root,
+            f"sweep {sweep_id} — {len(items)} deltas but the sanitizer failed on "
+            f"all {sanitizer_attempts} attempt(s); grok not invoked, "
+            f"blind_streak={blind_streak}/{threshold}",
+            dry_run=dry_run,
+        )
+    elif items and dry_run:
         envelope["grok_reply_state"] = "dry-run"
         prompt_file = Path(root) / "watchman" / f"{sweep_id}.dry-run-prompt.txt"
         prompt_file.parent.mkdir(parents=True, exist_ok=True)
@@ -648,7 +858,9 @@ def run_sweep(
         prompt_file.write_text(build_prompt(digest), encoding="utf-8")
         envelope["dry_run_prompt_file"] = str(prompt_file)
         log_line(
-            root, f"sweep {sweep_id} DRY RUN — {len(items)} deltas, grok NOT invoked"
+            root,
+            f"sweep {sweep_id} DRY RUN — {len(items)} deltas, grok NOT invoked",
+            dry_run=dry_run,
         )
     elif items:
         digest = {k: envelope[k] for k in ("sweep_id", "surfaces", "counts", "items")}
@@ -656,7 +868,9 @@ def run_sweep(
             rc, stdout, stderr = invoke_cosmic(
                 build_prompt(digest), cosmic_bin=cosmic_bin
             )
+            # A process ran. Only here does grok_invoked become true.
             envelope["grok_invoked"] = True
+            envelope["grok_process_state"] = "spawned"
             parsed, identity_present = parse_grok_reply(stdout if rc == 0 else "")
             if rc != 0 or parsed is None:
                 qfile = quarantine_reply(root, sweep_id, stdout, stderr)
@@ -664,17 +878,39 @@ def run_sweep(
                 envelope["quarantine_file"] = str(qfile)
             else:
                 envelope["grok_reply"] = parsed
-                envelope["grok_reply_state"] = "parsed"
                 envelope["grok_identity_line_present"] = identity_present
-        except (subprocess.TimeoutExpired, OSError) as e:
+                coverage = compute_reply_coverage(items, parsed)
+                envelope["reply_coverage"] = coverage
+                # A reply that does not cover the digest is NOT 'parsed'. The
+                # state says which, and the mechanical tier raises an attend
+                # line per omitted item so severity_ceiling cannot understate.
+                envelope["grok_reply_state"] = (
+                    "parsed"
+                    if coverage["omitted"] == 0 and coverage["extra"] == 0
+                    else "parsed-partial"
+                )
+        except subprocess.TimeoutExpired as e:
+            # The process DID spawn; it just never answered in time.
             envelope["grok_invoked"] = True
-            qfile = quarantine_reply(root, sweep_id, "", f"invocation failed: {e}")
+            envelope["grok_process_state"] = "spawned"
+            qfile = quarantine_reply(root, sweep_id, "", f"invocation timed out: {e}")
             envelope["grok_reply_state"] = "grok-reply-unparseable"
+            envelope["quarantine_file"] = str(qfile)
+        except OSError as e:
+            # No process ever ran (missing binary, permission, ENOENT). Saying
+            # 'invoked' here claims spend that did not happen.
+            envelope["grok_invoked"] = False
+            envelope["grok_process_state"] = "spawn-failed"
+            qfile = quarantine_reply(root, sweep_id, "", f"invocation failed: {e}")
+            envelope["grok_reply_state"] = "grok-spawn-failed"
+            envelope["grok_spawn_error"] = str(e)
             envelope["quarantine_file"] = str(qfile)
         log_line(
             root,
-            f"sweep {sweep_id} — {len(items)} deltas, grok invoked, "
+            f"sweep {sweep_id} — {len(items)} deltas, "
+            f"grok_process={envelope['grok_process_state']}, "
             f"reply={envelope['grok_reply_state']}",
+            dry_run=dry_run,
         )
     else:
         # Surface errors only: mechanical envelope, no semantic content to
@@ -683,9 +919,10 @@ def run_sweep(
             root,
             f"sweep {sweep_id} — 0 deltas but surface errors: "
             f"{', '.join(surface_errors)}; grok not invoked",
+            dry_run=dry_run,
         )
 
-    spool_writer.write_sweep(root, envelope)
+    spool_writer.write_sweep(root, envelope, dry_run=dry_run)
     return envelope
 
 
@@ -697,9 +934,11 @@ def main(argv=None):
     ap.add_argument(
         "--dry-run",
         action="store_true",
-        help="full mechanical sweep, but never invoke cosmic and never mutate "
-        "the comms board (mark_read_as omitted); the would-be prompt is saved "
-        "next to the spool",
+        help="full mechanical sweep that MUTATES NOTHING: cosmic is never "
+        "invoked, mark_read_as is omitted, the high-water state is not written, "
+        "and every output goes to dry-run-only files (dry-run-spool.jsonl, "
+        "latest.dry-run.md, watchman.dry-run.log, <sweep>.dry-run-prompt.txt). "
+        "A dry run can never blind a subsequent live sweep.",
     )
     ap.add_argument("--cosmic-bin", default=None, help="override cosmic-cli path")
     args = ap.parse_args(argv)
@@ -709,11 +948,14 @@ def main(argv=None):
     if envelope is None:
         print("watchman: quiet sweep — no deltas, grok not invoked")
     else:
+        cov = envelope.get("reply_coverage") or {}
         print(
             f"watchman: sweep {envelope['sweep_id']} — "
             f"{envelope['counts']['items_seen']} item(s), "
-            f"grok_invoked={envelope['grok_invoked']}, "
+            f"grok_invoked={envelope['grok_invoked']} "
+            f"({envelope.get('grok_process_state')}), "
             f"reply={envelope['grok_reply_state']}, "
+            f"coverage={cov.get('answered', '-')}/{cov.get('expected', '-')}, "
             f"ceiling={envelope.get('severity_ceiling')}"
         )
     return 0

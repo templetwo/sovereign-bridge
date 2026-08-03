@@ -14,8 +14,9 @@ from conftest import (
 )
 
 
-def read_spool(sov_root):
-    p = sov_root / "watchman" / "spool.jsonl"
+def read_spool(sov_root, *, dry_run=False):
+    name = "dry-run-spool.jsonl" if dry_run else "spool.jsonl"
+    p = sov_root / "watchman" / name
     return [json.loads(line) for line in p.read_text().splitlines()]
 
 
@@ -168,5 +169,5 @@ def test_dry_run_never_invokes_cosmic_and_saves_prompt(
     assert "WATCHMAN SWEEP DIRECTIVE" in text
     assert "DELTA DIGEST" in text
     assert "prop_dry.json" in text
-    entry = read_spool(sov_root)[-1]
+    entry = read_spool(sov_root, dry_run=True)[-1]
     assert entry["dry_run"] is True and entry["grok_invoked"] is False

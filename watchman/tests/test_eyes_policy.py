@@ -9,7 +9,12 @@ import pytest
 
 import sanitizer
 import watchman_sweep
-from conftest import good_reply_for, make_fake_cosmic, write_proposal
+from conftest import (
+    all_persisted_text,
+    good_reply_for,
+    make_fake_cosmic,
+    write_proposal,
+)
 
 T2HELIX_ROOT = Path.home() / "t2helix"
 needs_t2helix = pytest.mark.skipif(
@@ -27,20 +32,9 @@ SYNTH_BIOMED = (
 )
 
 
-def all_persisted_text(sov_root, envelope):
-    """Every byte the sweep persisted or would hand onward."""
-    chunks = [json.dumps(envelope, default=str)]
-    for name in ("spool.jsonl", "latest.md", "watchman.log"):
-        p = sov_root / "watchman" / name
-        if p.exists():
-            chunks.append(p.read_text())
-    qdir = sov_root / "watchman" / "quarantine"
-    if qdir.is_dir():
-        for f in qdir.iterdir():
-            chunks.append(f.read_text())
-    for f in (sov_root / "watchman").glob("*.dry-run-prompt.txt"):
-        chunks.append(f.read_text())
-    return "\n".join(chunks)
+# all_persisted_text lives in conftest now — a RECURSIVE glob over everything
+# under <root>/watchman/. The enumerated version this replaced would have gone
+# blind to the dry-run output files the moment they were added.
 
 
 # ---------------------------------------------------------- direction (a): denylist
@@ -232,7 +226,11 @@ def test_preview_truncates_after_redaction_not_before(clean_fetchers):
     # A secret placed just before the 600-char line: truncate-first would cut
     # it mid-token and the pattern would miss the fragment. We redact a wide
     # window first, then truncate, so the token (not the plaintext) survives.
-    body = ("x" * 590) + " " + SYNTH_SK_KEY + " tail"
+    # Filler is space-broken on purpose: an unbroken run of 590 base64-alphabet
+    # chars is now masked as a <BASE64-BLOB:len=N> token, which would move the
+    # secret away from the cut and quietly stop testing the boundary.
+    body = ("xy " * 197) + " " + SYNTH_SK_KEY + " tail"
+    assert len(body) > sanitizer.PREVIEW_CHARS
     policy, _ = sanitizer.load_policy()
     preview, state = sanitizer.preview_for(
         body,
@@ -246,4 +244,7 @@ def test_preview_truncates_after_redaction_not_before(clean_fetchers):
     )
     assert state == "sanitized"
     assert SYNTH_SK_KEY not in preview
-    assert len(preview) <= sanitizer.PREVIEW_CHARS
+    # The shown body is capped; the marker rides on top and SAYS it was cut.
+    assert preview.endswith(f"of {len(body)} chars]")
+    shown = preview.split("…[truncated:")[0]
+    assert len(shown) <= sanitizer.PREVIEW_CHARS
