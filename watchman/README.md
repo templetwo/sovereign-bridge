@@ -223,6 +223,13 @@ withholds every body and looks exactly like a quiet night.
   reads them directly), Grok is not invoked, an urgent `instrument:mind` line
   says so, and `--reset-mind` re-arms after repair. A completed spawn resets
   the streak; a spawn that never ran does not count toward it.
+- **The goose is the sixth surface.** `nape/honks.jsonl` joins the watch: new
+  UNACKED honks become items (observation as body through the full sanitizer
+  pipeline; sharp maps to high risk, uneasy to medium). The FIRST sweep
+  BASELINES without itemizing — a months-deep honk backlog is the triage
+  lane's history, not sweep signal — and an absent nape store is a stated
+  note, never an error. Ack loop stays where it was: `nape_honks` /
+  `nape_ack` (note required) on the bridge; the watchman only notices.
 - **Reply coverage.** The directive commands that every digest item appear
   exactly once; the mechanical tier *verifies* it. The envelope carries
   `reply_coverage: {expected, answered, omitted, extra, duplicated,

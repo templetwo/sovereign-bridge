@@ -51,7 +51,7 @@ import sanitizer  # noqa: E402
 import spool_writer  # noqa: E402
 
 QUEUES = ("grok_bridge", "openai_bridge", "antigravity_connector")
-SURFACE_NAMES = ("pending_writes", "halts", "handoffs", "heartbeat", "comms")
+SURFACE_NAMES = ("pending_writes", "halts", "handoffs", "heartbeat", "comms", "honks")
 
 DEFAULT_ROOT = Path.home() / ".sovereign"
 DEFAULT_STACK_REPO = Path.home() / "sovereign-stack"
@@ -473,6 +473,105 @@ def default_comms_fetch(bridge_url, token, mark_read):
         return json.loads(r.read().decode("utf-8"))
 
 
+def _load_ack_ids(apath):
+    ids = set()
+    try:
+        for ln in apath.read_text(encoding="utf-8").splitlines():
+            try:
+                ids.add(json.loads(ln).get("honk_id"))
+            except ValueError:
+                continue
+    except OSError:
+        pass
+    return ids
+
+
+def scan_honks(root, state):
+    """Surface (f): the nape goose's honks — the house's soft governance flags.
+
+    Watches <root>/nape/honks.jsonl for NEW unacked honks past a line-count
+    high-water. The FIRST run BASELINES without itemizing — months of backlog
+    are history for the triage lane, not signal for a sweep digest (the
+    baptism lesson: never hand the mind a flood). Thereafter each new unacked
+    honk is one item: observation as body (through the standard sanitizer
+    pipeline), level mapped to declared risk (sharp->high, uneasy->medium).
+    An ABSENT nape store is a stated note, not an error — the goose is an
+    optional instrument, and an absence is a measurement, said out loud."""
+    surface = {"ok": True, "error": None}
+    items = []
+    hpath = Path(root) / "nape" / "honks.jsonl"
+    apath = Path(root) / "nape" / "acks.jsonl"
+    prev_count = state.get("honks_line_count")
+    new_count = prev_count if isinstance(prev_count, int) else None
+    try:
+        if not hpath.is_file():
+            surface["note"] = "nape store absent — goose not installed at this root"
+            surface["items"] = 0
+            return surface, items, new_count
+        lines = hpath.read_text(encoding="utf-8").splitlines()
+        new_count = len(lines)
+        acked_ids = _load_ack_ids(apath)
+        corrupt = 0
+        if not isinstance(prev_count, int):
+            unacked = sharp = 0
+            for ln in lines:
+                try:
+                    h = json.loads(ln)
+                except ValueError:
+                    corrupt += 1
+                    continue
+                if h.get("honk_id") in acked_ids:
+                    continue
+                unacked += 1
+                if h.get("level") == "sharp":
+                    sharp += 1
+            surface["note"] = (
+                f"baseline: {len(lines)} honks on file, {unacked} unacked "
+                f"({sharp} sharp), corrupt={corrupt} — backlog NOT itemized "
+                f"(triage lane owns history); watch begins at this high-water"
+            )
+            surface["items"] = 0
+            return surface, items, new_count
+        for ln in lines[prev_count:]:
+            try:
+                h = json.loads(ln)
+            except ValueError:
+                corrupt += 1
+                continue
+            hid = str(h.get("honk_id", "?"))
+            if hid in acked_ids:
+                continue
+            level = str(h.get("level") or "")
+            body = str(h.get("observation") or "")
+            meta = {
+                "queue": "nape/honks",
+                "ref": f"nape/honks/{hid}",
+                "filename": hid,
+                "change": "new-honk",
+                "size": len(body),
+                "timestamp": str(h.get("ts") or h.get("timestamp") or ""),
+                "age_seconds": None,
+                "tool": h.get("trigger_tool"),
+                "commit_target": None,
+                "risk_level": {"sharp": "high", "uneasy": "medium"}.get(level, "low"),
+                "declared_domain": None,
+                "sender": h.get("session_id"),
+                "honk_pattern": h.get("pattern"),
+                "honk_level": level,
+            }
+            items.append((meta, body))
+        surface["note"] = (
+            f"new lines={len(lines) - prev_count} -> items={len(items)}"
+            + (f", corrupt skipped={corrupt}" if corrupt else "")
+        )
+    except OSError as e:
+        surface["ok"] = False
+        surface["error"] = str(e)
+        new_count = prev_count if isinstance(prev_count, int) else None
+    surface["items"] = len(items)
+    return surface, items, new_count
+
+
 def scan_comms(*, comms_fetch):
     """Surface (e): the legacy comms board. daemon.uncertainty still posts
     there; the watchman inherits the watch so those whispers finally land."""
@@ -797,6 +896,8 @@ def run_sweep(
     collect("heartbeat", hb_items)
     surfaces["comms"], comms_items = scan_comms(comms_fetch=comms_fetch)
     collect("comms", comms_items)
+    surfaces["honks"], honk_items, honks_line_count = scan_honks(root, state)
+    collect("honks", honk_items)
 
     # Sanitize. Metadata always travels — but SANITIZED: every string field
     # runs through the same redactor as previews and is capped, because
@@ -915,6 +1016,8 @@ def run_sweep(
         state["handoffs_unconsumed"] = unconsumed
     if surfaces["heartbeat"]["ok"]:
         state["heartbeat"] = hb_state
+    if surfaces["honks"]["ok"] and honks_line_count is not None:
+        state["honks_line_count"] = honks_line_count
     state["blind_streak"] = blind_streak
     state["last_sweep"] = started_at
     state["sweeps"] = int(state.get("sweeps", 0)) + 1
@@ -922,7 +1025,7 @@ def run_sweep(
     if not items and not surface_errors:
         log_line(
             root,
-            f"sweep {sweep_id} quiet — 5 surfaces ok, 0 deltas; state touched, "
+            f"sweep {sweep_id} quiet — {len(SURFACE_NAMES)} surfaces ok, 0 deltas; state touched, "
             f"grok not invoked",
             dry_run=dry_run,
         )
