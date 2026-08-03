@@ -57,7 +57,7 @@ DEFAULT_ROOT = Path.home() / ".sovereign"
 DEFAULT_STACK_REPO = Path.home() / "sovereign-stack"
 DEFAULT_COSMIC_BIN = str(Path.home() / "cosmic-cli" / "venv" / "bin" / "cosmic-cli")
 DEFAULT_BRIDGE_URL = "http://127.0.0.1:8100"
-COSMIC_TIMEOUT_S = 180
+COSMIC_TIMEOUT_S = int(os.environ.get("WATCHMAN_GROK_TIMEOUT", "180"))
 COMMS_CHANNEL = "general"
 INSTANCE_ID = "watchman"
 
@@ -78,6 +78,22 @@ BLIND_STREAK_DEFAULT = 3
 # digests keep landing in the spool (nothing is lost, the seat still sees
 # every item), Grok is not invoked, and an urgent instrument line says so.
 MIND_REST_DEFAULT = 3
+
+# Backlog-drain scale guard (found at the baptism, 2026-08-03): a 200-item
+# comms-backlog digest blew the invocation timeout, and every drain sweep
+# would have re-spent on a reply that could not finish. Grok classifies at
+# most WATCHMAN_GROK_ITEM_CAP items per sweep (filesystem surfaces first,
+# comms last); the remainder land in the spool mechanically and the envelope
+# SAYS so — grok_scope states classified vs mechanical_only, and reply
+# coverage is computed against exactly the capped set.
+GROK_ITEM_CAP_DEFAULT = 60
+
+
+def grok_item_cap():
+    try:
+        return max(1, int(os.environ.get("WATCHMAN_GROK_ITEM_CAP", "")))
+    except ValueError:
+        return GROK_ITEM_CAP_DEFAULT
 
 
 def blind_streak_threshold():
@@ -1030,9 +1046,23 @@ def run_sweep(
                 dry_run=dry_run,
             )
         elif items:
-            digest = {
-                k: envelope[k] for k in ("sweep_id", "surfaces", "counts", "items")
+            cap = grok_item_cap()
+            # Filesystem and instrument surfaces carry the operational signal;
+            # a comms backlog is history draining. Keep original order within
+            # each class.
+            ordered = [i for i in items if i.get("surface") != "comms"] + [
+                i for i in items if i.get("surface") == "comms"
+            ]
+            for_grok = ordered[:cap]
+            envelope["grok_scope"] = {
+                "cap": cap,
+                "classified": len(for_grok),
+                "mechanical_only": len(items) - len(for_grok),
             }
+            digest = {
+                k: envelope[k] for k in ("sweep_id", "surfaces", "counts")
+            }
+            digest["items"] = for_grok
             try:
                 rc, stdout, stderr = invoke_cosmic(
                     build_prompt(digest), cosmic_bin=cosmic_bin
@@ -1050,7 +1080,7 @@ def run_sweep(
                 else:
                     envelope["grok_reply"] = parsed
                     envelope["grok_identity_line_present"] = identity_present
-                    coverage = compute_reply_coverage(items, parsed)
+                    coverage = compute_reply_coverage(for_grok, parsed)
                     envelope["reply_coverage"] = coverage
                     # A reply that does not cover the digest exactly once each is
                     # NOT 'parsed'. The state says which, and the mechanical tier
