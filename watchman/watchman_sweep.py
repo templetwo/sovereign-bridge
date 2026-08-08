@@ -1226,7 +1226,41 @@ def run_sweep(
                 rc, stdout, stderr = invoke_cosmic(
                     build_prompt(digest), cosmic_bin=cosmic_bin
                 )
-                # A process ran. Only here does grok_invoked become true.
+            except subprocess.TimeoutExpired as e:
+                # The process DID spawn; it just never answered in time.
+                envelope["grok_invoked"] = True
+                envelope["grok_process_state"] = "spawned"
+                qfile = quarantine_reply(
+                    root, sweep_id, "", f"invocation timed out: {e}"
+                )
+                envelope["grok_reply_state"] = "grok-reply-unparseable"
+                envelope["quarantine_file"] = str(qfile)
+            except OSError as e:
+                # No process ever ran (missing binary, permission, ENOENT).
+                # Saying 'invoked' here claims spend that did not happen.
+                envelope["grok_invoked"] = False
+                envelope["grok_process_state"] = "spawn-failed"
+                qfile = quarantine_reply(root, sweep_id, "", f"invocation failed: {e}")
+                envelope["grok_reply_state"] = "grok-spawn-failed"
+                envelope["grok_spawn_error"] = str(e)
+                envelope["quarantine_file"] = str(qfile)
+            else:
+                # A process ran successfully (however rc came back). Only
+                # here does grok_invoked become true — and it STAYS true no
+                # matter what happens next in this branch (reply parsing,
+                # the quarantine write on an unparseable reply): the xAI
+                # spend already happened. This is deliberately an `else:`,
+                # not more code inside the `try:` above: a quarantine-write
+                # OSError raised here must NOT be caught by the sibling
+                # `except OSError` above, which exists for invoke_cosmic
+                # itself never running. It used to live in the same try, so
+                # a quarantine-write failure after a real spawn fell into
+                # the spawn-failed handler, which then quarantined AGAIN
+                # (raising a second time, now uncaught) — and because the
+                # mind-rest streak below only counts a failure when
+                # grok_process_state == 'spawned', the mislabeled
+                # 'spawn-failed' state silently defeated the spend breaker
+                # in exactly the loop it exists to close.
                 envelope["grok_invoked"] = True
                 envelope["grok_process_state"] = "spawned"
                 parsed, identity_present = parse_grok_reply(
@@ -1246,24 +1280,6 @@ def run_sweep(
                     # raises an attend line per omitted / extra / duplicated item
                     # so severity_ceiling cannot understate.
                     envelope["grok_reply_state"] = reply_state_for(coverage)
-            except subprocess.TimeoutExpired as e:
-                # The process DID spawn; it just never answered in time.
-                envelope["grok_invoked"] = True
-                envelope["grok_process_state"] = "spawned"
-                qfile = quarantine_reply(
-                    root, sweep_id, "", f"invocation timed out: {e}"
-                )
-                envelope["grok_reply_state"] = "grok-reply-unparseable"
-                envelope["quarantine_file"] = str(qfile)
-            except OSError as e:
-                # No process ever ran (missing binary, permission, ENOENT).
-                # Saying 'invoked' here claims spend that did not happen.
-                envelope["grok_invoked"] = False
-                envelope["grok_process_state"] = "spawn-failed"
-                qfile = quarantine_reply(root, sweep_id, "", f"invocation failed: {e}")
-                envelope["grok_reply_state"] = "grok-spawn-failed"
-                envelope["grok_spawn_error"] = str(e)
-                envelope["quarantine_file"] = str(qfile)
             log_line(
                 root,
                 f"sweep {sweep_id} — {len(items)} deltas, "

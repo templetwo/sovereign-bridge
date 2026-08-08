@@ -92,3 +92,41 @@ def test_reset_mind_flag_re_arms(sov_root, clean_fetchers):
     seed_streak(sov_root, 5)
     watchman_sweep.main(["--root", str(sov_root), "--reset-mind"])
     assert streak(sov_root) == 0
+
+
+def test_quarantine_write_failure_after_spawn_is_not_mislabeled_spawn_failed(
+    sov_root, clean_fetchers, tmp_path, monkeypatch
+):
+    """COMMIT 2: in the 'grok reply unparseable' branch, a quarantine_reply
+    write that raises OSError used to be caught by the SIBLING handler built
+    for spawn failures (invoke_cosmic itself never running) — because both
+    lived under the same try. That mislabels a sweep that genuinely invoked
+    Grok and spent real xAI credit as grok_invoked=False /
+    grok_process_state='spawn-failed', and it defeats the mind-rest spend
+    breaker: the outer failure handler only counts the streak when
+    grok_process_state == 'spawned', so a spawn that gets relabeled
+    'spawn-failed' silently stops being counted — the exact loop the spend
+    breaker exists to close."""
+    write_proposal(sov_root, "grok_bridge", "unparseable.json")
+    # A reply with no JSON object in it at all: parse_grok_reply returns
+    # (None, False) -> hits the 'grok reply unparseable' branch, which is
+    # where quarantine_reply is called on a genuinely-spawned process.
+    fake, log = make_fake_cosmic(tmp_path, "not an envelope, no braces here")
+
+    def boom_quarantine(*a, **k):
+        raise OSError("synthetic quarantine-write failure (disk full)")
+
+    monkeypatch.setattr(watchman_sweep, "quarantine_reply", boom_quarantine)
+    env = watchman_sweep.run_sweep(sov_root, cosmic_bin=fake, **clean_fetchers)
+
+    assert invocations(log) == 1, "the real spend happened"
+    assert env["grok_invoked"] is True, (
+        "a sweep that spawned and spent must always be recorded as having "
+        "invoked Grok, even when the quarantine write afterward fails"
+    )
+    assert env["grok_process_state"] == "spawned"
+    assert env["sweep_error"], "the quarantine-write failure must surface"
+    assert streak(sov_root) == 1, (
+        "the spend breaker must count this spawned-but-unsaved failure or "
+        "the loop it exists to stop is defeated"
+    )
