@@ -1369,19 +1369,49 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     root = resolve_root(args.root)
-    if args.reset_mind:
-        fresh = load_state(root)
-        fresh["mind_failure_streak"] = 0
-        save_state(root, fresh)
-        print("mind-rest streak reset to 0")
     with sweep_lock(root) as acquired:
         if not acquired:
             # An overlapping invocation touches NOTHING: no scan, no state, no
-            # spool, no cosmic. One honest line so the skip is visible, and
-            # exit 0 so launchd does not treat a correct skip as a failure.
+            # spool, no cosmic — and, moved here to close the same race,
+            # no --reset-mind either. --reset-mind used to run BEFORE this
+            # lock was taken, so it read-modify-wrote state.json unlocked
+            # while a launchd-triggered sweep could be doing the same thing
+            # (sweep_lock's own docstring names this exact shape: two
+            # writers racing the same high-water file can each
+            # half-advance it). A --reset-mind that silently no-ops here
+            # because a sweep was live would be its own fail-open, so it
+            # gets its own loud line and a non-zero exit rather than the
+            # generic skip message, which never mentions the reset at all.
             log_line(root, "sweep already live, skipping", dry_run=args.dry_run)
+            if args.reset_mind:
+                print(
+                    "watchman: sweep already live — --reset-mind did NOT "
+                    "run (could not get the lock, nothing written); retry "
+                    "once the live sweep finishes"
+                )
+                return 1
             print("watchman: sweep already live, skipping")
             return 0
+        if args.reset_mind:
+            # --dry-run's contract (module docstring) is 'MUTATES NOTHING...
+            # the high-water state is not written'. This block used to write
+            # the real state.json regardless of --dry-run, with no guard —
+            # an operator rehearsing a repair with --reset-mind --dry-run
+            # believed nothing changed while the spend breaker was silently
+            # re-armed on disk. Gated (not rejected outright) because a dry
+            # rehearsal of exactly this combination is the realistic case
+            # the flag exists for; log_line is the in-repo precedent for
+            # branching dry-run to a report-only path instead of erroring.
+            if args.dry_run:
+                print(
+                    "watchman: dry-run — would reset mind-rest streak to 0 "
+                    "(nothing written)"
+                )
+            else:
+                fresh = load_state(root)
+                fresh["mind_failure_streak"] = 0
+                save_state(root, fresh)
+                print("mind-rest streak reset to 0")
         envelope = run_sweep(root, dry_run=args.dry_run, cosmic_bin=args.cosmic_bin)
     if envelope is None:
         print("watchman: quiet sweep — no deltas, grok not invoked")
