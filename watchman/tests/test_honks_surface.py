@@ -80,6 +80,70 @@ def test_corrupt_line_is_counted_never_silent(sov_root):
     assert hw == 2
 
 
+def test_baseline_non_dict_line_is_corrupt_not_a_crash(sov_root):
+    """json.loads() on `null` / `42` / `"x"` / `true` / `[1, 2]` succeeds and
+    returns a non-dict; calling .get() on it (unguarded) raises
+    AttributeError. This is a SYNTACTICALLY VALID line, unlike
+    test_corrupt_line_is_counted_never_silent's `{not json` — that is why
+    that test alone does not catch this defect."""
+    d = sov_root / "nape"
+    d.mkdir(exist_ok=True)
+    with open(d / "honks.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(_honk("real1")) + "\n")
+        for raw in ["null", "42", '"x"', "true", "[1, 2]"]:
+            f.write(raw + "\n")
+    surface, items, hw = watchman_sweep.scan_honks(sov_root, {})
+    assert items == [], "a backlog must never flood the digest"
+    assert hw == 6
+    assert "corrupt=5" in surface["note"]
+
+
+def test_incremental_non_dict_line_is_corrupt_not_a_crash(sov_root):
+    _write_honks(sov_root, [_honk("old1")])
+    state = {"honks_line_count": 1}
+    d = sov_root / "nape"
+    with open(d / "honks.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(_honk("new1")) + "\n")
+        for raw in ["null", "42", '"x"', "true", "[1, 2]"]:
+            f.write(raw + "\n")
+    surface, items, hw = watchman_sweep.scan_honks(sov_root, state)
+    assert hw == 7
+    assert len(items) == 1, "only the one real dict honk becomes an item"
+    assert items[0][0]["filename"] == "new1"
+    assert "corrupt skipped=5" in surface["note"]
+
+
+def test_ack_without_honk_id_does_not_poison_unacked_count(sov_root):
+    """Micro-defect, same family: _load_ack_ids used to add None to the
+    ack-id set for a record missing honk_id. A honk that also lacks
+    honk_id then read as ALREADY ACKED (None in acked_ids) and was
+    silently skipped from the unacked baseline count."""
+    d = sov_root / "nape"
+    d.mkdir(exist_ok=True)
+    with open(d / "honks.jsonl", "a", encoding="utf-8") as f:
+        f.write(
+            json.dumps(
+                {
+                    "session_id": "spiral_synthetic",
+                    "pattern": "repeated_mistake",
+                    "level": "sharp",
+                    "trigger_tool": "record_insight",
+                    "ts": "2026-08-03T12:00:00+00:00",
+                    "observation": "a honk missing honk_id entirely",
+                }
+            )
+            + "\n"
+        )
+    (d / "acks.jsonl").write_text(
+        json.dumps({"note": "malformed ack, no honk_id"}) + "\n", encoding="utf-8"
+    )
+    surface, items, hw = watchman_sweep.scan_honks(sov_root, {})
+    assert "1 unacked" in surface["note"], (
+        "a malformed ack lacking honk_id must not silently mark a "
+        "honk_id-less honk as already acked"
+    )
+
+
 def test_end_to_end_new_honk_reaches_the_spool(sov_root, clean_fetchers, tmp_path):
     _write_honks(sov_root, [_honk("base")])
     fake, log = make_fake_cosmic(tmp_path, good_reply_for([]))
