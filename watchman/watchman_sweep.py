@@ -145,10 +145,18 @@ def state_path(root):
 
 
 def load_state(root):
+    default = {"files": {}, "handoffs_unconsumed": None, "heartbeat": {}, "sweeps": 0}
     try:
-        return json.loads(state_path(root).read_text(encoding="utf-8"))
+        data = json.loads(state_path(root).read_text(encoding="utf-8"))
     except Exception:
-        return {"files": {}, "handoffs_unconsumed": None, "heartbeat": {}, "sweeps": 0}
+        return default
+    # A state.json whose top-level value is syntactically valid but not an
+    # object (`null`, `42`, `[1, 2]`, ...) parses cleanly and returns
+    # something with no .get() — crashing run_sweep before collection even
+    # starts. Same guard style as _extract_meta's `isinstance(data, dict)`.
+    if not isinstance(data, dict):
+        return default
+    return data
 
 
 def save_state(root, state):
@@ -345,6 +353,7 @@ def scan_handoffs(root: Path, state: dict):
     hdir = Path(root) / "handoffs"
     unconsumed = 0
     newest = []
+    corrupt = 0
     try:
         if not hdir.is_dir():
             raise FileNotFoundError(f"{hdir} is not a directory")
@@ -354,6 +363,16 @@ def scan_handoffs(root: Path, state: dict):
             try:
                 data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
             except (json.JSONDecodeError, OSError):
+                # Was a silent `continue` with no counter at all — a bad
+                # handoff simply vanished from the unconsumed count while
+                # the surface still reported ok. Report it instead.
+                corrupt += 1
+                continue
+            if not isinstance(data, dict):
+                # A syntactically valid but non-dict line (`null`, `42`,
+                # `[1, 2]`, ...) parses cleanly; .get() below would crash on
+                # it unguarded. Count it the same as a syntax-corrupt line.
+                corrupt += 1
                 continue
             if not data.get("consumed_at"):
                 unconsumed += 1
@@ -364,7 +383,9 @@ def scan_handoffs(root: Path, state: dict):
         surface["items"] = 0
         return surface, items, state.get("handoffs_unconsumed")
     prev = state.get("handoffs_unconsumed")
-    surface["note"] = f"unconsumed={unconsumed}"
+    surface["note"] = f"unconsumed={unconsumed}" + (
+        f", corrupt skipped={corrupt}" if corrupt else ""
+    )
     if prev is not None and unconsumed != prev:
         meta = {
             "queue": "handoffs",
@@ -478,9 +499,21 @@ def _load_ack_ids(apath):
     try:
         for ln in apath.read_text(encoding="utf-8").splitlines():
             try:
-                ids.add(json.loads(ln).get("honk_id"))
+                rec = json.loads(ln)
             except ValueError:
                 continue
+            if not isinstance(rec, dict):
+                # A syntactically valid but non-dict line — .get() below
+                # would crash on it unguarded.
+                continue
+            hid = rec.get("honk_id")
+            if hid is None:
+                # A record missing honk_id must be SKIPPED, not added as
+                # None: adding None poisons the set so any honk that also
+                # lacks honk_id reads as already-acked and is silently
+                # dropped from the unacked count.
+                continue
+            ids.add(hid)
     except OSError:
         pass
     return ids
@@ -512,6 +545,7 @@ def scan_honks(root, state):
         new_count = len(lines)
         acked_ids = _load_ack_ids(apath)
         corrupt = 0
+        non_dict = 0
         if not isinstance(prev_count, int):
             unacked = sharp = 0
             for ln in lines:
@@ -520,6 +554,12 @@ def scan_honks(root, state):
                 except ValueError:
                     corrupt += 1
                     continue
+                if not isinstance(h, dict):
+                    # Syntactically valid but non-dict (`null`, `42`,
+                    # `[1, 2]`, ...) — .get() below would crash unguarded.
+                    corrupt += 1
+                    non_dict += 1
+                    continue
                 if h.get("honk_id") in acked_ids:
                     continue
                 unacked += 1
@@ -527,7 +567,9 @@ def scan_honks(root, state):
                     sharp += 1
             surface["note"] = (
                 f"baseline: {len(lines)} honks on file, {unacked} unacked "
-                f"({sharp} sharp), corrupt={corrupt} — backlog NOT itemized "
+                f"({sharp} sharp), corrupt={corrupt}"
+                + (f" ({non_dict} non-dict)" if non_dict else "")
+                + " — backlog NOT itemized "
                 f"(triage lane owns history); watch begins at this high-water"
             )
             surface["items"] = 0
@@ -537,6 +579,14 @@ def scan_honks(root, state):
                 h = json.loads(ln)
             except ValueError:
                 corrupt += 1
+                continue
+            if not isinstance(h, dict):
+                # Same non-dict guard as the baseline loop above — THIS is
+                # the loop that matters most: it is the only one that runs
+                # after first boot, so a fix that guards only the baseline
+                # leaves the real-world case dead.
+                corrupt += 1
+                non_dict += 1
                 continue
             hid = str(h.get("honk_id", "?"))
             if hid in acked_ids:
@@ -563,6 +613,7 @@ def scan_honks(root, state):
         surface["note"] = (
             f"new lines={len(lines) - prev_count} -> items={len(items)}"
             + (f", corrupt skipped={corrupt}" if corrupt else "")
+            + (f" ({non_dict} non-dict)" if non_dict else "")
         )
     except OSError as e:
         surface["ok"] = False
@@ -1175,7 +1226,41 @@ def run_sweep(
                 rc, stdout, stderr = invoke_cosmic(
                     build_prompt(digest), cosmic_bin=cosmic_bin
                 )
-                # A process ran. Only here does grok_invoked become true.
+            except subprocess.TimeoutExpired as e:
+                # The process DID spawn; it just never answered in time.
+                envelope["grok_invoked"] = True
+                envelope["grok_process_state"] = "spawned"
+                qfile = quarantine_reply(
+                    root, sweep_id, "", f"invocation timed out: {e}"
+                )
+                envelope["grok_reply_state"] = "grok-reply-unparseable"
+                envelope["quarantine_file"] = str(qfile)
+            except OSError as e:
+                # No process ever ran (missing binary, permission, ENOENT).
+                # Saying 'invoked' here claims spend that did not happen.
+                envelope["grok_invoked"] = False
+                envelope["grok_process_state"] = "spawn-failed"
+                qfile = quarantine_reply(root, sweep_id, "", f"invocation failed: {e}")
+                envelope["grok_reply_state"] = "grok-spawn-failed"
+                envelope["grok_spawn_error"] = str(e)
+                envelope["quarantine_file"] = str(qfile)
+            else:
+                # A process ran successfully (however rc came back). Only
+                # here does grok_invoked become true — and it STAYS true no
+                # matter what happens next in this branch (reply parsing,
+                # the quarantine write on an unparseable reply): the xAI
+                # spend already happened. This is deliberately an `else:`,
+                # not more code inside the `try:` above: a quarantine-write
+                # OSError raised here must NOT be caught by the sibling
+                # `except OSError` above, which exists for invoke_cosmic
+                # itself never running. It used to live in the same try, so
+                # a quarantine-write failure after a real spawn fell into
+                # the spawn-failed handler, which then quarantined AGAIN
+                # (raising a second time, now uncaught) — and because the
+                # mind-rest streak below only counts a failure when
+                # grok_process_state == 'spawned', the mislabeled
+                # 'spawn-failed' state silently defeated the spend breaker
+                # in exactly the loop it exists to close.
                 envelope["grok_invoked"] = True
                 envelope["grok_process_state"] = "spawned"
                 parsed, identity_present = parse_grok_reply(
@@ -1195,24 +1280,6 @@ def run_sweep(
                     # raises an attend line per omitted / extra / duplicated item
                     # so severity_ceiling cannot understate.
                     envelope["grok_reply_state"] = reply_state_for(coverage)
-            except subprocess.TimeoutExpired as e:
-                # The process DID spawn; it just never answered in time.
-                envelope["grok_invoked"] = True
-                envelope["grok_process_state"] = "spawned"
-                qfile = quarantine_reply(
-                    root, sweep_id, "", f"invocation timed out: {e}"
-                )
-                envelope["grok_reply_state"] = "grok-reply-unparseable"
-                envelope["quarantine_file"] = str(qfile)
-            except OSError as e:
-                # No process ever ran (missing binary, permission, ENOENT).
-                # Saying 'invoked' here claims spend that did not happen.
-                envelope["grok_invoked"] = False
-                envelope["grok_process_state"] = "spawn-failed"
-                qfile = quarantine_reply(root, sweep_id, "", f"invocation failed: {e}")
-                envelope["grok_reply_state"] = "grok-spawn-failed"
-                envelope["grok_spawn_error"] = str(e)
-                envelope["quarantine_file"] = str(qfile)
             log_line(
                 root,
                 f"sweep {sweep_id} — {len(items)} deltas, "
@@ -1302,19 +1369,49 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     root = resolve_root(args.root)
-    if args.reset_mind:
-        fresh = load_state(root)
-        fresh["mind_failure_streak"] = 0
-        save_state(root, fresh)
-        print("mind-rest streak reset to 0")
     with sweep_lock(root) as acquired:
         if not acquired:
             # An overlapping invocation touches NOTHING: no scan, no state, no
-            # spool, no cosmic. One honest line so the skip is visible, and
-            # exit 0 so launchd does not treat a correct skip as a failure.
+            # spool, no cosmic — and, moved here to close the same race,
+            # no --reset-mind either. --reset-mind used to run BEFORE this
+            # lock was taken, so it read-modify-wrote state.json unlocked
+            # while a launchd-triggered sweep could be doing the same thing
+            # (sweep_lock's own docstring names this exact shape: two
+            # writers racing the same high-water file can each
+            # half-advance it). A --reset-mind that silently no-ops here
+            # because a sweep was live would be its own fail-open, so it
+            # gets its own loud line and a non-zero exit rather than the
+            # generic skip message, which never mentions the reset at all.
             log_line(root, "sweep already live, skipping", dry_run=args.dry_run)
+            if args.reset_mind:
+                print(
+                    "watchman: sweep already live — --reset-mind did NOT "
+                    "run (could not get the lock, nothing written); retry "
+                    "once the live sweep finishes"
+                )
+                return 1
             print("watchman: sweep already live, skipping")
             return 0
+        if args.reset_mind:
+            # --dry-run's contract (module docstring) is 'MUTATES NOTHING...
+            # the high-water state is not written'. This block used to write
+            # the real state.json regardless of --dry-run, with no guard —
+            # an operator rehearsing a repair with --reset-mind --dry-run
+            # believed nothing changed while the spend breaker was silently
+            # re-armed on disk. Gated (not rejected outright) because a dry
+            # rehearsal of exactly this combination is the realistic case
+            # the flag exists for; log_line is the in-repo precedent for
+            # branching dry-run to a report-only path instead of erroring.
+            if args.dry_run:
+                print(
+                    "watchman: dry-run — would reset mind-rest streak to 0 "
+                    "(nothing written)"
+                )
+            else:
+                fresh = load_state(root)
+                fresh["mind_failure_streak"] = 0
+                save_state(root, fresh)
+                print("mind-rest streak reset to 0")
         envelope = run_sweep(root, dry_run=args.dry_run, cosmic_bin=args.cosmic_bin)
     if envelope is None:
         print("watchman: quiet sweep — no deltas, grok not invoked")

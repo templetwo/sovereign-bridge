@@ -8,6 +8,9 @@ keep landing in the spool, Grok is not invoked, an urgent instrument line says
 so, and --reset-mind re-arms after repair.
 """
 
+import fcntl
+import os
+
 import watchman_sweep
 from conftest import (
     good_reply_for,
@@ -92,3 +95,101 @@ def test_reset_mind_flag_re_arms(sov_root, clean_fetchers):
     seed_streak(sov_root, 5)
     watchman_sweep.main(["--root", str(sov_root), "--reset-mind"])
     assert streak(sov_root) == 0
+
+
+def test_quarantine_write_failure_after_spawn_is_not_mislabeled_spawn_failed(
+    sov_root, clean_fetchers, tmp_path, monkeypatch
+):
+    """COMMIT 2: in the 'grok reply unparseable' branch, a quarantine_reply
+    write that raises OSError used to be caught by the SIBLING handler built
+    for spawn failures (invoke_cosmic itself never running) — because both
+    lived under the same try. That mislabels a sweep that genuinely invoked
+    Grok and spent real xAI credit as grok_invoked=False /
+    grok_process_state='spawn-failed', and it defeats the mind-rest spend
+    breaker: the outer failure handler only counts the streak when
+    grok_process_state == 'spawned', so a spawn that gets relabeled
+    'spawn-failed' silently stops being counted — the exact loop the spend
+    breaker exists to close."""
+    write_proposal(sov_root, "grok_bridge", "unparseable.json")
+    # A reply with no JSON object in it at all: parse_grok_reply returns
+    # (None, False) -> hits the 'grok reply unparseable' branch, which is
+    # where quarantine_reply is called on a genuinely-spawned process.
+    fake, log = make_fake_cosmic(tmp_path, "not an envelope, no braces here")
+
+    def boom_quarantine(*a, **k):
+        raise OSError("synthetic quarantine-write failure (disk full)")
+
+    monkeypatch.setattr(watchman_sweep, "quarantine_reply", boom_quarantine)
+    env = watchman_sweep.run_sweep(sov_root, cosmic_bin=fake, **clean_fetchers)
+
+    assert invocations(log) == 1, "the real spend happened"
+    assert env["grok_invoked"] is True, (
+        "a sweep that spawned and spent must always be recorded as having "
+        "invoked Grok, even when the quarantine write afterward fails"
+    )
+    assert env["grok_process_state"] == "spawned"
+    assert env["sweep_error"], "the quarantine-write failure must surface"
+    assert streak(sov_root) == 1, (
+        "the spend breaker must count this spawned-but-unsaved failure or "
+        "the loop it exists to stop is defeated"
+    )
+
+
+# --------------------------------------------------------- --reset-mind CLI
+
+
+def test_reset_mind_dry_run_does_not_write_state(sov_root):
+    """COMMIT 3, defect A: the module docstring's --dry-run contract is
+    'MUTATES NOTHING... the high-water state is not written'. --reset-mind
+    performed a real read-modify-write of state.json regardless of
+    --dry-run, with no guard and no argparse mutual exclusion. An operator
+    rehearsing a repair with `--reset-mind --dry-run` believed nothing
+    changed while the spend breaker was silently re-armed on disk."""
+    seed_streak(sov_root, 5)
+    watchman_sweep.main(["--root", str(sov_root), "--reset-mind", "--dry-run"])
+    assert streak(sov_root) == 5, "dry-run must mutate nothing, including --reset-mind"
+
+
+def test_reset_mind_live_still_writes(sov_root):
+    """The dry-run guard must not swallow the real (non-dry-run) reset."""
+    seed_streak(sov_root, 5)
+    watchman_sweep.main(["--root", str(sov_root), "--reset-mind"])
+    assert streak(sov_root) == 0
+
+
+def test_reset_mind_does_not_race_a_live_sweep_and_says_so(sov_root, capsys):
+    """COMMIT 3, defect B: --reset-mind did its read-modify-write of
+    state.json BEFORE the sweep_lock was acquired, racing a concurrently
+    running sweep's own state write (sweep_lock's own docstring names this
+    exact shape: 'two live sweeps race the same high-water state file and
+    can each half-advance it'). --reset-mind is a documented manual repair
+    workflow, so this collision is realistic, not theoretical.
+
+    fcntl.flock is scoped to the OPEN FILE DESCRIPTION, not the process, so
+    a second independent open() in this SAME test process genuinely
+    contends with the first — this reproduces 'another sweep holds the
+    lock' without needing a second process."""
+    seed_streak(sov_root, 5)
+    lock_path = watchman_sweep.sweep_lock_path(sov_root)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        rc = watchman_sweep.main(["--root", str(sov_root), "--reset-mind"])
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+    assert streak(sov_root) == 5, (
+        "a reset that could not get the lock must not race the live "
+        "sweep's own state.json write"
+    )
+    assert rc != 0, (
+        "a --reset-mind that silently no-ops because a sweep was live is "
+        "its own fail-open — it must not report success"
+    )
+    out = capsys.readouterr().out.lower()
+    assert "reset-mind" in out and "not" in out, (
+        "the no-op must be unmistakable on stdout, not just a generic "
+        "'sweep already live' line that never mentions the reset at all"
+    )
