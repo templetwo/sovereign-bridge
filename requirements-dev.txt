@@ -1,0 +1,4 @@
+# Test dependencies. Runtime deps are required too — the suites import bridge.py.
+-r requirements.txt
+
+pytest>=8.0           # tests/ and watchman/tests/ (verified on pytest 9.0.2)

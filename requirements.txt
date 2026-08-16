@@ -1,0 +1,29 @@
+# Sovereign Bridge — runtime dependencies.
+#
+# Derived from the actual imports in the tracked *.py files, not from a
+# snapshot of somebody's venv. Everything else this repo imports is either
+# stdlib or a sibling module in this directory.
+#
+# Requires Python 3.11+ (bridge.py imports the stdlib `tomllib`).
+#
+# Verified working against: fastapi 0.135.3, uvicorn 0.40.0, httpx 0.28.1,
+# pydantic 2.12.5, mcp 1.29.0 on CPython 3.12.12 (263 tests green).
+# The floors below are compatibility judgments, not measurements.
+
+fastapi>=0.110        # bridge.py — app, routes, CORS, StaticFiles, TestClient
+uvicorn>=0.27         # bridge.py — ASGI server for `python3 bridge.py`
+httpx>=0.27           # bridge.py, comms_dispatcher.py, sovereign_dashboard.py,
+                      #   stress_test_metabolism.py, tests.py; also required by
+                      #   fastapi.testclient
+pydantic>=2.0         # bridge.py — request models
+mcp>=1.0              # bridge.py — mcp.client.session / mcp.client.sse / mcp.types
+
+# NOT listed here on purpose:
+#
+#   sovereign_stack — the companion MCP server
+#                     (https://github.com/templetwo/sovereign-stack). It is not
+#                     published on PyPI; bridge.py adds ~/sovereign-stack/src to
+#                     sys.path and imports it inside try/except ImportError, so
+#                     the bridge starts without it (version reporting and the
+#                     shared comms read surface degrade). Install it from its own
+#                     repo if you want those.

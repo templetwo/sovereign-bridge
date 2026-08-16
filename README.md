@@ -79,7 +79,25 @@ python3 stack_tokens.py list
 | `stack_tokens.py` | token CLI |
 | `sovereign_dashboard.py`, `dashboard/index.html` | activity monitors (terminal, web) |
 | `comms_dispatcher.py`, `comms_listener.sh` | legacy comms plumbing (the bulletin board is retired) |
-| `tests/`, `tests.py` | arrival gate, session tokens, write-path, heartbeat |
+| `tests/`, `watchman/tests/` | pytest suites — arrival gate, session tokens, write-path, heartbeat, watchman |
+| `tests.py` | live-integration script; needs a running bridge |
+| `requirements.txt`, `requirements-dev.txt` | runtime / test dependencies |
+
+## Install
+
+Python 3.11+ (`bridge.py` uses the stdlib `tomllib`).
+
+```bash
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt          # runtime
+pip install -r requirements-dev.txt      # + pytest, to run the suites
+```
+
+The companion [sovereign-stack](https://github.com/templetwo/sovereign-stack) is
+deliberately not a pip dependency — it is not on PyPI. `bridge.py` adds
+`~/sovereign-stack/src` to `sys.path` and imports it inside `try/except
+ImportError`, so the bridge runs without it, with version reporting and the
+shared comms read surface degraded. Install it from its own repo to get those.
 
 ## Running
 
@@ -95,7 +113,9 @@ instance), and it is the origin the arrival gate signs into the approve/deny lin
 it pushes to a phone — left at the default on someone else's deployment, those
 links point at a host the operator does not control.
 
-Tests: `python3 -m pytest tests/`.
+Tests: `python3 -m pytest tests/ watchman/tests/`. (`tests.py` at the repo root is
+a separate live-integration script — it talks to a *running* bridge and writes
+through it; it is not part of the pytest suites.)
 
 ## Relationship to the native connector
 
