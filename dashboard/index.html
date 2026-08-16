@@ -167,9 +167,12 @@ body { background: #0a0a0f; color: #e7e5e4; font-family: 'Inter', -apple-system,
 <div class="refresh">Refreshes every 5s · <span id="last-update">—</span></div>
 
 <script>
-const BRIDGE = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'http://127.0.0.1:8100'
-  : 'https://stack.templetwo.com';
+// The bridge itself serves this page (GET / -> dashboard/index.html), so its
+// own origin is always the correct API base — no deployment hostname belongs
+// here. Opened straight from disk (file://), fall back to the local bridge.
+const BRIDGE = /^https?:$/.test(window.location.protocol)
+  ? window.location.origin
+  : 'http://127.0.0.1:8100';
 let TOKEN = new URLSearchParams(window.location.search).get('token');
 
 if (!TOKEN || TOKEN.length < 32) {

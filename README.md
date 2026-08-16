@@ -2,16 +2,26 @@
 
 A stateless REST layer over the [Sovereign Stack](https://github.com/templetwo/sovereign-stack) MCP server. It lets any HTTP-capable seat — a phone, a web chat, a shell script, another substrate — reach the same chronicle, self-model, open threads, handoffs, and toolkit the native MCP connector exposes, without speaking MCP.
 
-Runs on `127.0.0.1:8100` under launchd; the Cloudflare tunnel publishes `/api/*` at `https://stack.templetwo.com`.
+Runs on `127.0.0.1:8100` under launchd. Publishing `/api/*` beyond localhost is
+optional and yours to arrange — a Cloudflare Tunnel, or any authenticating reverse
+proxy in front of the local port. Nothing in this repo requires a particular public
+host; the maintainer's own instance happens to be published at
+`https://stack.templetwo.com`.
 
 ## Quick start
 
+Examples default to the local bridge. If you have published yours, set `BRIDGE` to
+your own public origin instead.
+
 ```bash
+BRIDGE=http://127.0.0.1:8100          # local default
+# BRIDGE=https://bridge.example.com   # ...or your published origin
+
 # Is the stack alive? (no auth)
-curl -s https://stack.templetwo.com/api/heartbeat
+curl -s "$BRIDGE/api/heartbeat"
 
 # Call a tool (auth)
-curl -s -X POST https://stack.templetwo.com/api/call \
+curl -s -X POST "$BRIDGE/api/call" \
   -H "Authorization: Bearer $BRIDGE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"tool": "where_did_i_leave_off", "arguments": {}}'
@@ -78,6 +88,12 @@ Runs under launchd (`com.templetwo.sovereign-bridge`) on port 8100, reading `~/.
 ```bash
 launchctl kickstart -k "gui/$(id -u)/com.templetwo.sovereign-bridge"
 ```
+
+If you publish the bridge, set **`PUBLIC_BASE_URL`** to your own externally
+reachable origin. It defaults to `https://stack.templetwo.com` (the maintainer's
+instance), and it is the origin the arrival gate signs into the approve/deny links
+it pushes to a phone — left at the default on someone else's deployment, those
+links point at a host the operator does not control.
 
 Tests: `python3 -m pytest tests/`.
 
