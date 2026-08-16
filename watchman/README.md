@@ -366,10 +366,17 @@ Stack record; durable findings are HQ's to land, with receipts.
 Nothing below happens without his explicit go (SOP #3):
 
 1. Merge `draft/watchman` into `~/sovereign-bridge` main.
-2. Rename `com.templetwo.comms-dispatcher.plist.DRAFT` → `.plist`, copy to
-   `~/Library/LaunchAgents/`, `launchctl bootout` the old dispatcher job,
-   `launchctl bootstrap` the new one (same label — addresses outlast
-   occupants).
+2. Install the plist, substituting the `__HOME__` placeholders on the way in.
+   This step is not optional: launchd expands neither `~` nor `$HOME` inside a
+   plist, so an unsubstituted copy watches nothing and starts nothing.
+
+   ```
+   sed "s|__HOME__|$HOME|g" watchman/com.templetwo.comms-dispatcher.plist.DRAFT \
+     > ~/Library/LaunchAgents/com.templetwo.comms-dispatcher.plist
+   ```
+
+   Then `launchctl bootout` the old dispatcher job and `launchctl bootstrap` the
+   new one (same label — addresses outlast occupants).
 3. First sweep seeds `~/.sovereign/watchman/state.json` high-water; expect one
    large baseline envelope, then quiet.
 

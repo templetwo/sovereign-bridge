@@ -15,7 +15,22 @@
   stampeding. The sweep itself only wakes Grok (cosmic-cli ask) when deltas
   exist — the LLM wakes on sound, never on the clock.
 
-  Paths assume the watchman/ dir lives in the merged ~/sovereign-bridge tree.
+  Paths assume the watchman/ dir lives in the merged ~/sovereign-bridge tree,
+  and that sovereign-stack is checked out beside it (line ~28 points at THAT
+  sibling repo's venv interpreter, not at anything in this one).
+
+  TEMPLATED: every absolute path below carries __HOME__ where your home
+  directory goes. Substitute before installing:
+
+      sed "s|__HOME__|$HOME|g" com.templetwo.comms-dispatcher.plist.DRAFT \
+        > ~/Library/LaunchAgents/com.templetwo.comms-dispatcher.plist
+
+  Do NOT write a literal ~ or $HOME into these values. launchd performs no
+  shell or tilde expansion in ProgramArguments, WatchPaths, StandardOutPath,
+  or StandardErrorPath — it would take them as literal paths, find nothing,
+  and the job would fail to start (or watch nothing) with no useful signal.
+  __HOME__ is left deliberately unresolvable so an unsubstituted install
+  fails loudly instead of silently going deaf.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -25,8 +40,8 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/tony_studio/sovereign-stack/venv/bin/python3</string>
-        <string>/Users/tony_studio/sovereign-bridge/watchman/watchman_sweep.py</string>
+        <string>__HOME__/sovereign-stack/venv/bin/python3</string>
+        <string>__HOME__/sovereign-bridge/watchman/watchman_sweep.py</string>
     </array>
 
     <!-- launchd does NOT inherit a login shell's PATH. node lives under
@@ -46,10 +61,10 @@
 
     <key>WatchPaths</key>
     <array>
-        <string>/Users/tony_studio/.sovereign/grok_bridge/pending_writes</string>
-        <string>/Users/tony_studio/.sovereign/openai_bridge/pending_writes</string>
-        <string>/Users/tony_studio/.sovereign/antigravity_connector/pending_writes</string>
-        <string>/Users/tony_studio/.sovereign/daemons/halts</string>
+        <string>__HOME__/.sovereign/grok_bridge/pending_writes</string>
+        <string>__HOME__/.sovereign/openai_bridge/pending_writes</string>
+        <string>__HOME__/.sovereign/antigravity_connector/pending_writes</string>
+        <string>__HOME__/.sovereign/daemons/halts</string>
     </array>
 
     <!-- Slow sweep heartbeat: every 30 minutes even with no filesystem sound,
@@ -68,8 +83,8 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/Users/tony_studio/.sovereign/watchman/launchd.out</string>
+    <string>__HOME__/.sovereign/watchman/launchd.out</string>
     <key>StandardErrorPath</key>
-    <string>/Users/tony_studio/.sovereign/watchman/launchd.err</string>
+    <string>__HOME__/.sovereign/watchman/launchd.err</string>
 </dict>
 </plist>
