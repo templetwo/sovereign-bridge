@@ -55,6 +55,18 @@ def client(monkeypatch, tmp_path):
         return [_fake_tool(n) for n in _CATALOG_NAMES]
 
     monkeypatch.setattr(bridge, "_list_tools_raw", fake_raw)
+
+    # Isolate the chronicle write path too. admin_mint records every grant via
+    # call_mcp_tool -> live SSE (:3434) -> record_insight. Without this stub the
+    # suite writes REAL "Arrival grant ... decided via hq_mint" ground_truth
+    # entries (with a human receipt) into the production chronicle on every run
+    # -- observed 2026-08-16: 14 false grant records in ~/.sovereign/chronicle
+    # from two runs of this file. Same shape as the boot_ritual tests asserting
+    # against the live store: the token DB was isolated, the record was not.
+    async def fake_call_mcp_tool(tool_name, arguments):
+        return {"ok": True, "stubbed": tool_name}
+
+    monkeypatch.setattr(bridge, "call_mcp_tool", fake_call_mcp_tool)
     return TestClient(bridge.app)
 
 
