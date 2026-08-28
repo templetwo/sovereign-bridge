@@ -956,8 +956,108 @@ except Exception:  # pragma: no cover — stack import failure is already fatal 
         }
 
 
+# ── Gate census: what the seat WROTE that has not landed ────────────────────
+# The mirror image of the aperture. The aperture tells an arriving seat what it
+# is not being SHOWN; this tells it what it PROPOSED that is still waiting, and
+# who it is waiting on. Same one-implementation rule: the logic lives in
+# sovereign_stack.gate_census and derives its counts from the bridge console's
+# own dispatcher, so this endpoint can never drift from the queue Anthony
+# actually drains. Two counts of the same queue is this house's disease.
+try:
+    from sovereign_stack.gate_census import GATE_POLICY_VERSION
+    from sovereign_stack.gate_census import measure_gate as _measure_gate
+    from sovereign_stack.gate_census import unmeasured as _gate_unmeasured
+except Exception:  # pragma: no cover — stack import failure is already fatal upstream
+    GATE_POLICY_VERSION = "gate-unavailable"
+
+    def _measure_gate(now):
+        raise RuntimeError("sovereign_stack.gate_census unavailable")
+
+    def _gate_unmeasured(now, exc):
+        return {
+            "policy_version": GATE_POLICY_VERSION,
+            "status": "unmeasured",
+            "measured_at": now.isoformat(),
+            "reason": type(exc).__name__,
+            "note": "gate census could not be measured; absent counts are NOT zero counts",
+        }
+
+
+# ?as= lets a caller SAY who it is so `next` can be shaped for it. It is never
+# inferred: this endpoint is unauthenticated, so User-Agent sniffing would be a
+# guess rendered as knowledge. The value is attacker-controlled free text on a
+# public route — cap it, whitelist the charset, and never interpolate the raw
+# string into prose. An unrecognised name stays "declared but unmatched", which
+# is an honest state; guessing a substrate from it would not be.
+_AS_MAX_LEN = 64
+_AS_ALLOWED = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._: "
+)
+_AS_HINT = "GET /api/heartbeat?as=<your model or seat name> to see guidance shaped for you"
+
+
+def _declared_caller(raw: str | None) -> dict:
+    """Interpret a self-declared ?as= value. Never infers, never trusts."""
+    if not raw:
+        return {"identified": False, "how": _AS_HINT}
+    cleaned = "".join(c for c in str(raw)[:_AS_MAX_LEN] if c in _AS_ALLOWED).strip()
+    if not cleaned:
+        return {
+            "identified": False,
+            "reason": "declared value contained no usable characters",
+            "how": _AS_HINT,
+        }
+    low = cleaned.lower()
+    if "grok" in low or "xai" in low:
+        substrate = "grok_bridge"
+    elif "gpt" in low or "openai" in low or "chatgpt" in low:
+        substrate = "openai_bridge"
+    else:
+        substrate = None
+    out = {
+        "identified": True,
+        "declared": cleaned,
+        "note": (
+            "self-declared and UNVERIFIED — this endpoint is unauthenticated and "
+            "cannot confirm who is calling. Guidance below is shaped by what you "
+            "said, not by what you are."
+        ),
+    }
+    out["substrate"] = substrate or "declared name matched no known bridge queue"
+    return out
+
+
+def _gate_guidance(caller: dict, gate: dict) -> dict | None:
+    """One line telling a declared caller what IT has waiting. None if unknowable."""
+    sub = caller.get("substrate")
+    if not caller.get("identified") or sub not in (gate.get("substrates") or {}):
+        return None
+    entry = gate["substrates"][sub]
+    if entry.get("status") != "measured":
+        return {"your_queue": sub, "status": "unmeasured", "note": entry.get("reason")}
+    pending = entry["by_status"].get("pending", 0)
+    g = {
+        "your_queue": sub,
+        "pending_at_the_human_gate": pending,
+        "oldest_pending_age_days": entry.get("oldest_pending_age_days"),
+        "means": (
+            "proposals you filed that Anthony has not ratified. They are preserved, "
+            "not lost, and not rejected. Nothing you do makes them land faster — "
+            "ratification is his gate."
+        ),
+    }
+    stuck = entry["by_status"].get("needs_revision")
+    if stuck:
+        g["stuck_needs_revision"] = stuck
+        g["stuck_means"] = (
+            "these can never be approved — the status has no path back to pending. "
+            "Refile as a new proposal rather than waiting on these."
+        )
+    return g
+
+
 @app.get("/api/heartbeat")
-async def heartbeat():
+async def heartbeat(as_: str | None = Query(None, alias="as")):
     """Liveness check, no auth. The shape an arriving instance hits first.
 
     Datetime delivery is bulletproof: `now` is read ONCE, FIRST, before any
@@ -1025,10 +1125,20 @@ async def heartbeat():
     except Exception as exc:
         aperture = _aperture_unmeasured(now, exc)
 
+    # Gate census: same guard. A raise becomes status="unmeasured" with no
+    # counts, because a missing queue read must never render as an empty queue.
+    try:
+        gate = _measure_gate(now)
+    except Exception as exc:
+        gate = _gate_unmeasured(now, exc)
+    caller = _declared_caller(as_)
+
     return {
         "status": "ok" if healthy else "degraded",
         "version": VERSION,
         "aperture": aperture,
+        "gate": gate,
+        "caller": caller,
         "tools": tool_count,
         "tools_summary": _build_tools_summary(inventory.get("names"), tool_count),
         "comms_messages": total_messages,
