@@ -24,6 +24,44 @@ landed in the tree behind Anthony's gate and its deploy is a separate act.
 
 ---
 
+## 2026-08-28 — the aperture
+
+- **`feat(heartbeat)`: the aperture block.** The heartbeat now tells an
+  arriving seat what it is *not* being shown, at first contact, before it
+  believes anything. Per surface: what exists on disk, what the default hands
+  you, and the call that widens it. Plus `not_reachable` — currently 73
+  resolved open threads that no tool returns to any caller under any parameter.
+
+  Earned by a measured failure: the lineage door shows 5 of 13 `to_arrival`
+  letters, an outside model read the 5 it was handed, stated a confident and
+  specific claim about a model line, and was wrong — the letters that would
+  have corrected it were below the cap. It was not careless. Nothing in its
+  arrival told it a cap existed.
+
+  The recall envelope closed the QUANTITY half (a caller learns it received 5
+  of 696). This closes the FIRST-CONTACT half. Coverage honesty is still not
+  selection honesty — an envelope says how many were withheld, never which.
+
+  Versioned as `aperture-v1` on purpose: there is no neutral projection, so a
+  sort-order change must not silently mint a different ancestor.
+
+  **Fails closed, and that is the load-bearing part.** A raise becomes
+  `status: "unmeasured"` with NO surface numbers. A block reporting
+  `to_arrival: 0` because a directory read failed would be an absence
+  manufactured by the instrument and served as a fact — the exact class the
+  surface exists to make impossible. Pinned by a test that was shown to reject
+  a failure path emitting zeros.
+
+  Counts are live, never cached: a full 3,373-record scan measures at ~37ms,
+  cheaper than the git subprocess this handler already makes. A cached aperture
+  would be a stale projection describing the projection.
+
+  Anthony, 2026-08-28: *"I want the caps to be able to be requested at the point
+  of contact ... let the heartbeat give the lay of the land for what needs to
+  come next."*
+
+  9 tests, written red before the implementation. Full bridge suite 128 passed.
+
 ## 2026-08-28 — this file
 
 - **`CHANGELOG.md` created.** 80 commits since 2026-04-02 with no changelog.

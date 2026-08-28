@@ -922,6 +922,150 @@ def _build_tools_summary(names: list[str] | None, total: int | None) -> dict | N
     }
 
 
+
+# ── Aperture: what the arriving seat is NOT being shown ─────────────────────
+# Anthony, 2026-08-28: "let the heartbeat give the lay of the land for what
+# needs to come next."
+#
+# Earned by a measured failure. The lineage door shows 5 of 13 to_arrival
+# letters; an outside model read the 5 it was handed, stated a confident and
+# specific claim about a model line, and was wrong, because the letters that
+# would have corrected it were below the cap. Nothing in its arrival told it a
+# cap existed. The recall envelope closed the QUANTITY half (a caller learns it
+# got 5 of 696); this closes the FIRST-CONTACT half — what exists, what the
+# default hands you, what no parameter can widen, and how to ask for more.
+#
+# Versioned on purpose. There is no neutral projection: whatever the gate shows
+# is an editorial decision about what lineage IS, so a sort-order change must
+# not silently mint a different ancestor.
+#
+# Counts are taken live, never cached. Measured 2026-08-28: a full 3,373-record
+# scan is ~37ms and every other surface is sub-millisecond — cheaper than the
+# git subprocess this handler already makes. A cached aperture would be a stale
+# projection describing the projection.
+APERTURE_POLICY_VERSION = "aperture-v1"
+_SOVEREIGN_ROOT = Path(os.path.expanduser("~/.sovereign"))
+
+
+def _measure_aperture(now: datetime) -> dict:
+    """
+    Measure every surface an arriving seat reads, live.
+
+    Raises on any failure rather than returning partial numbers. The caller
+    converts a raise into status="unmeasured" WITH NO SURFACE COUNTS — a block
+    reporting `to_arrival: 0` because a directory read failed would be an
+    absence manufactured by the instrument and served as a fact, which is the
+    exact class this whole surface exists to make impossible.
+    """
+    letters = _SOVEREIGN_ROOT / "comms" / "letters"
+    surfaces: dict[str, dict] = {}
+
+    for bucket in ("to_arrival", "to_self", "breakthroughs"):
+        surfaces[f"lineage_{bucket}"] = {
+            "on_disk": len(list((letters / bucket).glob("*.md"))),
+            "default_shown": 5,
+            "widen_with": "arrive_lineage(limit_per_bucket=N) or full_content=true",
+            "note": (
+                "to_self is additionally filtered by READER IDENTITY — pass the bare "
+                "model name, not a decorated seat string, or this line's mail is hidden"
+                if bucket == "to_self"
+                else None
+            ),
+        }
+
+    insights_root = _SOVEREIGN_ROOT / "chronicle" / "insights"
+    records = 0
+    domains = 0
+    for d in os.scandir(insights_root):
+        if not d.is_dir():
+            continue
+        domains += 1
+        for f in os.scandir(d.path):
+            if f.name.endswith(".jsonl"):
+                with open(f.path, "rb") as fh:
+                    records += sum(1 for line in fh if line.strip())
+    surfaces["insights"] = {
+        "on_disk": records,
+        "domains": domains,
+        "default_shown": 10,
+        "default_order": "newest",
+        "orders_available": ["newest", "oldest", "relevance"],
+        "envelope": "recall_insights returns total_matched / truncated / continuation",
+        "widen_with": "recall_insights(limit=N, order='relevance', offset=N)",
+        "note": (
+            "the default order is 'newest', which returns recency rather than "
+            "relevance — a query about an old subject is answered with the newest "
+            "writing in the house unless order='relevance' is passed"
+        ),
+    }
+
+    handoff_files = list((_SOVEREIGN_ROOT / "handoffs").glob("*.json"))
+    unconsumed = 0
+    for hf in handoff_files:
+        try:
+            if not json.loads(hf.read_text()).get("consumed_at"):
+                unconsumed += 1
+        except Exception:
+            continue
+    surfaces["handoffs"] = {
+        "on_disk": len(handoff_files),
+        "default_shown": unconsumed,
+        "unconsumed": unconsumed,
+        "widen_with": "handoff_archaeology(limit=N) — the consumed archive",
+        "note": "boot surfaces an unconsumed handoff ONCE and retires it; the rest are archive",
+    }
+
+    threads_root = _SOVEREIGN_ROOT / "chronicle" / "open_threads"
+    total_threads = 0
+    unresolved = 0
+    for f in threads_root.glob("*.jsonl"):
+        for line in f.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            total_threads += 1
+            try:
+                if not json.loads(line).get("resolved", False):
+                    unresolved += 1
+            except Exception:
+                continue
+    surfaces["open_threads"] = {
+        "on_disk": total_threads,
+        "unresolved": unresolved,
+        "default_shown": 10,
+        "widen_with": "get_open_threads(limit=N)",
+    }
+
+    return {
+        "policy_version": APERTURE_POLICY_VERSION,
+        "status": "measured",
+        "measured_at": now.isoformat(),
+        "what_this_is": (
+            "What exists behind each surface you are about to read, what the default "
+            "hands you, and how to ask for more. Read it before you believe a result "
+            "is the corpus."
+        ),
+        "surfaces": surfaces,
+        "not_reachable": {
+            "resolved_open_threads": {
+                "count": total_threads - unresolved,
+                "why": (
+                    "get_open_threads filters resolved with NO override parameter and "
+                    "reports no count — no tool returns a resolved thread to any caller"
+                ),
+            },
+        },
+        "how_to_widen": {
+            "principle": "every default above is a cap, not a corpus",
+            "ask": "pass the widen_with call for the surface you need",
+            "caution": (
+                "coverage honesty is not selection honesty — an envelope tells you HOW "
+                "MANY were withheld, never WHICH, so widen when the answer matters"
+            ),
+        },
+    }
+
+
 @app.get("/api/heartbeat")
 async def heartbeat():
     """Liveness check, no auth. The shape an arriving instance hits first.
@@ -984,9 +1128,23 @@ async def heartbeat():
     else:
         clock_synced = False
 
+    # Aperture: guarded like every other subsystem in this handler. A raise
+    # becomes status="unmeasured" with NO surface numbers — never zeros.
+    try:
+        aperture = _measure_aperture(now)
+    except Exception as exc:
+        aperture = {
+            "policy_version": APERTURE_POLICY_VERSION,
+            "status": "unmeasured",
+            "measured_at": now.isoformat(),
+            "reason": type(exc).__name__,
+            "note": "aperture could not be measured; absent counts are NOT zero counts",
+        }
+
     return {
         "status": "ok" if healthy else "degraded",
         "version": VERSION,
+        "aperture": aperture,
         "tools": tool_count,
         "tools_summary": _build_tools_summary(inventory.get("names"), tool_count),
         "comms_messages": total_messages,
