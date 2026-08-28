@@ -24,6 +24,16 @@ landed in the tree behind Anthony's gate and its deploy is a separate act.
 
 ---
 
+## 2026-08-28 — aperture moved to the stack (dedup)
+
+- **`bridge.py` no longer implements the aperture.** It imports
+  `sovereign_stack.aperture`, which the boot door also renders. The ChatGPT
+  seat reported from the OpenAI bridge that no heartbeat *tool* is exposed to
+  it, so a heartbeat-only aperture was unreachable by the schema-constrained
+  seats it was built for. `_measure_aperture` is kept as a module-level alias
+  so the guarded call and the test that monkeypatches it stay pointed at one
+  name. Two implementations could disagree about what is being withheld.
+
 ## 2026-08-28 — the aperture
 
 - **`feat(heartbeat)`: the aperture block.** The heartbeat now tells an
