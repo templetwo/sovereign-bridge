@@ -983,6 +983,34 @@ except Exception:  # pragma: no cover — stack import failure is already fatal 
         }
 
 
+# ── Attribution: WHO wrote the record ──────────────────────────────────────
+# The third census, and the one the chronicle could not answer about itself.
+# record_insight accepted `source_instance`, discarded it, and returned ok:true;
+# session_id is this bridge's spiral session, identical for every writer. So the
+# record had no author. Anthony's instruction on being shown the fix, 2026-08-28:
+# "i agree with both but it must be visable at heartbeat" — because a fix nobody
+# can see from the door is indistinguishable from a fix nobody made, which is how
+# this house accumulated a list of written-but-unconnected repairs. The door
+# therefore reports the measured RATE, not the claim.
+try:
+    from sovereign_stack.attribution import ATTRIBUTION_POLICY_VERSION
+    from sovereign_stack.attribution import measure_attribution as _measure_attribution
+    from sovereign_stack.attribution import unmeasured as _attribution_unmeasured
+except Exception:  # pragma: no cover — stack import failure is already fatal upstream
+    ATTRIBUTION_POLICY_VERSION = "attribution-unavailable"
+
+    def _measure_attribution(now):
+        raise RuntimeError("sovereign_stack.attribution unavailable")
+
+    def _attribution_unmeasured(now, exc):
+        return {
+            "policy_version": ATTRIBUTION_POLICY_VERSION,
+            "status": "unmeasured",
+            "measured_at": now.isoformat(),
+            "reason": type(exc).__name__,
+            "note": "attribution could not be measured; an absent rate is NOT a zero rate",
+        }
+
 # ?as= lets a caller SAY who it is so `next` can be shaped for it. It is never
 # inferred: this endpoint is unauthenticated, so User-Agent sniffing would be a
 # guess rendered as knowledge. The value is attacker-controlled free text on a
@@ -1133,11 +1161,19 @@ async def heartbeat(as_: str | None = Query(None, alias="as")):
         gate = _gate_unmeasured(now, exc)
     caller = _declared_caller(as_)
 
+    # Same guard: a raise becomes unmeasured with no rate, because a 0%
+    # manufactured by a failed read is the exact lie this block exists to expose.
+    try:
+        attribution = _measure_attribution(now)
+    except Exception as exc:
+        attribution = _attribution_unmeasured(now, exc)
+
     return {
         "status": "ok" if healthy else "degraded",
         "version": VERSION,
         "aperture": aperture,
         "gate": gate,
+        "attribution": attribution,
         "caller": caller,
         "tools": tool_count,
         "tools_summary": _build_tools_summary(inventory.get("names"), tool_count),
