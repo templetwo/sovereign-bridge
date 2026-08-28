@@ -1170,6 +1170,7 @@ async def heartbeat(as_: str | None = Query(None, alias="as")):
                 "poll returns a short-lived scoped token. See /api/discover."
             ),
             "doc": "GET /api/discover for the full self-describing entry-point doc",
+            **({"your_gate": _g} if (_g := _gate_guidance(caller, gate)) else {}),
         },
     }
 
