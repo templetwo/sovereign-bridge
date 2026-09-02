@@ -43,8 +43,16 @@ TTL_DEFAULT_HOURS = 12
 #
 # Review corrections applied:
 #   * check_mistakes moved write → read (it searches learnings, writes nothing)
-#   * where_did_i_leave_off NOT in read — it consumes handoffs (side effect);
-#     scoped seats arrive through arrive_lineage.
+#   * where_did_i_leave_off NOT in read — scoped seats arrive through
+#     arrive_lineage. THE STATED REASON HAS CHANGED, the mapping has not.
+#     The 2026-07-01 review gave it as "it consumes handoffs (side effect)",
+#     and that reason no longer exists: the signature ledger (2026-08-31,
+#     sovereign-stack 7bf249f + 2d698f8) made receipt additive and per-reader,
+#     so reading retires nothing for anyone. Two reasons survive and are why
+#     this stays out of `read`: the door still WRITES (it signs the ledger for
+#     the reading seat), and it is the full boot surface, reserved to the
+#     master token on purpose. Not a pending cleanup — do not "fix" it by
+#     adding it to read on the strength of the dead rationale.
 #   * close_session / spiral_inherit pulled out of write into a separate
 #     'session' scope — they mutate global spiral state and are granted
 #     deliberately, never bundled.
