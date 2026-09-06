@@ -1201,6 +1201,71 @@ except Exception:  # pragma: no cover — stack import failure is already fatal 
             "note": "attribution could not be measured; an absent rate is NOT a zero rate",
         }
 
+# ── Unacked signals: what the watch seats raised that nobody has closed ─────
+# The fourth census, and the same one-implementation rule as the three above:
+# the logic lives in sovereign_stack.signal_ledger, which is also what the
+# stack's own `signals_summary` tool returns, so the heartbeat and the tool can
+# never report two different numbers for one ledger.
+#
+# ⚠ AN UNREADABLE OR NEVER-SCANNED LEDGER IS AN ERROR STATE, NEVER ZERO, and
+# that property is load-bearing enough to say twice. `heartbeat_field` already
+# renders `{"error": "not_scanned", "total": None}` rather than
+# `{"total": 0}` — a zero here would read as "every signal is closed", which is
+# the single most reassuring lie this field could tell. So NOTHING in this
+# module coerces a None to 0, and the failure paths below render `total: None`
+# with a populated `error` for exactly the same reason.
+#
+# THE IMPORT WILL FAIL TODAY, AND THAT IS EXPECTED, NOT A BUG. bridge.py adds
+# ~/sovereign-stack/src to sys.path (line 49), so `sovereign_stack` resolves to
+# the LIVE checked-out tree — where signal_ledger.py does not exist until the
+# stack's release/2026-09-06 is merged and deployed. Until then this degrades
+# to the stub, the heartbeat carries
+# `unacked_signals.error == "signal_ledger_unavailable"`, and no caller can
+# mistake that for a quiet ledger.
+try:
+    from sovereign_stack.signal_ledger import heartbeat_field as _signal_heartbeat_field
+
+    SIGNALS_SOURCE = "sovereign_stack.signal_ledger"
+except Exception:  # pragma: no cover — exercised by the fallback test
+    SIGNALS_SOURCE = "unavailable"
+
+    def _signal_heartbeat_field(root=None):
+        raise RuntimeError("sovereign_stack.signal_ledger unavailable")
+
+
+def _signals_unmeasured(exc: Exception) -> dict:
+    """The honest shape of a failed read: an error, and no numbers at all."""
+    unavailable = isinstance(exc, RuntimeError) and "unavailable" in str(exc)
+    return {
+        "source": SIGNALS_SOURCE,
+        "error": "signal_ledger_unavailable" if unavailable else f"unreadable:{type(exc).__name__}",
+        "ingestion": "error",
+        "scanned_at": None,
+        "total": None,
+        "stale_24h": None,
+        "stale_7d": None,
+        "by_source": None,
+        "note": (
+            "the signal ledger could not be read; an absent count is NOT a zero "
+            "count, and this field must never be rendered as 'no unacked signals'"
+        ),
+    }
+
+
+def _measure_signals() -> dict:
+    """`unacked_signals` for the heartbeat. Never raises, never fabricates a
+    zero. A raise from the ledger becomes an error state carrying `total: None`;
+    a successful read is passed through with its own error field intact, since
+    `heartbeat_field` already distinguishes not_scanned from a real count."""
+    try:
+        field = _signal_heartbeat_field()
+    except Exception as exc:
+        return _signals_unmeasured(exc)
+    if not isinstance(field, dict):
+        return _signals_unmeasured(TypeError("signal ledger returned a non-mapping"))
+    return {"source": SIGNALS_SOURCE, **field}
+
+
 # ?as= lets a caller SAY who it is so `next` can be shaped for it. It is never
 # inferred: this endpoint is unauthenticated, so User-Agent sniffing would be a
 # guess rendered as knowledge. The value is attacker-controlled free text on a
@@ -1358,12 +1423,22 @@ async def heartbeat(as_: str | None = Query(None, alias="as")):
     except Exception as exc:
         attribution = _attribution_unmeasured(now, exc)
 
+    # Same guard, same reason, one more surface: an unreadable ledger renders
+    # as an error state with total=None. _measure_signals swallows its own
+    # exceptions, so this try is the belt to that — a raise here would still
+    # not be allowed to sink the handler, or to become a zero.
+    try:
+        signals = _measure_signals()
+    except Exception as exc:  # pragma: no cover — _measure_signals is total
+        signals = _signals_unmeasured(exc)
+
     return {
         "status": "ok" if healthy else "degraded",
         "version": VERSION,
         "aperture": aperture,
         "gate": gate,
         "attribution": attribution,
+        "unacked_signals": signals,
         "caller": caller,
         "tools": tool_count,
         "tools_summary": _build_tools_summary(inventory.get("names"), tool_count),
