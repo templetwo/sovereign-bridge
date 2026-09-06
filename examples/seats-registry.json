@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "EXAMPLE seat registry. Copy to ~/.sovereign/hq/seats/registry.json to seat",
+    "terminals on this machine. Nothing in the bridge writes this file: it is",
+    "Anthony's, by hand, and its absence is the off switch for seat identity.",
+    "A seat entry is a statement that Anthony put that terminal on the Studio.",
+    "'enabled' must be literally true; anything else denies. Deleting a seat, or",
+    "the file, revokes immediately - the registry is read fresh on every request."
+  ],
+  "seats": {
+    "hq-claude-studio": {
+      "substrate": "anthropic",
+      "kind": "hq",
+      "enabled": true
+    },
+    "grok-build-studio": {
+      "substrate": "xai",
+      "kind": "seated",
+      "enabled": true
+    },
+    "codex-astra-studio": {
+      "substrate": "openai",
+      "kind": "seated",
+      "enabled": true
+    }
+  }
+}

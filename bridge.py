@@ -221,6 +221,7 @@ class CommsMessage(BaseModel):
 
 # === Auth ===
 import session_tokens as st
+import seat_identity as si
 
 
 class ScopeHTTPException(HTTPException):
@@ -303,6 +304,47 @@ def check_auth(authorization: str | None, allow_session: bool = False):
             "GET /api/heartbeat will confirm."
         ),
     )
+
+
+def check_auth_or_seat(
+    request: Request,
+    authorization: str | None,
+    seat_header: str | None,
+):
+    """THE /api/call CHOKEPOINT. Three auth paths, decided here, no fallback.
+
+    Returns exactly what check_auth returns for the two bearer paths (None for
+    master, the session context dict for a scoped token), or a seat context
+    {"status":"ok","kind":"seat","seat_id",...} for the third.
+
+    ORDER IS THE SECURITY PROPERTY:
+
+      * An Authorization header of ANY kind routes to check_auth and check_auth
+        alone — a good bearer, a dead session token, and a garbage string all
+        get exactly the answer they got before this function existed. Adding
+        X-Sovereign-Seat to a bad-bearer request therefore buys nothing. This
+        is the "bearer path decides" rule, and stating it as "an Authorization
+        header present at all" rather than "a VALID bearer" is what makes it
+        an escalation-proof rule instead of a race between two validators.
+
+      * Only a request with NO Authorization header can reach the seat path,
+        and only then if it presents a seat header. Everything else is the
+        pre-existing 401 for a missing bearer, byte-identical.
+
+    Deliberately NOT folded into check_auth: check_auth guards ~15 master-only
+    routes (batch, tools, admin mint/revoke, approval, comms). Teaching it about
+    seats would put the seat path on all of them by default — the opposite of
+    default-deny. The seat surface is one route, on purpose.
+    """
+    if authorization is not None or not seat_header:
+        return check_auth(authorization, allow_session=True)
+
+    peer = request.client.host if request.client else None
+    try:
+        return si.resolve_seat(peer, seat_header, request.headers)
+    except si.SeatDenied as denied:
+        si.audit(seat_header, None, "denied", denied.reason)
+        raise HTTPException(status_code=401, detail=denied.detail) from None
 
 
 # === MCP Client ===
@@ -1223,16 +1265,40 @@ def _heartbeat_gate_enabled() -> bool:
 @app.post("/api/call")
 async def call_tool_endpoint(
     req: ToolCall,
+    request: Request,
     authorization: str | None = Header(default=None),
+    x_sovereign_seat: str | None = Header(default=None),
 ):
-    ctx = check_auth(authorization, allow_session=True)
+    ctx = check_auth_or_seat(request, authorization, x_sovereign_seat)
     start = time.time()
+
+    # Seat identity (Anthony 2026-09-05: seats he put on the Studio need no
+    # token; every write signs itself). Scope is the read+write session surface
+    # reused exactly, narrowed by governance and by whether the write CAN sign.
+    if isinstance(ctx, dict) and ctx.get("kind") == "seat":
+        seat_id = ctx["seat_id"]
+        allowed, reason = si.seat_tool_allowed(req.tool)
+        if not allowed:
+            si.audit(seat_id, req.tool, "denied", reason)
+            raise ScopeHTTPException(
+                status_code=403,
+                detail=si.deny_detail(req.tool, reason),
+            )
+        # OVERRIDE, never setdefault: a seat cannot claim another identity.
+        req.arguments = si.sign_arguments(req.tool, req.arguments, seat_id)
+        si.audit(seat_id, req.tool, "allowed", "ok")
 
     # Scoped session token (The Door That Asks, Phase 1): default-deny per
     # tool, hard-deny on the never list, and stamp chronicle writes with the
     # grant so inspect_claim can trace any entry back to it (spec §4.4).
     # ctx is None for the master token (and for tests that bypass auth).
-    if ctx is not None and ctx.get("status") == "ok":
+    #
+    # `kind != "seat"` is load-bearing, not defensive noise: a seat context also
+    # carries status "ok" and a `scope` list, so without this guard it would
+    # fall into the session-token branch and KeyError on ctx["token_id"] the
+    # first time a seat called record_insight. Two auth paths sharing a context
+    # shape need the discriminator checked, not assumed.
+    if ctx is not None and ctx.get("status") == "ok" and ctx.get("kind") != "seat":
         if not st.tool_allowed(req.tool, ctx["scope"]):
             raise ScopeHTTPException(
                 status_code=403,

@@ -45,10 +45,50 @@ curl -s -X POST "$BRIDGE/api/call" \
 
 ## Auth model
 
-Two credentials reach the bridge:
+Three paths reach the bridge, decided in this order, with no fallback between them:
 
 - **The master bridge token** (`BRIDGE_TOKEN`, in `~/.config/sovereign-bridge.env`) — full access. Never committed; loaded from the env file at startup.
 - **Scoped session tokens** (`svs_` prefix) — short-lived, revocable, least-privilege. A leaked session token is a dead key card, not a master key: at no scope can it mint/revoke tokens, call `set_policy`, or touch the protected drawer. See below.
+- **Seat identity** — no token at all, for terminals seated on this machine. See below.
+
+An `Authorization` header of *any* kind is decided by the bearer path alone, whether it
+succeeds or fails. Adding a seat header to a bad-bearer request buys nothing — only a
+request with no `Authorization` header at all can reach the seat path.
+
+## Seat identity — no token inside the machine
+
+A terminal the operator seated on this machine has the filesystem already. Requiring it
+to carry a bearer bought no security and cost it the ability to write the record at all.
+The arrival flow above is for everything *outside*; this is for what is already inside.
+
+`POST /api/call` accepts `X-Sovereign-Seat: <seat-id>` with **no** `Authorization`
+header, and allows it only when **all** of these hold — any failure is a 401 naming the
+condition, never a fallback to another path:
+
+1. the TCP peer is literally `127.0.0.1` (read from the ASGI scope, never from a header);
+2. **no** proxy-forwarding header is present (`CF-Connecting-IP`, `X-Forwarded-For`,
+   `X-Real-IP`, `Forwarded`, …);
+3. the seat id is present in `~/.sovereign/hq/seats/registry.json`;
+4. that entry carries `"enabled": true`, literally.
+
+**Check 2 is not redundant.** If the bridge is published through a tunnel, the tunnel
+daemon runs on this machine and connects to `127.0.0.1`, so a request from the open
+internet arrives with a *loopback peer*. Seat ids are not secrets. The peer check alone
+would publish the read+write surface to anyone who guessed one.
+
+**Scope:** exactly what a `read`+`write` session grant gets (the same `TOOL_SCOPES` map,
+reused, never widened), minus two narrowings — governance-shaped tools are denied
+regardless of scope, and a write tool whose stack schema has no field to carry the seat
+id is denied rather than written unsigned.
+
+**Signing:** the bridge *overrides* `source_instance` with the seat id on every call that
+declares it. A seat cannot claim another identity — the body does not get a vote.
+
+**The registry file is the deploy switch.** There is no enable flag: absent or unreadable
+registry means every seat request is refused. Creating the file turns the path on;
+deleting it, or flipping `enabled` to `false`, revokes immediately (it is read fresh on
+every request). See `examples/seats-registry.json`. Every seat request writes one audit
+line — seat, tool, outcome, reason — to the bridge's log.
 
 ## The Door That Asks — consent-gated arrival
 
@@ -75,6 +115,7 @@ python3 stack_tokens.py list
 | `bridge.py` | the FastAPI server — every route |
 | `bridge_config.py` | shared config; loads `BRIDGE_TOKEN` |
 | `session_tokens.py` | scoped session tokens |
+| `seat_identity.py` | seat identity — the tokenless loopback path |
 | `arrival_gate.py` | the arrival gate |
 | `stack_tokens.py` | token CLI |
 | `sovereign_dashboard.py`, `dashboard/index.html` | activity monitors (terminal, web) |
