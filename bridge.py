@@ -25,6 +25,7 @@ work; instances just prefer record_insight with addressed-letter shape.
 """
 
 import asyncio
+import hashlib
 import hmac
 import json
 import os
@@ -130,7 +131,23 @@ VERSION = _resolve_version(_STACK_REPO_ROOT, _METADATA_VERSION)
 # Door That Asks, Phase 2: ARRIVAL_DECIDE_SECRET / NTFY_TOPIC / NTFY_SERVER /
 # ARRIVAL_GATE_ENABLED / PUBLIC_BASE_URL are exported into the process env so
 # arrival_gate.py reads one source of truth).
-TOKEN_FILE = Path(os.path.expanduser("~/.config/sovereign-bridge.env"))
+#
+# ⚠ THE PATH IS A SEAM, AND THE SEAM IS THE POINT (Codex review 2026-09-06, F6).
+# This read happens at IMPORT, which means it happens at pytest COLLECTION,
+# before any fixture can run: the review measured one intercepted read of
+# Anthony's real credential file during the mandated suite run and was right to
+# refuse the phrase "isolated test environment". A fixture cannot close that —
+# only an override the import itself honours can, which is what
+# SOVEREIGN_BRIDGE_ENV_FILE is. tests/conftest.py sets it to a synthetic file
+# at module scope, so the suite never opens the real one at all.
+#
+# It is NOT a production knob and must not become one: unset (the deployed
+# case) this resolves to exactly the path launchd has always used.
+BRIDGE_ENV_FILE_VAR = "SOVEREIGN_BRIDGE_ENV_FILE"
+TOKEN_FILE = Path(
+    os.environ.get(BRIDGE_ENV_FILE_VAR)
+    or os.path.expanduser("~/.config/sovereign-bridge.env")
+)
 BEARER_TOKEN = None
 _GATE_ENV_KEYS = (
     "ARRIVAL_DECIDE_SECRET",
@@ -159,6 +176,38 @@ if not BEARER_TOKEN:
 # The SSE server gates GET /sse on this same token (feat/sse-native-gate,
 # 2026-06-12) — present it on every upstream MCP connect.
 _MCP_SSE_HEADERS = {"Authorization": f"Bearer {BEARER_TOKEN}"} if BEARER_TOKEN else None
+
+# ── THE CALLER-IDENTITY CHANNEL (HQ, 2026-09-06, round 3) ──────────────────
+# The verified seat rides on the per-call SSE session as an HTTP header. The
+# stack's `handle_sse` reads it off the ASGI scope on the plain local /sse
+# endpoint, validates it, and binds CALLER_SEAT before `server.run`.
+#
+# ⚠ WHY NOT THE CONTEXTVAR THIS BRIDGE USED TO SET. `set_caller_seat` runs in
+# the bridge process; the stack's handlers run in sovereign-sse; a
+# `contextvars.ContextVar` is per-process, so the identity never arrived. Worse
+# than not arriving: the stack establishes CALLER_SEAT from its OWN spiral
+# session when it arrives unset, so the ledger would have named the SERVER as
+# the closer at HTTP 200. The in-process set is GONE rather than kept beside
+# this one — two channels where one is inert is a reader with no way to tell
+# which one carries.
+#
+# ⚠ THE SAME HEADER NAME ARRIVES INBOUND AND MEANS SOMETHING WEAKER. Inbound,
+# `X-Sovereign-Seat` is a client DECLARATION checked against the kernel-verified
+# peer. Outbound it is this bridge ASSERTING the identity it already verified.
+# The outbound value is built here from the verified seat and never copied from
+# the request, so a client cannot reach the stack's channel by sending a header.
+SEAT_HEADER = "X-Sovereign-Seat"
+
+
+def _mcp_headers_for(seat: str | None) -> dict | None:
+    """Per-call SSE headers. A fresh dict per call: mutating the module-level
+    one would leak the last seat onto the next caller's session, including onto
+    bearer calls, which is the shape this channel exists to prevent."""
+    if seat is None:
+        return _MCP_SSE_HEADERS
+    headers = dict(_MCP_SSE_HEADERS or {})
+    headers[SEAT_HEADER] = seat
+    return headers
 
 # Caller context — captured per request by middleware for auth logging and
 # the public-traffic rate limiter.
@@ -221,6 +270,8 @@ class CommsMessage(BaseModel):
 
 # === Auth ===
 import session_tokens as st
+import seat_identity as si
+import seat_socket as ss
 
 
 class ScopeHTTPException(HTTPException):
@@ -305,13 +356,155 @@ def check_auth(authorization: str | None, allow_session: bool = False):
     )
 
 
+def check_auth_or_seat(
+    request: Request,
+    authorization: str | None,
+    seat_header: str | None,
+):
+    """THE /api/call CHOKEPOINT. Three auth paths, decided here, no fallback.
+
+    Returns exactly what check_auth returns for the two bearer paths (None for
+    master, the session context dict for a scoped token), or a seat context
+    {"status":"ok","kind":"seat","seat_id",...} for the third.
+
+    ORDER IS THE SECURITY PROPERTY:
+
+      * An Authorization header of ANY kind routes to check_auth and check_auth
+        alone — a good bearer, a dead session token, and a garbage string all
+        get exactly the answer they got before this function existed. Adding
+        X-Sovereign-Seat to a bad-bearer request therefore buys nothing. This
+        is the "bearer path decides" rule, and stating it as "an Authorization
+        header present at all" rather than "a VALID bearer" is what makes it
+        an escalation-proof rule instead of a race between two validators.
+
+      * Only a request with NO Authorization header can reach the seat path,
+        and only then if it presents a seat header. Everything else is the
+        pre-existing 401 for a missing bearer, byte-identical.
+
+    Deliberately NOT folded into check_auth: check_auth guards ~15 master-only
+    routes (batch, tools, admin mint/revoke, approval, comms). Teaching it about
+    seats would put the seat path on all of them by default — the opposite of
+    default-deny. The seat surface is one route, on purpose.
+
+    THE PEER COMES FROM THE ASGI SCOPE EXTENSION, NEVER FROM A HEADER OR FROM
+    request.client. seat_socket stamps a kernel-verified identity there when the
+    request arrived on the seat's Unix socket; uvicorn builds an http scope with
+    no `extensions` key at all, so a TCP caller cannot manufacture one at any
+    price. `.get` returning None is the whole TCP denial, and it fails closed by
+    construction rather than by a check somebody has to remember to write.
+    """
+    if authorization is not None or not seat_header:
+        return check_auth(authorization, allow_session=True)
+
+    peer = (request.scope.get("extensions") or {}).get(ss.SEAT_PEER_EXT)
+    try:
+        return si.resolve_seat(peer, seat_header, request.headers)
+    except si.SeatDenied as denied:
+        # The pid goes on the DENIAL line too. Codex review 2026-09-06 asked
+        # for this and it is not cosmetic: a `seat_mismatch` is the one event
+        # that says a process declared a seat its environment does not name,
+        # and a mismatch is a BUG worth chasing — but without the pid the log
+        # records only the string the caller sent, which is the untrustworthy
+        # half. The pid is whatever the kernel just verified, so it is present
+        # for every denial that got past the transport check and absent (as
+        # '-') for the ones that did not.
+        #
+        # ALL THREE PIDS (F2 / D6). `seat_mismatch` is exactly the case where
+        # accept_pid != peer_pid is the explanation, so a denial line that
+        # carried only the sender left the reader unable to see the descriptor
+        # handoff that produced it.
+        peer_d = peer if isinstance(peer, dict) else {}
+        si.audit(
+            seat_header,
+            None,
+            "denied",
+            denied.reason,
+            peer_pid=peer_d.get("pid"),
+            seat_pid=peer_d.get("seat_pid"),
+            accept_pid=peer_d.get("accept_pid"),
+        )
+        raise HTTPException(status_code=401, detail=denied.detail) from None
+
+
 # === MCP Client ===
 # === Idempotency cache (write-path #3) =======================================
 # File-backed, TTL-pruned. A repeated idempotency_key replays the cached success
 # instead of re-calling the tool, so a client that lost the response can retry
 # without double-writing. A corrupt/missing cache never breaks a call.
+#
+# ⚠ THE STORAGE KEY IS NOT THE CALLER'S KEY, AND THAT IS THE FIX.
+#
+# Codex review 2026-09-06 (P1 CACHE): entries were retrieved by the supplied
+# idempotency_key ALONE, with no caller, tool or argument binding. Two
+# consequences, both proven live:
+#
+#   * A seat requesting an ALLOWED tool received a cached MASTER-ONLY result —
+#     200, idempotent_replay=true, zero upstream calls. Every scope check in
+#     this file ran and passed, and then the cache handed over an answer the
+#     scope check would never have permitted. A cache in front of an authz
+#     boundary that does not know about the boundary IS the boundary's hole.
+#   * A colliding key SUPPRESSED another seat's write: the second caller got
+#     the first caller's result and its own write never happened. Silent, and
+#     indistinguishable from success.
+#
+# Verifying the fields on retrieval would fix the first and not the second — a
+# collision would then be an error instead of a wrong answer, but the write is
+# still lost. So the PRINCIPAL, TOOL AND ARGUMENTS ARE HASHED INTO THE STORAGE
+# KEY: a colliding user key cannot name another principal's entry at all, and
+# two principals using "retry-1" simply have two different entries.
 _IDEM_PATH = Path(os.path.expanduser("~/.sovereign/bridge/idempotency.json"))
 _IDEM_TTL = 24 * 3600
+
+
+def _idem_principal(ctx) -> str:
+    """Who is asking, as one opaque string. Never None, never empty — an
+    unlabelled principal would pool every anonymous caller into one namespace,
+    which is the bug in miniature."""
+    if isinstance(ctx, dict):
+        if ctx.get("kind") == "seat":
+            return f"seat:{ctx.get('seat_id')}"
+        if ctx.get("token_id"):
+            return f"session:{ctx.get('token_id')}"
+    return "master"
+
+
+def _idem_storage_key(principal: str, tool: str, arguments: Any, client_key: str) -> str:
+    """The real cache key. Computed AFTER sign_arguments, so a seat's signed
+    call and an unsigned one are different entries — which they are.
+
+    Canonical JSON: sorted keys, no whitespace, `default=str` so an
+    unserialisable argument degrades to a stable string instead of raising and
+    knocking out the whole write path.
+
+    ⚠ THE KEY MATERIAL IS JSON, ASCII-ESCAPED. TWO DEFECTS DIE HERE.
+
+    1. LOSSY ENCODING COLLAPSED DISTINCT KEYS. Codex review 2026-09-06 (P2
+       IDEMPOTENCY) sent two requests, same principal/tool/arguments, keys `"?"`
+       and a lone surrogate `"\\ud800"`. Both returned 200; the SECOND returned
+       `idempotent_replay=true` with ONE upstream call total. The old
+       `.encode("utf-8", "replace")` turned the unencodable surrogate into a
+       literal `?`, so two different keys hashed to one entry and the second
+       caller's write silently did not happen — a suppressed write that is
+       indistinguishable from a successful one. `json.dumps(...,
+       ensure_ascii=True)` escapes a lone surrogate to the six characters
+       `\\ud800` instead of destroying it (verified in-interpreter before this
+       was written), so the two keys are two entries again.
+
+    2. THE FIELD SEPARATOR WAS FORGEABLE. The old material was
+       `"\\x1f".join([...])` over caller-influenced strings, so a client key
+       containing U+001F could shift the field boundaries and impersonate a
+       different (principal, tool, arguments) tuple. A JSON ARRAY has no
+       in-band separator to forge: every element is quoted and escaped, and
+       ambiguity between `["a\\x1fb", ""]` and `["a", "b"]` cannot arise.
+
+    Never go back to a lossy codec here. `ensure_ascii=True` guarantees the
+    result is pure ASCII, so `.encode("ascii")` is exact and cannot substitute
+    a character — an encode that can never need a replacement policy is the
+    point.
+    """
+    canonical = json.dumps(arguments, sort_keys=True, separators=(",", ":"), default=str)
+    material = json.dumps([principal, tool, canonical, client_key], ensure_ascii=True)
+    return hashlib.sha256(material.encode("ascii")).hexdigest()
 
 
 def _idem_load() -> dict:
@@ -321,27 +514,187 @@ def _idem_load() -> dict:
         return {}
 
 
-def _idem_get(key: str):
+def _idem_get(key: str, principal: str, tool: str):
     entry = _idem_load().get(key)
-    if entry and (time.time() - entry.get("ts", 0)) < _IDEM_TTL:
-        return entry.get("result")
-    return None
+    if not entry or (time.time() - entry.get("ts", 0)) >= _IDEM_TTL:
+        return None
+    # Belt to the keying's suspenders. The hash already makes a cross-principal
+    # or cross-tool hit impossible; this makes a hash collision, or a cache file
+    # written by an older build with the old flat keys, fail CLOSED rather than
+    # replay somebody else's answer.
+    if entry.get("principal") != principal or entry.get("tool") != tool:
+        return None
+    return entry.get("result")
 
 
-def _idem_put(key: str, result: dict) -> None:
+def _idem_put(key: str, principal: str, tool: str, result: dict) -> None:
     try:
         now = time.time()
         d = {k: v for k, v in _idem_load().items() if (now - v.get("ts", 0)) < _IDEM_TTL}
-        d[key] = {"result": result, "ts": now}
+        d[key] = {"result": result, "ts": now, "principal": principal, "tool": tool}
         _IDEM_PATH.parent.mkdir(parents=True, exist_ok=True)
         _IDEM_PATH.write_text(json.dumps(d))
     except Exception:
         pass
 
 
-async def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
+def _certify_seat_result(
+    result: dict,
+    seat_id: str,
+    tool: str,
+    protected_index,
+    audit_pids: dict,
+    protected_bodies: tuple = (),
+) -> dict:
+    """Drop every designated entry from a seat-bound response (D4, review F1).
+
+    Runs on BOTH routes out of /api/call: the freshly dispatched result AND an
+    idempotency replay. The replay leg is not belt-and-braces. A cache entry
+    was certified against the index as it stood when it was WRITTEN, so a
+    designation made since then would not reach a replaying caller for the
+    whole 24h TTL — and reading the index fresh on every request, which is the
+    property that makes a designation take effect immediately, would be
+    defeated by the one path that skips it.
+    """
     try:
-        async with sse_client(MCP_SSE_URL, headers=_MCP_SSE_HEADERS) as (read, write):
+        filtered, withheld = si.filter_protected(result.get("result"), protected_index)
+    except si.ProtectedIndexUnreadable as exc:
+        # Reached only by the response-size guard: a payload too large to walk
+        # cannot be certified, so it is withheld whole rather than returned
+        # with an unchecked tail.
+        si.audit(seat_id, tool, "denied", "protected_filter_incomplete", **audit_pids)
+        raise ScopeHTTPException(
+            status_code=403,
+            detail=(
+                f"The response to {tool!r} cannot be certified free of "
+                f"protected material ({exc}), so it is withheld whole."
+            ),
+        )
+    # SECOND PASS FOR TEXT-PRODUCING READS (review N1). The filter above sees
+    # ENTRY OBJECTS; `context_retrieve` renders an entry's first 150 characters
+    # into a sentence and throws the claim id away, so there is nothing left
+    # for the filter to recognise. This removes the designated BODIES from the
+    # rendered text — a blunt instrument, and blunt on purpose: it needs to
+    # understand no tool's formatting.
+    #
+    # `protected_bodies` is empty for a STRUCTURED tool and for a machine with
+    # nothing designated; in both cases this is a no-op. When it raises, the
+    # response is withheld WHOLE — a text response this bridge cannot certify
+    # is never passed through.
+    if protected_bodies:
+        try:
+            filtered, redacted = si.redact_protected_text(filtered, protected_bodies)
+            # ⚠ AND THE ERROR STRING, WHICH IS ALSO THE STACK'S PROSE. A failed
+            # tool call carries the handler's own message verbatim
+            # (`call_mcp_tool` lifts `result.content[0].text`), and a handler
+            # that formats entry content into a failure — "could not supersede
+            # claim …: content mismatch: <body>" — would deliver it to a seat
+            # through a field the certifier never walked. Same class as N1: not
+            # the result, but content reaching a seat through a key nobody
+            # thought to certify.
+            if isinstance(result.get("error"), str):
+                result["error"], from_error = si.redact_protected_text(
+                    result["error"], protected_bodies
+                )
+                redacted += from_error
+        except si.ProtectedBodiesUnavailable as exc:
+            si.audit(seat_id, tool, "denied", "protected_text_uncertifiable", **audit_pids)
+            raise ScopeHTTPException(
+                status_code=403,
+                detail=(
+                    f"The response to {tool!r} renders chronicle content as text "
+                    f"and cannot be certified free of protected material ({exc}), "
+                    "so it is withheld whole."
+                ),
+            )
+        withheld += redacted
+
+    # REPLACE a result the envelope already carries; never INVENT one. An error
+    # envelope has no "result" key, and stamping a null one there would change
+    # the shape of every seat-path failure relative to every other path.
+    if "result" in result:
+        result["result"] = filtered
+    # STATED EVEN WHEN ZERO. "the filter ran and removed nothing" and "the
+    # filter did not run" are different facts and a reader must be able to tell
+    # them apart — an absent field would collapse them (SOP #2).
+    result["withheld_protected"] = withheld
+    return result
+
+
+# ── WHEN THE STACK REFUSES THE SESSION AT CONNECT (review N4) ──────────────
+# The stack's `/sse` door 400s a session whose `X-Sovereign-Seat` it will not
+# accept — a reserved ledger label, or a name outside its pattern. That refusal
+# is correct and it is also the most confusing failure this bridge can produce,
+# because the MCP SDK opens the transport inside an anyio TaskGroup: the 400
+# arrives wrapped, `str(exc)` is "unhandled errors in a TaskGroup (1
+# sub-exception)", and the operator is told nothing about seat names at all.
+#
+# A generic message over a specific cause is a small fail-open of its own: it
+# does not report success, but it reports "something went wrong upstream" for a
+# condition the bridge knows exactly and could name.
+_SEAT_REFUSAL_MARK = "x-sovereign-seat"
+
+
+def _leaf_exceptions(exc: BaseException, _seen: set[int] | None = None):
+    """Flatten an exception group, and follow __cause__/__context__.
+
+    Bounded by identity so a cyclic chain cannot spin, and yields the leaves
+    only — a group carries no message of its own worth reading.
+    """
+    seen = _seen if _seen is not None else set()
+    if exc is None or id(exc) in seen:
+        return
+    seen.add(id(exc))
+    inner = getattr(exc, "exceptions", None)
+    if isinstance(inner, (list, tuple)) and inner:
+        for sub in inner:
+            yield from _leaf_exceptions(sub, seen)
+    else:
+        yield exc
+    for chained in (exc.__cause__, exc.__context__):
+        if chained is not None:
+            yield from _leaf_exceptions(chained, seen)
+
+
+def _connect_refusal(exc: BaseException) -> tuple[int, str] | None:
+    """(status, detail) when the stack refused the session, else None.
+
+    Reads the response body for the stack's own words rather than paraphrasing
+    them: the stack already writes a precise reason and the bridge's job is to
+    carry it, not to guess at it a second time.
+    """
+    for leaf in _leaf_exceptions(exc):
+        response = getattr(leaf, "response", None)
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int) and 400 <= status < 500:
+            detail = ""
+            try:
+                body = response.json()
+                if isinstance(body, dict):
+                    detail = str(body.get("detail") or body.get("error") or "")
+            except Exception:  # noqa: BLE001 — a body we cannot parse is not fatal
+                detail = ""
+            if not detail:
+                try:
+                    detail = (response.text or "").strip()
+                except Exception:  # noqa: BLE001 — a streamed body may be gone
+                    detail = ""
+            return status, detail or str(leaf)
+        text = str(leaf)
+        if _SEAT_REFUSAL_MARK in text.lower():
+            return 400, text
+    return None
+
+
+async def call_mcp_tool(tool_name: str, arguments: dict, seat: str | None = None) -> dict:
+    """Dispatch one tool over a per-call SSE session.
+
+    `seat` is the KERNEL-VERIFIED seat identity, or None. It is passed on the
+    seat path only; a bearer or session-token call sends no seat header at all,
+    so the stack cannot mistake an unauthenticated caller for a seated one.
+    """
+    try:
+        async with sse_client(MCP_SSE_URL, headers=_mcp_headers_for(seat)) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.call_tool(tool_name, arguments=arguments)
@@ -363,6 +716,31 @@ async def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
                         return {"ok": True, "result": text}
                 return {"ok": True, "result": None}
     except Exception as e:
+        # THE SPECIFIC CAUSE BEFORE THE GENERIC ONE (review N4). A refusal at
+        # the /sse door is a fact the bridge can name exactly; reporting it as
+        # "egress" or "stack" would send the operator looking for a network
+        # fault that is not there.
+        refusal = _connect_refusal(e)
+        if refusal is not None:
+            status, detail = refusal
+            named_seat = _SEAT_REFUSAL_MARK in detail.lower()
+            return {
+                "ok": False,
+                "error": (
+                    f"the stack refused this session at connect ({status}): {detail}"
+                    + (
+                        " — this bridge sent a seat name the stack will not accept, "
+                        "so no call from this seat can be served until the seat is "
+                        "renamed in the registry."
+                        if named_seat
+                        else ""
+                    )
+                ),
+                "failure_class": (
+                    "stack_refused_seat_name" if named_seat else "stack_refused_session"
+                ),
+                "upstream_status": status,
+            }
         msg = str(e)
         low = msg.lower()
         egress_signals = ("connect", "refused", "unreachable", "name resolution", "dns", "getaddrinfo")
@@ -677,6 +1055,46 @@ async def _clock_probe_loop() -> None:
         await asyncio.sleep(CLOCK_PROBE_INTERVAL)
 
 
+def seat_socket_path() -> Path:
+    """Where the seat socket lives — ONE definition, in seat_identity.
+
+    This used to hand-write the path a second time, and the second copy drifted
+    from the first: Codex review 2026-09-06 (P3 PATH) found the TCP denial
+    message naming `hq/seats/bridge.sock` while this function bound
+    `hq/seats/sock/bridge.sock`. The wrong copy was the one in the error
+    message — the only copy a locked-out caller ever reads. A path written
+    twice is a path that will disagree with itself, so it is written once, in
+    the module that also writes the denial, and this is a delegation.
+    """
+    return si.seat_socket_path()
+
+
+async def _start_seat_socket(app: FastAPI):
+    """Bind the seat socket, but ONLY if the seat registry exists.
+
+    THE REGISTRY IS ALREADY THE DEPLOY SWITCH (seat_identity's docstring: no
+    enable flag, because "a config that assumes a merge" is a shape this house
+    has been bitten by). Reusing it here means one switch, not two: no registry,
+    no socket, no listener, nothing to reason about. It also means this branch
+    binds nothing on a machine where Anthony has not turned the feature on —
+    including, today, this one.
+
+    Failure to bind is logged and swallowed on purpose: a bridge that will not
+    START because a supplementary listener could not bind has turned a
+    seat-path outage into a total outage. The seat path then simply stays shut,
+    which is the same answer it gives with no registry.
+    """
+    if not si.registry_path().exists():
+        return None
+    try:
+        server = await ss.start(app, seat_socket_path())
+        si.audit_log.info("seat socket listening at %s", seat_socket_path())
+        return server
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        si.audit_log.error("seat socket NOT started (%s): %r", seat_socket_path(), exc)
+        return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Runtime-freshness receipt: local `git` calls, bounded by GIT_PROBE_TIMEOUT
@@ -686,9 +1104,16 @@ async def lifespan(app: FastAPI):
     # Start the read-only clock-drift probe daemon. It runs the first probe
     # itself (probe-then-sleep), so startup is NOT delayed waiting on sntp.
     task = asyncio.create_task(_clock_probe_loop())
+    seat_server = await _start_seat_socket(app)
     try:
         yield
     finally:
+        if seat_server is not None:
+            seat_server.close()
+            try:
+                await seat_server.wait_closed()
+            except Exception:
+                pass
         task.cancel()
         try:
             await task
@@ -1011,6 +1436,166 @@ except Exception:  # pragma: no cover — stack import failure is already fatal 
             "note": "attribution could not be measured; an absent rate is NOT a zero rate",
         }
 
+# ── Unacked signals: what the watch seats raised that nobody has closed ─────
+# The fourth census, and the same one-implementation rule as the three above:
+# the logic lives in sovereign_stack.signal_ledger, which is also what the
+# stack's own `signals_summary` tool returns, so the heartbeat and the tool can
+# never report two different numbers for one ledger.
+#
+# ⚠ AN UNREADABLE OR NEVER-SCANNED LEDGER IS AN ERROR STATE, NEVER ZERO, and
+# that property is load-bearing enough to say twice. `heartbeat_field` already
+# renders `{"error": "not_scanned", "total": None}` rather than
+# `{"total": 0}` — a zero here would read as "every signal is closed", which is
+# the single most reassuring lie this field could tell. So NOTHING in this
+# module coerces a None to 0, and the failure paths below render `total: None`
+# with a populated `error` for exactly the same reason.
+#
+# THE IMPORT WILL FAIL TODAY, AND THAT IS EXPECTED, NOT A BUG. bridge.py adds
+# ~/sovereign-stack/src to sys.path (line 49), so `sovereign_stack` resolves to
+# the LIVE checked-out tree — where signal_ledger.py does not exist until the
+# stack's release/2026-09-06 is merged and deployed. Until then this degrades
+# to the stub, the heartbeat carries
+# `unacked_signals.error == "signal_ledger_unavailable"`, and no caller can
+# mistake that for a quiet ledger.
+try:
+    from sovereign_stack.signal_ledger import heartbeat_field as _signal_heartbeat_field
+
+    SIGNALS_SOURCE = "sovereign_stack.signal_ledger"
+except Exception:  # pragma: no cover — exercised by the fallback test
+    SIGNALS_SOURCE = "unavailable"
+
+    def _signal_heartbeat_field(root=None):
+        raise RuntimeError("sovereign_stack.signal_ledger unavailable")
+
+
+def _signals_unmeasured(exc: Exception, route: str | None = None) -> dict:
+    """The honest shape of a failed read: an error, and no numbers at all.
+
+    `route` names WHICH attempt failed, because after the tool fallback there
+    are two and they mean different things to whoever reads the heartbeat: an
+    unimportable module is a deploy-ordering fact, an upstream tool failure is
+    a live-service fact. A single opaque error word would have merged them.
+    """
+    return {
+        "source": route or SIGNALS_SOURCE,
+        "error": (
+            f"signal_ledger_unavailable; stack heartbeat failed: {type(exc).__name__}: {exc}"
+            if route == SIGNALS_TOOL_ROUTE
+            else f"unreadable:{type(exc).__name__}"
+        ),
+        "ingestion": "error",
+        "scanned_at": None,
+        "total": None,
+        "stale_24h": None,
+        "stale_7d": None,
+        "by_source": None,
+        "note": (
+            "the signal ledger could not be read; an absent count is NOT a zero "
+            "count, and this field must never be rendered as 'no unacked signals'"
+        ),
+    }
+
+
+async def _stack_heartbeat_payload() -> dict:
+    """The stack's OWN heartbeat object, over the route this bridge already has.
+
+    Shared by the caller-identity guard (`seat_identity.caller_channel`) and
+    kept deliberately thin: it raises on every shape it cannot vouch for, so a
+    caller can never mistake "the stack did not answer" for "the stack answered
+    and the field is absent". Both are refusals, but they are different facts
+    and the refusal detail says which.
+    """
+    envelope = await asyncio.wait_for(
+        call_mcp_tool("heartbeat", {}), timeout=HEARTBEAT_TOOL_TIMEOUT
+    )
+    if not isinstance(envelope, dict) or not envelope.get("ok"):
+        raise RuntimeError(str((envelope or {}).get("error") or "heartbeat failed"))
+    payload = envelope.get("result")
+    if not isinstance(payload, dict):
+        raise RuntimeError("the stack heartbeat returned no object")
+    return payload
+
+
+SIGNALS_TOOL_ROUTE = "stack tool heartbeat"
+
+
+async def _signals_via_tool() -> dict:
+    """THE FALLBACK: ask the stack's own heartbeat when we cannot import.
+
+    ⚠ THIS CLOSES A WINDOW THAT IS OPEN RIGHT NOW, not a hypothetical one. The
+    import above is resolved ONCE, at module scope. Deploy the stack's
+    signal_ledger, restart sovereign-sse so the stack answers upstream, and do
+    NOT restart the bridge — the heartbeat would report
+    `signal_ledger_unavailable` indefinitely while the process that knows the
+    answer is running one over. That is this house's most expensive shape
+    (SOP #12): a reader that exists and is not wired to the thing it reads. The
+    bridge already carries its own credential for this call, so no new secret
+    and no new grant is involved.
+
+    ⚠ IT ASKS FOR THE FIELD, IT DOES NOT REBUILD IT (Codex review 2026-09-06,
+    F3; HQ decision D7). The first version called `signals_summary` and
+    transcribed seven keys out of its answer. That silently DROPPED
+    `source_status`, `sources_degraded` and `corrupt_rows`, and — worse —
+    reported `by_source.watchman = 1` for a source the local route correctly
+    reported as `null` because it could not be read. Two routes for one field
+    that disagree about whether a number is KNOWN is exactly the fail-open the
+    field exists to prevent: the degraded route was the reassuring one.
+
+    So the fallback now calls the stack's `heartbeat` tool, which as of
+    release/2026-09-06 carries `unacked_signals` from the SAME
+    `signal_ledger.heartbeat_field` the local import would have called, and
+    passes that object through VERBATIM. No key list, no flattening, no
+    selection. A key the stack adds tomorrow arrives tomorrow; a null it
+    computed stays null. The only thing added is `source`, so a reader can tell
+    which route answered.
+    """
+    result = await asyncio.wait_for(
+        call_mcp_tool("heartbeat", {}), timeout=HEARTBEAT_TOOL_TIMEOUT
+    )
+    if not isinstance(result, dict) or not result.get("ok"):
+        raise RuntimeError(str((result or {}).get("error") or "heartbeat failed"))
+    payload = result.get("result")
+    if not isinstance(payload, dict):
+        raise RuntimeError("the stack heartbeat returned no object")
+    field = payload.get("unacked_signals")
+    if not isinstance(field, dict):
+        # The stack answered and its heartbeat does not carry the field: that
+        # is a DEPLOY-ORDER fact (a stack older than release/2026-09-06), and
+        # it must read as an error, never as a quiet zero.
+        raise RuntimeError(
+            "the stack heartbeat carries no unacked_signals field; this bridge "
+            "is running against a stack older than release/2026-09-06"
+        )
+    return dict(field)
+
+
+async def _measure_signals() -> dict:
+    """`unacked_signals` for the heartbeat. Never raises, never fabricates a
+    zero. A raise from the ledger becomes an error state carrying `total: None`;
+    a successful read is passed through with its own error field intact, since
+    `heartbeat_field` already distinguishes not_scanned from a real count.
+
+    Local import first — it is a filesystem read with no network in it. The
+    upstream tool is the fallback, and only when the import is the thing that
+    failed: a ledger that raises OSError locally is a REAL error and must be
+    reported as one, not laundered through a second route until some surface
+    agrees to answer.
+    """
+    if SIGNALS_SOURCE == "unavailable":
+        try:
+            field = await _signals_via_tool()
+            return {"source": SIGNALS_TOOL_ROUTE, **field}
+        except Exception as exc:
+            return _signals_unmeasured(exc, route=SIGNALS_TOOL_ROUTE)
+    try:
+        field = _signal_heartbeat_field()
+    except Exception as exc:
+        return _signals_unmeasured(exc)
+    if not isinstance(field, dict):
+        return _signals_unmeasured(TypeError("signal ledger returned a non-mapping"))
+    return {"source": SIGNALS_SOURCE, **field}
+
+
 # ?as= lets a caller SAY who it is so `next` can be shaped for it. It is never
 # inferred: this endpoint is unauthenticated, so User-Agent sniffing would be a
 # guess rendered as knowledge. The value is attacker-controlled free text on a
@@ -1168,12 +1753,22 @@ async def heartbeat(as_: str | None = Query(None, alias="as")):
     except Exception as exc:
         attribution = _attribution_unmeasured(now, exc)
 
+    # Same guard, same reason, one more surface: an unreadable ledger renders
+    # as an error state with total=None. _measure_signals swallows its own
+    # exceptions, so this try is the belt to that — a raise here would still
+    # not be allowed to sink the handler, or to become a zero.
+    try:
+        signals = await _measure_signals()
+    except Exception as exc:  # pragma: no cover — _measure_signals is total
+        signals = _signals_unmeasured(exc)
+
     return {
         "status": "ok" if healthy else "degraded",
         "version": VERSION,
         "aperture": aperture,
         "gate": gate,
         "attribution": attribution,
+        "unacked_signals": signals,
         "caller": caller,
         "tools": tool_count,
         "tools_summary": _build_tools_summary(inventory.get("names"), tool_count),
@@ -1223,16 +1818,130 @@ def _heartbeat_gate_enabled() -> bool:
 @app.post("/api/call")
 async def call_tool_endpoint(
     req: ToolCall,
+    request: Request,
     authorization: str | None = Header(default=None),
+    x_sovereign_seat: str | None = Header(default=None),
 ):
-    ctx = check_auth(authorization, allow_session=True)
+    ctx = check_auth_or_seat(request, authorization, x_sovereign_seat)
     start = time.time()
+
+    # Seat identity (Anthony 2026-09-05: seats he put on the Studio need no
+    # token; every write signs itself). Scope is the read+write session surface
+    # reused exactly, narrowed by governance and by whether the write CAN sign.
+    seat_id = None
+    _audit_pids: dict[str, Any] = {}
+    if isinstance(ctx, dict) and ctx.get("kind") == "seat":
+        seat_id = ctx["seat_id"]
+        _audit_pids = {
+            "peer_pid": ctx.get("peer_pid"),
+            "seat_pid": ctx.get("seat_pid"),
+            "accept_pid": ctx.get("accept_pid"),
+        }
+        # ONE SOURCE for the surface (D2): what the stack publishes RIGHT NOW,
+        # minus governance. Neither route answering is a 503, never a silent
+        # allow-all and never a silent deny-all dressed as policy.
+        try:
+            surface = await si.published_surface(fetch=_list_tools_raw)
+        except si.SeatSurfaceUnavailable as exc:
+            si.audit(seat_id, req.tool, "denied", "surface_unavailable", **_audit_pids)
+            raise HTTPException(status_code=503, detail=str(exc))
+        allowed, reason = si.seat_tool_allowed(req.tool, surface)
+        if not allowed:
+            si.audit(seat_id, req.tool, "denied", reason, **_audit_pids)
+            raise ScopeHTTPException(
+                status_code=403,
+                detail=si.deny_detail(req.tool, reason),
+            )
+        # PROTECTED MATERIAL (D4, review F1). Anthony reserves his children and
+        # protected family material to himself.
+        #
+        # ⚠ THE INDEX IS LOADED ONCE, HERE, BEFORE THE CALL, AND SERVES BOTH THE
+        # PRE-CHECK AND THE POST-FILTER. Two reads would open a window between
+        # them; and loading it only at filter time meant a WRITE was dispatched
+        # before an unreadable index could refuse it — the write landed and the
+        # caller was told 403, which is the worst of both answers.
+        #
+        # An unreadable index shuts the WHOLE seat path, exactly as an
+        # unreadable registry already does. That symmetry is the argument: when
+        # a guard cannot be evaluated, the door is shut, not narrowed.
+        try:
+            protected_index = si.load_protected_index()
+        except si.ProtectedIndexUnreadable as exc:
+            si.audit(seat_id, req.tool, "denied", "protected_index_unreadable", **_audit_pids)
+            raise ScopeHTTPException(
+                status_code=403,
+                detail=(
+                    "The protected designation index could not be read "
+                    f"({exc}), so no response can be certified free of protected "
+                    "material and no seat call is served. Anthony's protected "
+                    "family material is reserved to him; a guard that cannot "
+                    "tell which records those are refuses rather than guesses."
+                ),
+            )
+        refusal = si.protected_call_refusal(req.tool, req.arguments, protected_index)
+        if refusal is not None:
+            si.audit(seat_id, req.tool, "denied", refusal[0], **_audit_pids)
+            raise ScopeHTTPException(status_code=403, detail=refusal[1])
+        # CONTAINMENT CLASS (review N1). A published tool nobody has classified
+        # is refused rather than defaulted: a tool the stack adds tomorrow must
+        # not choose its own containment class by being absent from the table.
+        unclassified = si.unclassified_refusal(req.tool)
+        if unclassified is not None:
+            si.audit(seat_id, req.tool, "denied", unclassified[0], **_audit_pids)
+            raise ScopeHTTPException(status_code=403, detail=unclassified[1])
+        # ⚠ THE BODIES ARE LOADED BEFORE THE CALL, for the same reason the index
+        # is: if they cannot be assembled, the answer is a refusal, and a
+        # refusal issued after dispatch is a call that already happened.
+        protected_bodies: tuple = ()
+        if si.tool_class(req.tool) == si.TOOL_CLASS_TEXT:
+            try:
+                protected_bodies = si.load_protected_bodies(protected_index)
+            except si.ProtectedBodiesUnavailable as exc:
+                si.audit(
+                    seat_id, req.tool, "denied", "protected_bodies_unavailable", **_audit_pids
+                )
+                raise ScopeHTTPException(
+                    status_code=403,
+                    detail=(
+                        f"Tool {req.tool!r} renders chronicle content as text, so "
+                        "its response can only be served once the designated "
+                        "records are known well enough to be removed from it. "
+                        f"They are not: {exc}. Refused rather than served with "
+                        "an unchecked body in the prose."
+                    ),
+                )
+        # THE CLOSER IDENTITY (D1 as amended). It is NOT an argument: a client
+        # that names the actor is refused, and a stack with no in-process
+        # channel to carry the verified seat cannot serve the tool at all.
+        for check in (
+            si.actor_argument_refusal(req.tool, req.arguments),
+            await si.actor_channel_refusal(
+                req.tool, fetch=_stack_heartbeat_payload, seat=seat_id
+            ),
+        ):
+            if check is not None:
+                si.audit(seat_id, req.tool, "denied", check[0], **_audit_pids)
+                raise ScopeHTTPException(status_code=403, detail=check[1])
+        # POST-FIX PROBES (D5): classify by ARGUMENTS, not by the tool name.
+        probe_refusal = si.probe_call_refusal(req.tool, req.arguments)
+        if probe_refusal is not None:
+            si.audit(seat_id, req.tool, "denied", probe_refusal[0], **_audit_pids)
+            raise ScopeHTTPException(status_code=403, detail=probe_refusal[1])
+        # OVERRIDE, never setdefault: a seat cannot claim another identity.
+        req.arguments = si.sign_arguments(req.tool, req.arguments, seat_id)
+        si.audit(seat_id, req.tool, "allowed", "ok", **_audit_pids)
 
     # Scoped session token (The Door That Asks, Phase 1): default-deny per
     # tool, hard-deny on the never list, and stamp chronicle writes with the
     # grant so inspect_claim can trace any entry back to it (spec §4.4).
     # ctx is None for the master token (and for tests that bypass auth).
-    if ctx is not None and ctx.get("status") == "ok":
+    #
+    # `kind != "seat"` is load-bearing, not defensive noise: a seat context also
+    # carries status "ok" and a `scope` list, so without this guard it would
+    # fall into the session-token branch and KeyError on ctx["token_id"] the
+    # first time a seat called record_insight. Two auth paths sharing a context
+    # shape need the discriminator checked, not assumed.
+    if ctx is not None and ctx.get("status") == "ok" and ctx.get("kind") != "seat":
         if not st.tool_allowed(req.tool, ctx["scope"]):
             raise ScopeHTTPException(
                 status_code=403,
@@ -1272,22 +1981,69 @@ async def call_tool_endpoint(
             "duration_ms": round((time.time() - start) * 1000),
         }
 
-    # idempotency (#3): replay a cached success for a repeated key; never double-write.
+    # idempotency (#3): replay a cached success for a repeated key; never
+    # double-write. Scoped to (principal, tool, arguments, key) — see the
+    # _IDEM_PATH block above for the two live escapes that scoping closes.
+    # Computed HERE, after the seat signer has run, so the arguments hashed are
+    # the arguments dispatched.
+    idem_key = None
     if req.idempotency_key:
-        cached = _idem_get(req.idempotency_key)
+        principal = _idem_principal(ctx)
+        idem_key = _idem_storage_key(
+            principal, req.tool, req.arguments, req.idempotency_key
+        )
+        cached = _idem_get(idem_key, principal, req.tool)
         if cached is not None:
             replay = dict(cached)
+            # ⚠ A REPLAY IS RE-CERTIFIED, NOT SERVED AS STORED. See
+            # _certify_seat_result: the cache holds what was protected when it
+            # was written, and this is the one seat route that would otherwise
+            # outlive a designation.
+            if seat_id is not None:
+                replay = _certify_seat_result(
+                    replay, seat_id, req.tool, protected_index, _audit_pids,
+                    protected_bodies,
+                )
             replay["idempotent_replay"] = True
             replay["duration_ms"] = round((time.time() - start) * 1000)
             return replay
 
-    result = await call_mcp_tool(req.tool, req.arguments)
+    # ⚠ THE VERIFIED SEAT RIDES THE PER-CALL SSE SESSION AS A HEADER, NOT AS AN
+    # ARGUMENT AND NOT AS A CONTEXTVAR (HQ round 3, 2026-09-06). See
+    # `_mcp_headers_for` for why the in-process channel could not work and why
+    # it was removed rather than kept alongside.
+    #
+    # Sent for EVERY seat call, not only the tools that read it: a channel armed
+    # selectively is a channel whose absence means two different things, and the
+    # next tool to need an identity should find one there. `seat_id` is None on
+    # every other auth path, and the header is then absent entirely.
+    # A name the stack's /sse door would refuse is not sent at all: the connect
+    # would 400 and take the seat's whole surface with it. `signal_ack` is
+    # already refused above in that case, so nothing is served with a missing
+    # identity — see seat_identity.SEAT_HEADER_VALUE_RE.
+    wire_seat = seat_id if si.seat_can_ride_the_channel(seat_id) else None
+    result = await call_mcp_tool(req.tool, req.arguments, seat=wire_seat)
     if not result.get("ok") and "failure_class" not in result:
         result["failure_class"] = "stack"  # (#7)
+
+    # PROTECTED POST-FILTER (D4, review F1). Every seat response is walked and
+    # every designated entry dropped, whatever tool produced it and whatever
+    # shape it came back in.
+    #
+    # ⚠ BEFORE _idem_put, NOT AFTER. Caching the unfiltered result and
+    # filtering the return value would put protected content in the
+    # idempotency store, where the next replay would serve it straight back
+    # around the guard. The filter runs on the object that is both returned AND
+    # cached.
+    if seat_id is not None:
+        result = _certify_seat_result(
+            result, seat_id, req.tool, protected_index, _audit_pids, protected_bodies
+        )
+
     result["duration_ms"] = round((time.time() - start) * 1000)
 
-    if req.idempotency_key and result.get("ok"):
-        _idem_put(req.idempotency_key, result)
+    if idem_key and result.get("ok"):
+        _idem_put(idem_key, _idem_principal(ctx), req.tool, result)
     return result
 
 

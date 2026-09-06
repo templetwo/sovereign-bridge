@@ -27,7 +27,7 @@ def client(monkeypatch, tmp_path):
 
 
 def _mock_tool(monkeypatch, recorder):
-    async def fake(tool, args):
+    async def fake(tool, args, seat=None):
         recorder.append((tool, args))
         return {"ok": True, "result": {"echo": tool}}
 
