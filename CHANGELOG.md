@@ -24,6 +24,82 @@ landed in the tree behind Anthony's gate and its deploy is a separate act.
 
 ---
 
+## 2026-09-06 — seat identity is bound to a PROCESS (Codex review fixes) — HELD
+
+Five findings from an independent review by the Codex seat, on the
+`feat/seat-identity-localhost` branch. All five were real; all five are closed
+with a test that fails when its guard is deleted.
+
+- **P1 IMPERSONATION — `seat_identity.py`.** The seat header was validated for
+  registry membership and never bound to the requesting process. With
+  `SOVEREIGN_SEAT=codex-astra-studio` in its environment, a caller sending
+  `X-Sovereign-Seat: hq-claude-studio` got a 200 and wrote as HQ. Seat ids are
+  not secrets, so the header was an unchecked claim. **Fixed by changing the
+  transport, not the header:** a seat now calls over a Unix domain socket
+  (`<root>/hq/seats/bridge.sock`, 0600), the kernel names the peer pid and uid,
+  and the bridge reads that process's own `SOVEREIGN_SEAT` and requires it to
+  equal the declaration. New module `seat_socket.py`. Loopback TCP is no longer
+  a seat path at all — it is a 401 saying "use the socket". No token is
+  introduced, so Anthony's rule is kept exactly.
+
+- **P1 CACHE — `bridge.py`.** Idempotency entries were retrieved by the
+  caller-supplied key alone. A seat calling an allowed tool received a cached
+  *master-only* result (200, `idempotent_replay=true`, zero upstream calls), and
+  a colliding key silently suppressed another seat's write. The storage key is
+  now `sha256(principal, tool, canonical-args, user-key)`, computed after the
+  seat signer runs, with a principal/tool re-check on read. Keying rather than
+  verifying, because verifying alone would turn a suppressed write into an
+  error instead of letting it happen.
+
+- **P2 FORWARDING — `seat_identity.py`.** The relay defence was a six-name
+  denylist; `X-Forwarded-Proto`, `X-Forwarded-Port`, `CF-Connecting-IPv6` and
+  `True-Client-IP` each admitted a request when supplied alone. Inverted to an
+  allowlist of the headers a client needs to make a request.
+
+- **P2 REGISTRY — `seat_identity.py`.** A 10,000-level nested array raised
+  `RecursionError` (not a `ValueError`) and surfaced as a 500 rather than a 401
+  — a broken door reads differently from a shut one, and it loses the audit
+  line. Duplicate `enabled` keys (`false` then `true`) parsed last-wins and
+  re-enabled a disabled seat, defeating the revocation lever by appending.
+  Now: 64 KiB size cap, duplicate-key rejection, depth cap, and every failure
+  returns the existing `no_registry` denial.
+
+- **P2 AUDIT — `seat_identity.py`.** A tool name containing a newline produced
+  two physical log lines — forged audit text, since the surface's contract is
+  one line per request. Every interpolated field is now `repr()`-escaped and
+  length-bounded, with truncation marked.
+
+**P1 is NARROWED, NOT CLOSED, and the docs say so.** Header-only impersonation
+is dead and accidental mis-signing fails closed. A process that deliberately
+constructs its own ancestry — spawning a child with any `SOVEREIGN_SEAT` it
+likes — is still indistinguishable from a seat, and
+`tests/test_seat_socket.py::test_RESIDUAL_*` asserts that outcome (200) so the
+gap is a measured fact rather than an assumption. It cannot be closed under the
+no-token rule; the remaining lever is per-seat UIDs, which is Anthony's call.
+It grants nothing new: anything running as this user can already read the
+master token.
+
+**Deploy notes.** The listener binds only when
+`~/.sovereign/hq/seats/registry.json` exists, reusing the registry as the single
+deploy switch; on a machine without it nothing is bound. The socket lives in its
+own directory (`hq/seats/sock/`) because the bridge chmods its parent to 0700
+and `hq/seats/` is Anthony's — it holds the launchers and is 755 today. Seat
+call sites need `--unix-socket <root>/hq/seats/sock/bridge.sock` instead of the
+`127.0.0.1:8100` origin; **none of the four launcher scripts under
+`~/.sovereign/hq/seats/` contains the curl** (`seat-codex`/`dispatch-codex`
+export `SOVEREIGN_SEAT` and exec the agent), so HQ must locate where each seat
+actually constructs its bridge call. Coupled to uvicorn internals
+(`H11Protocol`, per-request `self.app`), pinned against 0.40 and failing closed
+if that changes.
+
+**Known limitation:** macOS hides the environment of system binaries, so the
+peer's seat is read from the nearest ancestor whose environment is readable
+(stopping at the first readable one). See `seat_socket.seat_of_process`.
+
+Suite: 334 passing (was 298).
+
+---
+
 ## 2026-08-28 — aperture moved to the stack (dedup)
 
 - **`bridge.py` no longer implements the aperture.** It imports

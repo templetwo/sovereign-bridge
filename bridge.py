@@ -25,6 +25,7 @@ work; instances just prefer record_insight with addressed-letter shape.
 """
 
 import asyncio
+import hashlib
 import hmac
 import json
 import os
@@ -221,6 +222,8 @@ class CommsMessage(BaseModel):
 
 # === Auth ===
 import session_tokens as st
+import seat_identity as si
+import seat_socket as ss
 
 
 class ScopeHTTPException(HTTPException):
@@ -305,13 +308,107 @@ def check_auth(authorization: str | None, allow_session: bool = False):
     )
 
 
+def check_auth_or_seat(
+    request: Request,
+    authorization: str | None,
+    seat_header: str | None,
+):
+    """THE /api/call CHOKEPOINT. Three auth paths, decided here, no fallback.
+
+    Returns exactly what check_auth returns for the two bearer paths (None for
+    master, the session context dict for a scoped token), or a seat context
+    {"status":"ok","kind":"seat","seat_id",...} for the third.
+
+    ORDER IS THE SECURITY PROPERTY:
+
+      * An Authorization header of ANY kind routes to check_auth and check_auth
+        alone — a good bearer, a dead session token, and a garbage string all
+        get exactly the answer they got before this function existed. Adding
+        X-Sovereign-Seat to a bad-bearer request therefore buys nothing. This
+        is the "bearer path decides" rule, and stating it as "an Authorization
+        header present at all" rather than "a VALID bearer" is what makes it
+        an escalation-proof rule instead of a race between two validators.
+
+      * Only a request with NO Authorization header can reach the seat path,
+        and only then if it presents a seat header. Everything else is the
+        pre-existing 401 for a missing bearer, byte-identical.
+
+    Deliberately NOT folded into check_auth: check_auth guards ~15 master-only
+    routes (batch, tools, admin mint/revoke, approval, comms). Teaching it about
+    seats would put the seat path on all of them by default — the opposite of
+    default-deny. The seat surface is one route, on purpose.
+
+    THE PEER COMES FROM THE ASGI SCOPE EXTENSION, NEVER FROM A HEADER OR FROM
+    request.client. seat_socket stamps a kernel-verified identity there when the
+    request arrived on the seat's Unix socket; uvicorn builds an http scope with
+    no `extensions` key at all, so a TCP caller cannot manufacture one at any
+    price. `.get` returning None is the whole TCP denial, and it fails closed by
+    construction rather than by a check somebody has to remember to write.
+    """
+    if authorization is not None or not seat_header:
+        return check_auth(authorization, allow_session=True)
+
+    peer = (request.scope.get("extensions") or {}).get(ss.SEAT_PEER_EXT)
+    try:
+        return si.resolve_seat(peer, seat_header, request.headers)
+    except si.SeatDenied as denied:
+        si.audit(seat_header, None, "denied", denied.reason)
+        raise HTTPException(status_code=401, detail=denied.detail) from None
+
+
 # === MCP Client ===
 # === Idempotency cache (write-path #3) =======================================
 # File-backed, TTL-pruned. A repeated idempotency_key replays the cached success
 # instead of re-calling the tool, so a client that lost the response can retry
 # without double-writing. A corrupt/missing cache never breaks a call.
+#
+# ⚠ THE STORAGE KEY IS NOT THE CALLER'S KEY, AND THAT IS THE FIX.
+#
+# Codex review 2026-09-06 (P1 CACHE): entries were retrieved by the supplied
+# idempotency_key ALONE, with no caller, tool or argument binding. Two
+# consequences, both proven live:
+#
+#   * A seat requesting an ALLOWED tool received a cached MASTER-ONLY result —
+#     200, idempotent_replay=true, zero upstream calls. Every scope check in
+#     this file ran and passed, and then the cache handed over an answer the
+#     scope check would never have permitted. A cache in front of an authz
+#     boundary that does not know about the boundary IS the boundary's hole.
+#   * A colliding key SUPPRESSED another seat's write: the second caller got
+#     the first caller's result and its own write never happened. Silent, and
+#     indistinguishable from success.
+#
+# Verifying the fields on retrieval would fix the first and not the second — a
+# collision would then be an error instead of a wrong answer, but the write is
+# still lost. So the PRINCIPAL, TOOL AND ARGUMENTS ARE HASHED INTO THE STORAGE
+# KEY: a colliding user key cannot name another principal's entry at all, and
+# two principals using "retry-1" simply have two different entries.
 _IDEM_PATH = Path(os.path.expanduser("~/.sovereign/bridge/idempotency.json"))
 _IDEM_TTL = 24 * 3600
+
+
+def _idem_principal(ctx) -> str:
+    """Who is asking, as one opaque string. Never None, never empty — an
+    unlabelled principal would pool every anonymous caller into one namespace,
+    which is the bug in miniature."""
+    if isinstance(ctx, dict):
+        if ctx.get("kind") == "seat":
+            return f"seat:{ctx.get('seat_id')}"
+        if ctx.get("token_id"):
+            return f"session:{ctx.get('token_id')}"
+    return "master"
+
+
+def _idem_storage_key(principal: str, tool: str, arguments: Any, client_key: str) -> str:
+    """The real cache key. Computed AFTER sign_arguments, so a seat's signed
+    call and an unsigned one are different entries — which they are.
+
+    Canonical JSON: sorted keys, no whitespace, `default=str` so an
+    unserialisable argument degrades to a stable string instead of raising and
+    knocking out the whole write path.
+    """
+    canonical = json.dumps(arguments, sort_keys=True, separators=(",", ":"), default=str)
+    material = "\x1f".join([principal, tool, canonical, client_key])
+    return hashlib.sha256(material.encode("utf-8", "replace")).hexdigest()
 
 
 def _idem_load() -> dict:
@@ -321,18 +418,24 @@ def _idem_load() -> dict:
         return {}
 
 
-def _idem_get(key: str):
+def _idem_get(key: str, principal: str, tool: str):
     entry = _idem_load().get(key)
-    if entry and (time.time() - entry.get("ts", 0)) < _IDEM_TTL:
-        return entry.get("result")
-    return None
+    if not entry or (time.time() - entry.get("ts", 0)) >= _IDEM_TTL:
+        return None
+    # Belt to the keying's suspenders. The hash already makes a cross-principal
+    # or cross-tool hit impossible; this makes a hash collision, or a cache file
+    # written by an older build with the old flat keys, fail CLOSED rather than
+    # replay somebody else's answer.
+    if entry.get("principal") != principal or entry.get("tool") != tool:
+        return None
+    return entry.get("result")
 
 
-def _idem_put(key: str, result: dict) -> None:
+def _idem_put(key: str, principal: str, tool: str, result: dict) -> None:
     try:
         now = time.time()
         d = {k: v for k, v in _idem_load().items() if (now - v.get("ts", 0)) < _IDEM_TTL}
-        d[key] = {"result": result, "ts": now}
+        d[key] = {"result": result, "ts": now, "principal": principal, "tool": tool}
         _IDEM_PATH.parent.mkdir(parents=True, exist_ok=True)
         _IDEM_PATH.write_text(json.dumps(d))
     except Exception:
@@ -677,6 +780,47 @@ async def _clock_probe_loop() -> None:
         await asyncio.sleep(CLOCK_PROBE_INTERVAL)
 
 
+def seat_socket_path() -> Path:
+    """Where the seat socket lives. Derived from seat_identity.sovereign_root()
+    so SOVEREIGN_ROOT redirection moves it — a module-level constant here would
+    make the tests' tmp redirection a no-op and bind the LIVE path instead,
+    which is the trap seat_identity.sovereign_root() already documents."""
+    #
+    # ⚠ ITS OWN DIRECTORY, not hq/seats/ itself. prepare_socket_path chmods the
+    # PARENT to 0700, and hq/seats/ is Anthony's — it holds the seat launchers
+    # (seat-codex, dispatch-grok, ...) and is 755 today. A bridge that silently
+    # narrows a directory it does not own is an unannounced permission change
+    # to someone else's files. One level down, the bridge owns the directory
+    # outright and the chmod is honest.
+    return si.sovereign_root() / "hq" / "seats" / "sock" / "bridge.sock"
+
+
+async def _start_seat_socket(app: FastAPI):
+    """Bind the seat socket, but ONLY if the seat registry exists.
+
+    THE REGISTRY IS ALREADY THE DEPLOY SWITCH (seat_identity's docstring: no
+    enable flag, because "a config that assumes a merge" is a shape this house
+    has been bitten by). Reusing it here means one switch, not two: no registry,
+    no socket, no listener, nothing to reason about. It also means this branch
+    binds nothing on a machine where Anthony has not turned the feature on —
+    including, today, this one.
+
+    Failure to bind is logged and swallowed on purpose: a bridge that will not
+    START because a supplementary listener could not bind has turned a
+    seat-path outage into a total outage. The seat path then simply stays shut,
+    which is the same answer it gives with no registry.
+    """
+    if not si.registry_path().exists():
+        return None
+    try:
+        server = await ss.start(app, seat_socket_path())
+        si.audit_log.info("seat socket listening at %s", seat_socket_path())
+        return server
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        si.audit_log.error("seat socket NOT started (%s): %r", seat_socket_path(), exc)
+        return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Runtime-freshness receipt: local `git` calls, bounded by GIT_PROBE_TIMEOUT
@@ -686,9 +830,16 @@ async def lifespan(app: FastAPI):
     # Start the read-only clock-drift probe daemon. It runs the first probe
     # itself (probe-then-sleep), so startup is NOT delayed waiting on sntp.
     task = asyncio.create_task(_clock_probe_loop())
+    seat_server = await _start_seat_socket(app)
     try:
         yield
     finally:
+        if seat_server is not None:
+            seat_server.close()
+            try:
+                await seat_server.wait_closed()
+            except Exception:
+                pass
         task.cancel()
         try:
             await task
@@ -1223,16 +1374,40 @@ def _heartbeat_gate_enabled() -> bool:
 @app.post("/api/call")
 async def call_tool_endpoint(
     req: ToolCall,
+    request: Request,
     authorization: str | None = Header(default=None),
+    x_sovereign_seat: str | None = Header(default=None),
 ):
-    ctx = check_auth(authorization, allow_session=True)
+    ctx = check_auth_or_seat(request, authorization, x_sovereign_seat)
     start = time.time()
+
+    # Seat identity (Anthony 2026-09-05: seats he put on the Studio need no
+    # token; every write signs itself). Scope is the read+write session surface
+    # reused exactly, narrowed by governance and by whether the write CAN sign.
+    if isinstance(ctx, dict) and ctx.get("kind") == "seat":
+        seat_id = ctx["seat_id"]
+        allowed, reason = si.seat_tool_allowed(req.tool)
+        if not allowed:
+            si.audit(seat_id, req.tool, "denied", reason, ctx.get("peer_pid"))
+            raise ScopeHTTPException(
+                status_code=403,
+                detail=si.deny_detail(req.tool, reason),
+            )
+        # OVERRIDE, never setdefault: a seat cannot claim another identity.
+        req.arguments = si.sign_arguments(req.tool, req.arguments, seat_id)
+        si.audit(seat_id, req.tool, "allowed", "ok", ctx.get("peer_pid"))
 
     # Scoped session token (The Door That Asks, Phase 1): default-deny per
     # tool, hard-deny on the never list, and stamp chronicle writes with the
     # grant so inspect_claim can trace any entry back to it (spec §4.4).
     # ctx is None for the master token (and for tests that bypass auth).
-    if ctx is not None and ctx.get("status") == "ok":
+    #
+    # `kind != "seat"` is load-bearing, not defensive noise: a seat context also
+    # carries status "ok" and a `scope` list, so without this guard it would
+    # fall into the session-token branch and KeyError on ctx["token_id"] the
+    # first time a seat called record_insight. Two auth paths sharing a context
+    # shape need the discriminator checked, not assumed.
+    if ctx is not None and ctx.get("status") == "ok" and ctx.get("kind") != "seat":
         if not st.tool_allowed(req.tool, ctx["scope"]):
             raise ScopeHTTPException(
                 status_code=403,
@@ -1272,9 +1447,18 @@ async def call_tool_endpoint(
             "duration_ms": round((time.time() - start) * 1000),
         }
 
-    # idempotency (#3): replay a cached success for a repeated key; never double-write.
+    # idempotency (#3): replay a cached success for a repeated key; never
+    # double-write. Scoped to (principal, tool, arguments, key) — see the
+    # _IDEM_PATH block above for the two live escapes that scoping closes.
+    # Computed HERE, after the seat signer has run, so the arguments hashed are
+    # the arguments dispatched.
+    idem_key = None
     if req.idempotency_key:
-        cached = _idem_get(req.idempotency_key)
+        principal = _idem_principal(ctx)
+        idem_key = _idem_storage_key(
+            principal, req.tool, req.arguments, req.idempotency_key
+        )
+        cached = _idem_get(idem_key, principal, req.tool)
         if cached is not None:
             replay = dict(cached)
             replay["idempotent_replay"] = True
@@ -1286,8 +1470,8 @@ async def call_tool_endpoint(
         result["failure_class"] = "stack"  # (#7)
     result["duration_ms"] = round((time.time() - start) * 1000)
 
-    if req.idempotency_key and result.get("ok"):
-        _idem_put(req.idempotency_key, result)
+    if idem_key and result.get("ok"):
+        _idem_put(idem_key, _idem_principal(ctx), req.tool, result)
     return result
 
 

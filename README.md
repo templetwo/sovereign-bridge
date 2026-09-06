@@ -45,10 +45,86 @@ curl -s -X POST "$BRIDGE/api/call" \
 
 ## Auth model
 
-Two credentials reach the bridge:
+Three paths reach the bridge, decided in this order, with no fallback between them:
 
 - **The master bridge token** (`BRIDGE_TOKEN`, in `~/.config/sovereign-bridge.env`) — full access. Never committed; loaded from the env file at startup.
 - **Scoped session tokens** (`svs_` prefix) — short-lived, revocable, least-privilege. A leaked session token is a dead key card, not a master key: at no scope can it mint/revoke tokens, call `set_policy`, or touch the protected drawer. See below.
+- **Seat identity** — no token at all, for terminals seated on this machine. See below.
+
+An `Authorization` header of *any* kind is decided by the bearer path alone, whether it
+succeeds or fails. Adding a seat header to a bad-bearer request buys nothing — only a
+request with no `Authorization` header at all can reach the seat path.
+
+## Seat identity — no token inside the machine
+
+A terminal the operator seated on this machine has the filesystem already. Requiring it
+to carry a bearer bought no security and cost it the ability to write the record at all.
+The arrival flow above is for everything *outside*; this is for what is already inside.
+
+A seat calls over a **Unix domain socket** — `<sovereign-root>/hq/seats/sock/bridge.sock`,
+mode 0600 — and sends `X-Sovereign-Seat: <seat-id>` with **no** `Authorization` header:
+
+```bash
+curl --unix-socket ~/.sovereign/hq/seats/sock/bridge.sock \
+  -H "X-Sovereign-Seat: $SOVEREIGN_SEAT" -H 'Content-Type: application/json' \
+  -d '{"tool":"record_insight","arguments":{"content":"...","domain":"..."}}' \
+  http://localhost/api/call
+```
+
+It is allowed only when **all** of these hold — any failure is a 401 naming the
+condition, never a fallback to another path:
+
+1. the request arrived on the seat socket (a TCP request is refused outright);
+2. the kernel names the peer process, and it is owned by the same user;
+3. that process's own `SOVEREIGN_SEAT` **equals** the `X-Sovereign-Seat` header;
+4. only the headers a client needs to make a request are present (an **allowlist** — any
+   `X-Forwarded-*`, `CF-*`, `Forwarded`, `Via`, `True-Client-IP` or unknown
+   forwarding-shaped header is a 401);
+5. the seat id is present in `~/.sovereign/hq/seats/registry.json`;
+6. that entry carries `"enabled": true`, literally.
+
+**Why a socket and not loopback TCP.** Loopback is not an identity. If the bridge is
+published through a tunnel, the tunnel daemon runs on this machine and connects to
+`127.0.0.1`, so a request from the open internet arrives with a *loopback peer* — and seat
+ids are not secrets, so any local process could name any seat it liked. A Unix socket is
+the only transport where the kernel will say **which process** is calling; the seat id is
+then read from that process's environment rather than believed from its header. The header
+stays as a declaration that must match, because a checked declaration audits better than
+an inference.
+
+**What this defends, and the line it does not cross.** It kills impersonation *by header*:
+a caller can no longer name a seat its own environment does not name, so accidental
+mis-signing fails closed and a script with the wrong header stops writing as the wrong
+seat. It does **not** stop *deliberate* impersonation — any process running as this user
+can spawn a child with whatever `SOVEREIGN_SEAT` it likes. That residual is asserted
+explicitly in `tests/test_seat_socket.py` rather than left as an assumption, and it cannot
+be closed without either a token (which the whole design forbids) or per-seat UIDs (an ops
+decision). It grants nothing new either way: anything running as this user can already
+read the master token out of `~/.config/sovereign-bridge.env`. This is **not** a privilege
+boundary between local processes and cannot be one. The asset is the chronicle's
+attribution.
+
+**One limitation, named.** macOS hides the environment of system binaries: `/usr/bin/curl`
+and `/bin/sleep` expose none, while `/usr/bin/python3` and Homebrew binaries do. So the
+bridge walks to the nearest ancestor whose environment it can read — in practice the agent
+process the seat launcher started — and stops at the first readable one. A process spawned
+by a seated terminal, whose own environment is hidden, is therefore treated as that
+terminal's seat. That is what environment inheritance already means, and it is why
+`env -u SOVEREIGN_SEAT` only drops the seat for clients that expose their environment.
+
+**Scope:** exactly what a `read`+`write` session grant gets (the same `TOOL_SCOPES` map,
+reused, never widened), minus two narrowings — governance-shaped tools are denied
+regardless of scope, and a write tool whose stack schema has no field to carry the seat
+id is denied rather than written unsigned.
+
+**Signing:** the bridge *overrides* `source_instance` with the seat id on every call that
+declares it. A seat cannot claim another identity — the body does not get a vote.
+
+**The registry file is the deploy switch.** There is no enable flag: absent or unreadable
+registry means every seat request is refused. Creating the file turns the path on;
+deleting it, or flipping `enabled` to `false`, revokes immediately (it is read fresh on
+every request). See `examples/seats-registry.json`. Every seat request writes one audit
+line — seat, tool, outcome, reason — to the bridge's log.
 
 ## The Door That Asks — consent-gated arrival
 
@@ -75,6 +151,8 @@ python3 stack_tokens.py list
 | `bridge.py` | the FastAPI server — every route |
 | `bridge_config.py` | shared config; loads `BRIDGE_TOKEN` |
 | `session_tokens.py` | scoped session tokens |
+| `seat_identity.py` | seat identity — the decision: binding, scope, registry, audit |
+| `seat_socket.py` | seat identity — the Unix-socket transport + peer credentials |
 | `arrival_gate.py` | the arrival gate |
 | `stack_tokens.py` | token CLI |
 | `sovereign_dashboard.py`, `dashboard/index.html` | activity monitors (terminal, web) |
