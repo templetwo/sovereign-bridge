@@ -1233,12 +1233,21 @@ except Exception:  # pragma: no cover — exercised by the fallback test
         raise RuntimeError("sovereign_stack.signal_ledger unavailable")
 
 
-def _signals_unmeasured(exc: Exception) -> dict:
-    """The honest shape of a failed read: an error, and no numbers at all."""
-    unavailable = isinstance(exc, RuntimeError) and "unavailable" in str(exc)
+def _signals_unmeasured(exc: Exception, route: str | None = None) -> dict:
+    """The honest shape of a failed read: an error, and no numbers at all.
+
+    `route` names WHICH attempt failed, because after the tool fallback there
+    are two and they mean different things to whoever reads the heartbeat: an
+    unimportable module is a deploy-ordering fact, an upstream tool failure is
+    a live-service fact. A single opaque error word would have merged them.
+    """
     return {
-        "source": SIGNALS_SOURCE,
-        "error": "signal_ledger_unavailable" if unavailable else f"unreadable:{type(exc).__name__}",
+        "source": route or SIGNALS_SOURCE,
+        "error": (
+            f"signal_ledger_unavailable; signals_summary failed: {type(exc).__name__}"
+            if route == "stack tool signals_summary"
+            else f"unreadable:{type(exc).__name__}"
+        ),
         "ingestion": "error",
         "scanned_at": None,
         "total": None,
@@ -1252,11 +1261,71 @@ def _signals_unmeasured(exc: Exception) -> dict:
     }
 
 
-def _measure_signals() -> dict:
+async def _signals_via_tool() -> dict:
+    """THE FALLBACK: ask the stack for the summary when we cannot import it.
+
+    ⚠ THIS CLOSES A WINDOW THAT IS OPEN RIGHT NOW, not a hypothetical one. The
+    import above is resolved ONCE, at module scope. Deploy the stack's
+    signal_ledger, restart sovereign-sse so `signals_summary` answers upstream,
+    and do NOT restart the bridge — the heartbeat would report
+    `signal_ledger_unavailable` indefinitely while the tool that knows the
+    answer is running one process over. That is this house's most expensive
+    shape (SOP #12): a reader that exists and is not wired to the thing it
+    reads. The bridge already carries its own credential for this call, so no
+    new secret and no new grant is involved.
+
+    IT IS BOUNDED, because /api/heartbeat is UNAUTHENTICATED and this is a
+    network round-trip: same timeout the tool-inventory fetch uses, and a
+    timeout renders as an error state rather than a zero, like every other
+    failure on this field.
+    """
+    result = await asyncio.wait_for(
+        call_mcp_tool("signals_summary", {}), timeout=HEARTBEAT_TOOL_TIMEOUT
+    )
+    if not isinstance(result, dict) or not result.get("ok"):
+        raise RuntimeError(str((result or {}).get("error") or "signals_summary failed"))
+    payload = result.get("result")
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        raise RuntimeError(str((payload or {}).get("error") or "signals_summary returned no data"))
+    # handle_signal_tool returns `{"ok", "ingestion", **summarize(root)}`, whose
+    # by_source values are per-source DICTS, not the flat open-counts
+    # heartbeat_field renders. Flattened here so the heartbeat field has ONE
+    # shape whichever path produced it — a consumer must not have to ask which
+    # route answered before it can read `by_source`.
+    by_source = payload.get("by_source")
+    if isinstance(by_source, dict):
+        by_source = {
+            k: (v.get("open") if isinstance(v, dict) else v) for k, v in by_source.items()
+        }
+    return {
+        "error": None,
+        "ingestion": payload.get("ingestion"),
+        "scanned_at": payload.get("scanned_at"),
+        "total": payload.get("total"),
+        "stale_24h": payload.get("stale_24h"),
+        "stale_7d": payload.get("stale_7d"),
+        "by_source": by_source,
+    }
+
+
+async def _measure_signals() -> dict:
     """`unacked_signals` for the heartbeat. Never raises, never fabricates a
     zero. A raise from the ledger becomes an error state carrying `total: None`;
     a successful read is passed through with its own error field intact, since
-    `heartbeat_field` already distinguishes not_scanned from a real count."""
+    `heartbeat_field` already distinguishes not_scanned from a real count.
+
+    Local import first — it is a filesystem read with no network in it. The
+    upstream tool is the fallback, and only when the import is the thing that
+    failed: a ledger that raises OSError locally is a REAL error and must be
+    reported as one, not laundered through a second route until some surface
+    agrees to answer.
+    """
+    if SIGNALS_SOURCE == "unavailable":
+        try:
+            field = await _signals_via_tool()
+            return {"source": "stack tool signals_summary", **field}
+        except Exception as exc:
+            return _signals_unmeasured(exc, route="stack tool signals_summary")
     try:
         field = _signal_heartbeat_field()
     except Exception as exc:
@@ -1428,7 +1497,7 @@ async def heartbeat(as_: str | None = Query(None, alias="as")):
     # exceptions, so this try is the belt to that — a raise here would still
     # not be allowed to sink the handler, or to become a zero.
     try:
-        signals = _measure_signals()
+        signals = await _measure_signals()
     except Exception as exc:  # pragma: no cover — _measure_signals is total
         signals = _signals_unmeasured(exc)
 
