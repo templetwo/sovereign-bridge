@@ -60,6 +60,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat
 import sys
 from pathlib import Path
 from typing import Any
@@ -296,6 +297,26 @@ def registry_path() -> Path:
     return sovereign_root() / "hq" / "seats" / "registry.json"
 
 
+def seat_socket_path() -> Path:
+    """Where the seat socket lives. ONE definition, because two drifted.
+
+    ⚠ ITS OWN DIRECTORY, not hq/seats/ itself. seat_socket.prepare_socket_path
+    chmods the PARENT to 0700, and hq/seats/ is Anthony's — it holds the seat
+    launchers (seat-codex, dispatch-grok, ...) and is 755 today. A bridge that
+    silently tightened a directory the operator owns would be a surprise.
+
+    ⚠ AND IT LIVES HERE, IN THE MODULE THAT WRITES THE DENIAL MESSAGE. Codex
+    review 2026-09-06 (P3 PATH): the TCP denial told callers to use
+    `<sovereign-root>/hq/seats/bridge.sock` while bridge.py bound
+    `hq/seats/sock/bridge.sock`. Two hand-written copies of one path, and the
+    copy in the error message — the only copy a locked-out caller ever reads —
+    was the wrong one. bridge.py now calls THIS function, the denial
+    interpolates THIS function, and the test asserts the two are the same
+    string, so the pair cannot drift apart again by editing one of them.
+    """
+    return sovereign_root() / "hq" / "seats" / "sock" / "bridge.sock"
+
+
 # The registry is a hand-written file listing a handful of terminals. 64 KiB is
 # already absurdly generous; anything larger is not a registry.
 REGISTRY_MAX_BYTES = 64 * 1024
@@ -338,6 +359,57 @@ def _depth_ok(value: Any, budget: int) -> bool:
     return True
 
 
+def _read_registry_bytes(path: Path) -> bytes:
+    """Read at most REGISTRY_MAX_BYTES from `path`, and never block on it.
+
+    ⚠ THE THREE PROPERTIES, EACH EARNED. Codex review 2026-09-06 (P2 REGISTRY)
+    broke the previous `path.stat()` + `path.read_text()` pair three ways, and
+    all three are closed by opening ONCE and validating the DESCRIPTOR:
+
+      * O_NONBLOCK — a real FIFO at registry.json reported st_size 0 and then
+        BLOCKED `load_registry()` indefinitely. That call is synchronous inside
+        the async request path, so a named pipe where a file should be would
+        stall the whole event loop: one bad local file, total bridge outage.
+        O_NONBLOCK makes opening a FIFO with no writer fail (ENXIO) instead of
+        waiting, and never blocks when one is attached.
+      * fstat on the OPEN DESCRIPTOR, S_ISREG required — binds the check to the
+        thing actually opened rather than to a path that may since have changed,
+        and refuses every non-regular file: FIFO, device, directory, socket.
+      * A BOUNDED READ of cap+1 bytes — `stat().st_size` was the only size
+        check, so a file that grew between the stat and the read was accepted
+        at 65,599 bytes against a 65,536 cap. The cap now bounds the bytes that
+        actually arrive, which is the only number that was ever the point.
+
+    SYMLINK POLICY, STATED RATHER THAN LEFT TO INFERENCE: a symlink whose
+    TARGET is a regular file within the cap is FOLLOWED and accepted. It is not
+    an authorization bypass — the target must still parse to a registry naming
+    an enabled seat, and the whole file is Anthony's own kill switch, which he
+    may legitimately want to keep elsewhere. O_NOFOLLOW is deliberately NOT
+    set. What the fstat closes is the dangerous half: a symlink pointing at a
+    FIFO or a device can no longer block or bypass, because the descriptor is
+    judged, not the name.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"seat registry at {path} is not a regular file")
+        chunks: list[bytes] = []
+        remaining = REGISTRY_MAX_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(fd)
+    if len(raw) > REGISTRY_MAX_BYTES:
+        raise ValueError("seat registry exceeds the size cap")
+    return raw
+
+
 def load_registry() -> dict[str, Any] | None:
     """The seat registry, or None if it is absent/unreadable/malformed.
 
@@ -353,9 +425,10 @@ def load_registry() -> dict[str, Any] | None:
     """
     path = registry_path()
     try:
-        if path.stat().st_size > REGISTRY_MAX_BYTES:
-            return None
-        raw = json.loads(path.read_text(), object_pairs_hook=_no_duplicate_keys)
+        raw = json.loads(
+            _read_registry_bytes(path).decode("utf-8"),
+            object_pairs_hook=_no_duplicate_keys,
+        )
     except (OSError, ValueError, RecursionError):
         return None
     if not isinstance(raw, dict):
@@ -412,8 +485,8 @@ def resolve_seat(peer: Any, seat_id: str | None, headers: Any) -> dict[str, Any]
             "not_socket",
             (
                 "Seat identity is not available on this connection. A seat must "
-                "call over the seat socket (curl --unix-socket "
-                "<sovereign-root>/hq/seats/bridge.sock), not over 127.0.0.1:8100 "
+                f"call over the seat socket (curl --unix-socket {seat_socket_path()}"
+                "), not over 127.0.0.1:8100 "
                 "— a TCP connection carries no process identity, and the tunnel "
                 "makes every outside request look local. Everything else uses "
                 "the arrival flow: POST /api/arrival/request."

@@ -47,7 +47,9 @@ no-op:
 
 import json
 import os
+import signal
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -672,3 +674,195 @@ def test_an_oversized_registry_is_refused(registry, calls):
     assert si.load_registry() is None
     assert call(client(), READ_TOOL, seat_hdr()).status_code == 401
     assert not calls
+
+
+# ── FINDING 3: the registry read must be bounded and must never block ───────
+
+
+def test_a_fifo_registry_cannot_block_the_bridge(registry, calls):
+    """FINDING 3, the half that was a live outage rather than a bypass.
+
+    A real FIFO at registry.json reports st_size 0, so the size check passed;
+    `read_text()` then BLOCKED until a writer appeared. load_registry is called
+    synchronously inside the async request path, so one bad local file would
+    have stalled the whole event loop — every route, every caller, not just
+    seats. Astra's repro killed the reader after 0.5s.
+
+    O_NONBLOCK makes the open fail instead of waiting, and the answer is the
+    fail-closed one: no registry, deny.
+
+    ⚠ GUARDED WITH SIGALRM, because the failure mode of a regression here is a
+    HANG, not a red assertion, and a suite that hangs is a suite people stop
+    running. This works precisely where the /dev/zero guard above could not:
+    an open on a writerless FIFO blocks INTERRUPTIBLY, so the alarm lands and
+    the test fails in five seconds with a message naming the defect. (The
+    unbounded device read does not block — it succeeds, repeatedly, into
+    memory — which is why that case is tested at the guard instead.)
+    """
+    registry.path.unlink()
+    os.mkfifo(registry.path)
+
+    def _blocked(signum, frame):
+        raise AssertionError(
+            "load_registry blocked on a FIFO — the open is not O_NONBLOCK, and in "
+            "production this call is synchronous inside the async request path, so "
+            "one bad local file stalls the whole event loop"
+        )
+
+    previous = signal.signal(signal.SIGALRM, _blocked)
+    signal.alarm(5)
+    try:
+        started = time.monotonic()
+        assert si.load_registry() is None
+        assert time.monotonic() - started < 2.0, "load_registry blocked on a FIFO"
+        assert call(client(), READ_TOOL, seat_hdr()).status_code == 401
+        assert _reason(READ_TOOL) == "no_registry"
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+        registry.path.unlink()
+    assert not calls
+
+
+def test_a_directory_where_the_registry_should_be_is_refused(registry):
+    """The general form: the OPENED DESCRIPTOR must be a regular file. An
+    fstat-based check covers every non-regular kind at once, including the ones
+    nobody enumerated."""
+    registry.path.unlink()
+    registry.path.mkdir()
+    try:
+        assert si.load_registry() is None
+    finally:
+        registry.path.rmdir()
+
+
+def test_the_descriptor_check_covers_a_character_device(registry, tmp_path):
+    """A character device is the FIFO's quieter sibling: it does not block, it
+    ANSWERS — forever. `/dev/zero` under an unbounded read returns NUL bytes
+    until the reader dies.
+
+    ⚠ THIS TEST DELIBERATELY DOES NOT CALL load_registry() ON /dev/zero, AND
+    THE REASON IS A MEASUREMENT, NOT A HUNCH. Falsifying the fix — reverting
+    load_registry to its `stat()` + `read_text()` shape and pointing it at
+    /dev/zero — produced a process that grew to 7.6 GB resident and entered
+    UNINTERRUPTIBLE wait, where SIGKILL takes minutes to land. Moving the read
+    into a subprocess did not help: `subprocess.run(timeout=...)` kills the
+    child and then WAITS for it, so the parent hangs on the same
+    uninterruptible child. Measured twice, 2026-09-06, both times on this
+    machine.
+
+    A regression test that can wedge the runner and eat its memory teaches
+    people to skip the suite, which is worse than the bug it catches. So the
+    GUARD is tested rather than the HAZARD: the premise (that /dev/zero is not
+    a regular file) and the guard (that a non-regular descriptor is refused)
+    are asserted separately, and they are the same single S_ISREG check that
+    the directory case above drives end to end. Nothing here can read a byte
+    from a device.
+    """
+    import stat as _stat
+
+    fd = os.open("/dev/zero", os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        mode = os.fstat(fd).st_mode
+    finally:
+        os.close(fd)
+    # The premise: this is exactly the classification the guard keys on.
+    assert _stat.S_ISCHR(mode) and not _stat.S_ISREG(mode)
+
+    # The guard: a non-regular descriptor is refused before any read happens.
+    # Proven on a FIFO with a live writer, which is safe to open and yields
+    # nothing — the read loop would return b"" immediately, so a failure here
+    # is the S_ISREG check being gone, never a hang.
+    fifo = tmp_path / "not-a-file"
+    os.mkfifo(fifo)
+    reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        with pytest.raises(OSError, match="not a regular file"):
+            si._read_registry_bytes(fifo)
+    finally:
+        os.close(reader)
+        fifo.unlink()
+
+
+def test_the_size_cap_bounds_the_bytes_actually_read(registry, monkeypatch):
+    """FINDING 3, the half that was a bypass.
+
+    Verbatim: "a controlled stat/read race fixture reported size 1 at stat
+    time, then read and accepted a 65,599-byte valid registry, above the
+    65,536-byte cap." `stat()` was the ONLY size check, so a file that grew
+    between the stat and the read sailed past it.
+
+    The fixture lies about st_size exactly as the race would, and the read must
+    refuse on the bytes that actually arrive.
+    """
+    oversized = json.dumps({"seats": {SEAT: {"enabled": True}}, "pad": "x" * si.REGISTRY_MAX_BYTES})
+    assert len(oversized) > si.REGISTRY_MAX_BYTES
+    registry.path.write_text(oversized)
+
+    real_stat = Path.stat
+    tiny = os.stat_result((0o100644, 0, 0, 1, 0, 0, 1, 0, 0, 0))
+    monkeypatch.setattr(
+        Path, "stat", lambda p, *a, **kw: tiny if p == registry.path else real_stat(p, *a, **kw)
+    )
+    assert si.load_registry() is None, "the cap was enforced on stat, not on the read"
+
+
+def test_a_symlink_to_a_real_registry_is_followed_deliberately(registry, tmp_path):
+    """The symlink POLICY, stated as a test rather than left to inference.
+
+    Following a symlink whose target is a regular file within the cap is
+    allowed on purpose — the file is Anthony's own kill switch and he may keep
+    it wherever he likes. What the descriptor check closes is the dangerous
+    half, above: a symlink to a FIFO or a device can no longer block or bypass.
+    """
+    real = tmp_path / "elsewhere.json"
+    real.write_text(json.dumps({"seats": {SEAT: {"enabled": True}}}))
+    registry.path.unlink()
+    os.symlink(real, registry.path)
+    try:
+        loaded = si.load_registry()
+        assert loaded is not None and SEAT in loaded["seats"]
+    finally:
+        registry.path.unlink()
+
+
+def test_a_registry_exactly_at_the_cap_still_loads(registry):
+    """The falsifier for the bounded read: a cap that refuses everything would
+    pass every test above. cap bytes load; cap+1 does not."""
+    body = json.dumps({"seats": {SEAT: {"enabled": True}}})
+    registry.path.write_text(body + " " * (si.REGISTRY_MAX_BYTES - len(body)))
+    assert si.load_registry() is not None
+    registry.path.write_text(registry.path.read_text() + " ")
+    assert si.load_registry() is None
+
+
+# ── FINDING 5: the denial must name the socket the bridge actually binds ────
+
+
+def test_the_tcp_denial_names_the_socket_the_bridge_binds(registry):
+    """FINDING 5. The denial said `<sovereign-root>/hq/seats/bridge.sock`; the
+    bridge bound `hq/seats/sock/bridge.sock`. The wrong copy was the one in the
+    error message — the only copy a locked-out caller ever reads.
+
+    Asserted as an EQUALITY between the message and the bound path, not against
+    a third hand-written literal, because a third copy is a third thing to
+    drift.
+    """
+    try:
+        si.resolve_seat(None, SEAT, {})
+    except si.SeatDenied as denied:
+        assert denied.reason == "not_socket"
+        assert str(si.seat_socket_path()) in denied.detail
+    else:  # pragma: no cover
+        raise AssertionError("a TCP request was admitted to the seat path")
+
+    assert bridge.seat_socket_path() == si.seat_socket_path()
+    assert si.seat_socket_path().parts[-3:] == ("seats", "sock", "bridge.sock")
+
+
+def test_the_socket_path_follows_sovereign_root(monkeypatch, tmp_path):
+    """A module-level constant here would bind the LIVE path under test. Both
+    copies must move together when SOVEREIGN_ROOT does."""
+    monkeypatch.setenv("SOVEREIGN_ROOT", str(tmp_path))
+    assert si.seat_socket_path() == tmp_path / "hq" / "seats" / "sock" / "bridge.sock"
+    assert bridge.seat_socket_path() == si.seat_socket_path()

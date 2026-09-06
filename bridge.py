@@ -821,18 +821,17 @@ async def _clock_probe_loop() -> None:
 
 
 def seat_socket_path() -> Path:
-    """Where the seat socket lives. Derived from seat_identity.sovereign_root()
-    so SOVEREIGN_ROOT redirection moves it — a module-level constant here would
-    make the tests' tmp redirection a no-op and bind the LIVE path instead,
-    which is the trap seat_identity.sovereign_root() already documents."""
-    #
-    # ⚠ ITS OWN DIRECTORY, not hq/seats/ itself. prepare_socket_path chmods the
-    # PARENT to 0700, and hq/seats/ is Anthony's — it holds the seat launchers
-    # (seat-codex, dispatch-grok, ...) and is 755 today. A bridge that silently
-    # narrows a directory it does not own is an unannounced permission change
-    # to someone else's files. One level down, the bridge owns the directory
-    # outright and the chmod is honest.
-    return si.sovereign_root() / "hq" / "seats" / "sock" / "bridge.sock"
+    """Where the seat socket lives — ONE definition, in seat_identity.
+
+    This used to hand-write the path a second time, and the second copy drifted
+    from the first: Codex review 2026-09-06 (P3 PATH) found the TCP denial
+    message naming `hq/seats/bridge.sock` while this function bound
+    `hq/seats/sock/bridge.sock`. The wrong copy was the one in the error
+    message — the only copy a locked-out caller ever reads. A path written
+    twice is a path that will disagree with itself, so it is written once, in
+    the module that also writes the denial, and this is a delegation.
+    """
+    return si.seat_socket_path()
 
 
 async def _start_seat_socket(app: FastAPI):
