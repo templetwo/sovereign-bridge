@@ -5,6 +5,7 @@ validate_only must behave exactly as before. Tests monkeypatch call_mcp_tool so
 no live stack is needed, and isolate the idempotency cache to a tmp path.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -267,3 +268,85 @@ def test_a_hash_collision_still_fails_closed(client, monkeypatch):
     r = client.post("/api/call", json={"tool": "recall_insights", "arguments": {}, "idempotency_key": "k"})
     assert r.json().get("result") != "NOT-YOURS", "a colliding entry replayed another principal's result"
     assert len(calls) == 1
+
+
+# ── FINDING 2: distinct idempotency keys must never collide ─────────────────
+
+
+def test_distinct_unicode_keys_do_not_collide(client, monkeypatch):
+    """FINDING 2, the defect, reproduced as Astra found it.
+
+    Verbatim: two validly transported JSON requests, identical
+    principal/tool/arguments, distinct `idempotency_key` strings `"?"` and an
+    escaped lone surrogate `"\\ud800"`, both returned 200 — but the SECOND
+    returned `idempotent_replay=true`, with ONE upstream call total. The old
+    `.encode("utf-8", "replace")` turned the surrogate into a literal `?`, so
+    the two keys hashed to one entry and the second caller's write never
+    happened. Silent, and indistinguishable from success.
+    """
+    calls = []
+    _mock_tool(monkeypatch, calls)
+    body = {"tool": "record_insight", "arguments": {"content": "c", "domain": "d"}}
+
+    def post(key):
+        # ⚠ NOT `json=`: httpx serialises with ensure_ascii=False and then
+        # utf-8-encodes, so a lone surrogate raises in the CLIENT and the
+        # server never sees the request. Astra's phrase was "escaped lone
+        # surrogate" — the six ASCII characters \ud800 in the JSON text, which
+        # is valid JSON and is exactly what any other HTTP client would send.
+        # A test that could not transmit the input would have "proved" the fix
+        # by never exercising it.
+        return client.post(
+            "/api/call",
+            content=json.dumps({**body, "idempotency_key": key}, ensure_ascii=True),
+            headers={"Content-Type": "application/json"},
+        )
+
+    first = post("?")
+    second = post("\ud800")
+    assert first.status_code == second.status_code == 200
+    assert "idempotent_replay" not in second.json(), "a lone surrogate collapsed onto '?'"
+    assert len(calls) == 2, "the second write was suppressed by a key collision"
+    assert bridge._idem_storage_key("master", "record_insight", {}, "?") != bridge._idem_storage_key(
+        "master", "record_insight", {}, "\ud800"
+    )
+
+
+def test_no_key_can_forge_the_field_separator(client, monkeypatch):
+    """The second half of the same defect, fixed while it was open.
+
+    The old key material was `"\\x1f".join([...])` over caller-influenced
+    strings, so a client key containing U+001F could shift the field boundaries
+    and name a different (principal, tool, arguments) tuple. A JSON array has
+    no in-band separator to forge.
+    """
+    a = bridge._idem_storage_key("seat:one", "record_insight", {}, "k\x1fseat:two")
+    b = bridge._idem_storage_key("seat:one\x1frecord_insight", "", {}, "k\x1fseat:two")
+    assert a != b
+    assert bridge._idem_storage_key("a", "t", {}, "b\x1fc") != bridge._idem_storage_key(
+        "a", "t", {}, "b"
+    )
+
+
+def test_lossy_encoding_is_gone_from_the_key_material():
+    """The falsifier that names the MECHANISM rather than one input. Any codec
+    with a replacement policy can map two distinct keys onto one; the fix is
+    that the material is pure ASCII by construction, so `.encode("ascii")`
+    cannot need a policy at all. If a future edit reintroduces a lossy encode,
+    a fresh unencodable pair will collide again — so this asserts on a
+    generated family, not on the one string the review happened to send.
+    """
+    surrogates = ["\ud800", "\udfff", "𐀀x", "\udcff"]
+    keys = {bridge._idem_storage_key("p", "t", {}, s) for s in surrogates}
+    assert len(keys) == len(surrogates), "distinct unencodable keys shared a hash"
+    assert "?" not in "".join(surrogates)  # the collision partner is not among them
+    assert bridge._idem_storage_key("p", "t", {}, "?") not in keys
+
+
+def test_arguments_carrying_a_lone_surrogate_do_not_break_the_write_path():
+    """The key is not the only caller-controlled string hashed. An argument
+    value that cannot be UTF-8 encoded must not raise out of the cache and take
+    the whole write path with it."""
+    key = bridge._idem_storage_key("p", "record_insight", {"content": "\ud800"}, "k")
+    assert len(key) == 64
+    assert key != bridge._idem_storage_key("p", "record_insight", {"content": "?"}, "k")

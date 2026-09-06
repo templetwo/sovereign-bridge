@@ -419,10 +419,36 @@ def _idem_storage_key(principal: str, tool: str, arguments: Any, client_key: str
     Canonical JSON: sorted keys, no whitespace, `default=str` so an
     unserialisable argument degrades to a stable string instead of raising and
     knocking out the whole write path.
+
+    ⚠ THE KEY MATERIAL IS JSON, ASCII-ESCAPED. TWO DEFECTS DIE HERE.
+
+    1. LOSSY ENCODING COLLAPSED DISTINCT KEYS. Codex review 2026-09-06 (P2
+       IDEMPOTENCY) sent two requests, same principal/tool/arguments, keys `"?"`
+       and a lone surrogate `"\\ud800"`. Both returned 200; the SECOND returned
+       `idempotent_replay=true` with ONE upstream call total. The old
+       `.encode("utf-8", "replace")` turned the unencodable surrogate into a
+       literal `?`, so two different keys hashed to one entry and the second
+       caller's write silently did not happen — a suppressed write that is
+       indistinguishable from a successful one. `json.dumps(...,
+       ensure_ascii=True)` escapes a lone surrogate to the six characters
+       `\\ud800` instead of destroying it (verified in-interpreter before this
+       was written), so the two keys are two entries again.
+
+    2. THE FIELD SEPARATOR WAS FORGEABLE. The old material was
+       `"\\x1f".join([...])` over caller-influenced strings, so a client key
+       containing U+001F could shift the field boundaries and impersonate a
+       different (principal, tool, arguments) tuple. A JSON ARRAY has no
+       in-band separator to forge: every element is quoted and escaped, and
+       ambiguity between `["a\\x1fb", ""]` and `["a", "b"]` cannot arise.
+
+    Never go back to a lossy codec here. `ensure_ascii=True` guarantees the
+    result is pure ASCII, so `.encode("ascii")` is exact and cannot substitute
+    a character — an encode that can never need a replacement policy is the
+    point.
     """
     canonical = json.dumps(arguments, sort_keys=True, separators=(",", ":"), default=str)
-    material = "\x1f".join([principal, tool, canonical, client_key])
-    return hashlib.sha256(material.encode("utf-8", "replace")).hexdigest()
+    material = json.dumps([principal, tool, canonical, client_key], ensure_ascii=True)
+    return hashlib.sha256(material.encode("ascii")).hexdigest()
 
 
 def _idem_load() -> dict:
