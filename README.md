@@ -93,16 +93,30 @@ stays as a declaration that must match, because a checked declaration audits bet
 an inference.
 
 **What this defends, and the line it does not cross.** It kills impersonation *by header*:
-a caller can no longer name a seat its own environment does not name, so accidental
-mis-signing fails closed and a script with the wrong header stops writing as the wrong
-seat. It does **not** stop *deliberate* impersonation — any process running as this user
-can spawn a child with whatever `SOVEREIGN_SEAT` it likes. That residual is asserted
-explicitly in `tests/test_seat_socket.py` rather than left as an assumption, and it cannot
-be closed without either a token (which the whole design forbids) or per-seat UIDs (an ops
-decision). It grants nothing new either way: anything running as this user can already
-read the master token out of `~/.config/sovereign-bridge.env`. This is **not** a privilege
-boundary between local processes and cannot be one. The asset is the chronicle's
-attribution.
+a caller whose own environment is readable can no longer name a seat that environment does
+not name, so accidental mis-signing fails closed and a script with the wrong header stops
+writing as the wrong seat. **That claim carries three qualifiers, all of them narrowings
+required by the second review (2026-09-06), and none of them optional when this feature is
+described to anyone:**
+
+1. **Readable environment only.** See the limitation below. A child that hides its own
+   environment is attributed to its nearest readable ancestor, which is inheritance, not
+   proof of the immediate caller's identity.
+2. **A connection is not an identity either.** A process can fork, or pass its connected
+   descriptor over `SCM_RIGHTS`, and a later request on the same socket comes from a
+   different process. The review demonstrated exactly that against the first version and
+   got a 200 under the parent's seat. Identity is therefore resolved **per request**, not
+   per connection: the sender of each request is the process it is attributed to, and the
+   connection's opener is recorded only as `accept_pid` in the audit line.
+3. **Deliberate impersonation is not stopped.** Any process running as this user can spawn
+   a child with whatever `SOVEREIGN_SEAT` it likes. That residual is asserted explicitly in
+   `tests/test_seat_socket.py` rather than left as an assumption, and it cannot be closed
+   without either a token (which the whole design forbids) or per-seat UIDs (an ops
+   decision).
+
+It grants nothing new either way: anything running as this user can already read the master
+token out of `~/.config/sovereign-bridge.env`. This is **not** a privilege boundary between
+local processes and cannot be one. The asset is the chronicle's attribution.
 
 **One limitation, named.** macOS hides the environment of system binaries: `/usr/bin/curl`
 and `/bin/sleep` expose none, while `/usr/bin/python3` and Homebrew binaries do. So the
@@ -112,13 +126,33 @@ by a seated terminal, whose own environment is hidden, is therefore treated as t
 terminal's seat. That is what environment inheritance already means, and it is why
 `env -u SOVEREIGN_SEAT` only drops the seat for clients that expose their environment.
 
-**Scope:** exactly what a `read`+`write` session grant gets (the same `TOOL_SCOPES` map,
-reused, never widened), minus two narrowings — governance-shaped tools are denied
-regardless of scope, and a write tool whose stack schema has no field to carry the seat
-id is denied rather than written unsigned.
+**Scope — widened 2026-09-06 by Anthony's ruling, *"all studio seats are trusted."***
+A seat is not a scoped visitor; it is a terminal the operator started on his own machine.
+The surface is now
 
-**Signing:** the bridge *overrides* `source_instance` with the seat id on every call that
-declares it. A seat cannot claim another identity — the body does not get a vote.
+    the stack's published tool surface  −  governance  −  what the stack retires
+
+which is **48 of 100** published tools, up from the 19 a `read`+`write` session grant
+reaches. `where_did_i_leave_off` — the boot door every arriving seat is *told* to call, and
+which no seat but the master could reach — is among the tools this opens.
+
+**Governance is still Anthony's, and being trusted is not being him:** `set_policy`,
+`govern`, the protected drawer (`designate_protected`, `open_`/`decline_`/
+`list_protected_thresholds`), `resolve_thread` (by match), `retire_hypothesis`,
+`mint_token`, `revoke_token`, `audit_decoupling`, and the session-lifecycle pair
+`close_session` / `spiral_inherit`, which mutate global spiral state and stay as they were.
+`resolve_thread_by_id` is **allowed** — closing a thread by its id is a seat's ordinary act.
+Default-deny survives the widening: the base set is an enumeration of what the stack
+publishes, so a tool added upstream later is denied `unpublished` until it is added here.
+
+**Signing:** the bridge *overrides* `source_instance` with the seat id on every call whose
+stack schema **declares** that field (`arrive`, `arrive_lineage`, `handoff`,
+`record_insight`, `record_open_thread`, `where_did_i_leave_off`). A seat cannot claim
+another identity — the body does not get a vote. **For every other write the seat is in the
+audit line and not in the record**: injecting `source_instance` into a schema that does not
+declare it is either a hard error upstream or, worse, a silent drop that would leave the
+bridge believing it signed. The way to move a tool into the signed set is to add the field
+to its stack schema, never to inject harder.
 
 **The registry file is the deploy switch.** There is no enable flag: absent or unreadable
 registry means every seat request is refused. Creating the file turns the path on;

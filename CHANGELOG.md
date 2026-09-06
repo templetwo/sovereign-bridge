@@ -1,5 +1,100 @@
 # Changelog — Sovereign Bridge
 
+## Release 2026-09-06 — the second review's fixes, Anthony's trust ruling, and the signal ledger on the door
+
+Cross-substrate review 2 (gpt-6-astra, Codex seat 3/3) read
+`feat/seat-identity-localhost` at `b82c579` and returned **holds-with-fixes**: the
+transport, principal isolation, header allowlist, registry rejection and audit escaping
+were substantial, and five defects remained. All five are closed here, each with a test
+named after the finding and each test verified to FAIL when its fix is reverted.
+
+- **P2 RETAINED CONNECTION IDENTITY — `seat_socket.py`.** Identity was resolved once, at
+  accept, and reused for every request on the connection. The review passed the connected
+  descriptor from a seated HQ parent to a child seated as Codex; the child sent
+  `X-Sovereign-Seat: hq-claude-studio`, got **HTTP 200**, and dispatched `record_insight`
+  as HQ (accept pid 79420, actual sender 79421). **Fixed by resolving per request.**
+  `_wrap_app` now closes over the SOCKET, not the answer: macOS `LOCAL_PEERPID` re-read
+  after the child transmits names the child, verified independently here before the fix
+  was built and pinned by
+  `test_the_kernel_names_the_new_sender_after_a_descriptor_handoff`. Re-resolution failure
+  mid-connection is a denial, never a fall back to the connection's former identity. The
+  connection's opener is retained as `accept_pid` for the audit line and decides nothing;
+  denial audits now carry the verified pid too, so a `seat_mismatch` names a process.
+
+- **P2 IDEMPOTENCY KEY COLLISION — `bridge.py`.** Two requests with identical
+  principal/tool/arguments and distinct keys `"?"` and a lone surrogate `"\ud800"` both
+  returned 200 — the second as `idempotent_replay=true`, with one upstream call. The old
+  `.encode("utf-8", "replace")` mapped the surrogate onto `?`, so a separately-keyed write
+  was silently suppressed. Key material is now
+  `json.dumps([principal, tool, canonical_args, key], ensure_ascii=True)` hashed as ASCII:
+  a lone surrogate escapes rather than being destroyed, and the JSON array removes the
+  forgeable `\x1f` field separator the old material used.
+
+- **P2 REGISTRY READ — `seat_identity.py`.** `stat()` then `read_text()` bound neither the
+  size check nor the type check to the file actually opened. A real FIFO reported size 0
+  and BLOCKED the reader — synchronously, inside the async request path, so one bad local
+  file would stall the event loop for every caller. A stat/read race accepted 65,599 bytes
+  against a 65,536 cap. Now: `O_NONBLOCK` open, `fstat` requiring `S_ISREG`, and a read
+  bounded at cap+1 bytes. Symlink policy is stated rather than inferred — a symlink to a
+  regular file within the cap is followed deliberately; the descriptor check is what stops
+  a symlink to a FIFO or a device.
+
+- **P3 ENVIRONMENT-DEPENDENT TEST — `tests/test_seat_socket.py`.**
+  `test_the_protocol_stamps_the_verified_peer_into_the_scope` resolved the identity of
+  whatever process pytest happened to be and asserted `no_seat_env` unconditionally, so it
+  passed for an unseated runner and failed for the reviewer's seated one. Both directions
+  now run against explicit subprocess fixtures. Verified green with `SOVEREIGN_SEAT` unset
+  and with it exported as three different seats, including the seat the tests themselves
+  use.
+
+- **P3 WRONG SOCKET PATH — `seat_identity.py`, `bridge.py`, this file.** The TCP denial
+  named `<root>/hq/seats/bridge.sock` while the bridge bound `hq/seats/sock/bridge.sock` —
+  the wrong copy was the one in the error message, the only copy a locked-out caller reads.
+  `seat_socket_path()` now lives once, in `seat_identity`; `bridge.py` delegates to it, the
+  denial interpolates it, and a test asserts the two are the same string.
+
+### Anthony's ruling: all studio seats are trusted
+
+The seat surface was `TOOL_SCOPES` — the read+write session-grant map — because a seat was
+modelled as a scoped visitor. It is not. The surface is now the stack's published tool
+surface minus governance minus what the stack retires: **48 allowed, 52 denied, of 100
+published**. Default-deny survives — the base set is an enumeration resolved statically
+from sovereign-stack `release/2026-09-06`, never a live fetch in the auth path, so a tool
+added upstream later is denied `unpublished` rather than admitted by silence.
+
+Two calls worth reading before relying on them:
+
+- **`signal_ack` is DENIED, and that is a judgement at Anthony's gate.** It did not exist
+  when the ruling was made, and the stack's own `SIGNAL_TOOL_INTENTS` labels its intent
+  `govern`. The argument the other way is real — it is shaped like `resolve_thread_by_id`,
+  a watch seat closing a signal it owns, and carries its own producer guard upstream — but
+  widening governance is not HQ's to do quietly. One line to flip. `signals_summary`
+  (intent `read`) is allowed.
+- **The widening also NARROWS in exactly two places.** The stack has no `RETIRED` set, so
+  this release derives one from the 30-day census's Total-0 rows as instructed. That takes
+  `ask_scribe` and `reflection_ack` away from seats while a scoped session token can still
+  call them — a seated terminal reaching two fewer tools than an outside visitor, which is
+  backwards on its face. The census's own §4 marks `reflection_ack` ★ "keep reachable".
+  Pinned by `test_the_widening_also_NARROWS_in_exactly_two_places` so it is a decision on
+  the record rather than a surprise.
+
+### `unacked_signals` on the heartbeat
+
+The fourth census on the door, after aperture, gate and attribution, and the same
+one-implementation rule: it calls `sovereign_stack.signal_ledger.heartbeat_field`, which is
+also what the stack's `signals_summary` tool returns, so the door and the tool cannot
+report two different numbers for one ledger. **An unreadable, never-scanned or unimportable
+ledger renders as an error state with `total: null` — never zero**, because `0` here reads
+as "every signal is closed" and is the most reassuring thing this field could lie about. A
+genuine measured zero is still reported as zero; only a manufactured one is refused.
+
+**Deploy order: the stack goes first.** `signal_ledger` is on sovereign-stack
+`release/2026-09-06`; until that is merged and the SSE process runs it, the bridge's
+heartbeat carries `unacked_signals.error = "signal_ledger_unavailable"`, which is honest
+about the deploy. The same ordering is load-bearing for signing: `record_open_thread`'s
+`source_instance` lands on that stack branch, and shipping this bridge without it would
+have the bridge believe it signed while the thread landed unattributed.
+
 ## How to read this file
 
 **The bridge does not carry a version of its own, deliberately.** The `version`
@@ -36,7 +131,7 @@ with a test that fails when its guard is deleted.
   `X-Sovereign-Seat: hq-claude-studio` got a 200 and wrote as HQ. Seat ids are
   not secrets, so the header was an unchecked claim. **Fixed by changing the
   transport, not the header:** a seat now calls over a Unix domain socket
-  (`<root>/hq/seats/bridge.sock`, 0600), the kernel names the peer pid and uid,
+  (`<root>/hq/seats/sock/bridge.sock`, 0600), the kernel names the peer pid and uid,
   and the bridge reads that process's own `SOVEREIGN_SEAT` and requires it to
   equal the declaration. New module `seat_socket.py`. Loopback TCP is no longer
   a seat path at all — it is a 401 saying "use the socket". No token is
