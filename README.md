@@ -201,6 +201,19 @@ client supplying `actor`, `actor_seat`, `closed_by`, `owner` or `source_seat` is
 rather than overwritten, and a stack with no such module cannot serve `signal_ack` to a seat
 at all — a field trusted because of *who usually sets it* is not verified, it is assumed.
 
+> ⚠ **AND THE CHANNEL IS NOT PROVEN END TO END. Stated here because a green suite
+> would otherwise read as proof it works.** `call_mcp_tool` dispatches over SSE to
+> `MCP_SSE_URL` (127.0.0.1:3434) — the **sovereign-sse process**. The stack's handlers run
+> there; `set_caller_seat` runs here, in the bridge process; a `contextvars.ContextVar` is
+> per-process. Nothing this bridge sets around the dispatch is visible to the handler that
+> answers it unless the **stack** also carries the seat across the SSE hop. Today that is
+> harmless only by timing: `sovereign_stack.dispatch_context` does not exist, so the call is
+> refused. **When it lands, the guarded import here succeeds, the refusal lifts, and
+> `signal_ack` starts answering seats whether or not the identity arrives** — the refusal
+> keys on importability in a process that does not dispatch. The bridge half is implemented
+> as specified; the end-to-end property is the stack's to close.
+> Pinned by `tests/test_seat_identity.py::test_the_caller_channel_is_measured_in_the_WRONG_PROCESS`.
+
 **Signing:** the bridge *overrides* `source_instance` with the seat id on every call whose
 stack schema **declares** that field (`arrive`, `arrive_lineage`, `handoff`,
 `record_insight`, `record_open_thread`, `where_did_i_leave_off`). A seat cannot claim

@@ -319,6 +319,81 @@ def test_the_filtered_result_is_what_gets_CACHED(seated, upstream):
     assert len(upstream["seen"]) == 1, "the replay was not a replay"
 
 
+def test_a_DESIGNATION_MADE_AFTER_THE_CACHE_WRITE_still_binds_the_replay(
+    seated, upstream
+):
+    """⚠ THE CACHE MUST NOT OUTLIVE A DESIGNATION.
+
+    Filtering before the cache write (the test above) protects records that
+    were designated when the entry was written. It does nothing for a record
+    designated AFTER — and the idempotency TTL is 24 hours. Anthony designates
+    a record; a seat that read it an hour ago with an idempotency key would go
+    on being served it all day, through the one route that never reads the
+    index. Fresh-per-request (below) is the promise; this is the route that
+    would have quietly excepted itself from it.
+    """
+    upstream["result"] = {
+        "ok": True,
+        "result": {"items": [dict(ORDINARY), dict(SECRET, claim_id=SECRET_ID)]},
+    }
+    c = seat_client()
+    body = {
+        "tool": "recall_insights",
+        "arguments": {"query": "x"},
+        "idempotency_key": "k-late",
+    }
+    hdr = {"X-Sovereign-Seat": SEAT}
+    first = c.post("/api/call", json=body, headers=hdr).json()
+    assert first["withheld_protected"] == 1
+    assert len(first["result"]["items"]) == 1
+
+    # Anthony designates the OTHER record, after the cache entry exists.
+    seated(
+        json.dumps(
+            {
+                "action": "protect",
+                "claim_id": SECRET_ID,
+                "stakes_archive_id": STAKES_ARCHIVE_ID,
+                "designated_by": "t",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "action": "protect",
+                "claim_id": claim_id(ORDINARY),
+                "stakes_archive_id": "c" * 64,
+                "designated_by": "t",
+            }
+        )
+        + "\n"
+    )
+
+    replay = c.post("/api/call", json=body, headers=hdr).json()
+    assert replay.get("idempotent_replay") is True, "not a replay; the test proves nothing"
+    assert len(upstream["seen"]) == 1, "the replay was not a replay"
+    assert replay["result"]["items"] == [], (
+        "the idempotency cache served a record designated after it was written"
+    )
+    assert replay["withheld_protected"] == 1
+
+
+def test_an_error_envelope_does_not_grow_a_null_result_on_the_seat_path(
+    seated, upstream
+):
+    """The filter REPLACES a result; it must not INVENT one. A failed call
+    carries {ok, error, failure_class} and no `result` key on every other auth
+    path — stamping a null one here would make the seat path's failures a
+    different shape than everyone else's, which is a contract change nobody
+    asked for and no consumer would learn about until it broke.
+    """
+    upstream["result"] = {"ok": False, "error": "upstream said no", "failure_class": "tool"}
+    body = call("recall_insights", query="x").json()
+    assert body["ok"] is False
+    assert "result" not in body, "the seat path invented a null result on an error"
+    assert body["withheld_protected"] == 0, "the filter must still say it ran"
+
+
 # ── The index itself ────────────────────────────────────────────────────────
 
 

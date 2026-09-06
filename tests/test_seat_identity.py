@@ -676,6 +676,50 @@ def test_signal_ack_is_refused_when_the_stack_has_no_caller_channel(
     assert call(client(), "recall_insights", seat_hdr()).status_code == 200
 
 
+def test_the_caller_channel_is_measured_in_the_WRONG_PROCESS(monkeypatch):
+    """⚠ THE D1 RESIDUAL, PINNED. A PASSING TEST THAT DOCUMENTS A BOUND.
+
+    The three tests above prove this bridge sets and resets the contextvar
+    correctly around the dispatch. They cannot prove the STACK reads it,
+    because the stub that stands in for `dispatch_context` lives in the pytest
+    process and so does the fake upstream. The real dispatch does not:
+    `call_mcp_tool` opens `sse_client(MCP_SSE_URL)` to another process, and a
+    contextvar is per-process.
+
+    Two assertions, and together they are the whole finding:
+
+      1. the dispatch crosses a process boundary (an http:// SSE transport);
+      2. the refusal lifts on a LOCAL IMPORT SUCCEEDING — a fact about this
+         process, measured on a channel that terminates in this process.
+
+    So the day `sovereign_stack/dispatch_context.py` becomes importable here,
+    signal_ack starts returning 200 for seats whether or not the seat reaches
+    the handler. That is a fail-open on a timer, and it is the stack's half of
+    the contract to close (carry the seat across the SSE hop). This test exists
+    so nobody reads the green suite as evidence the channel works, and so the
+    day the assumption changes, something says so out loud.
+    """
+    import inspect
+
+    assert bridge.MCP_SSE_URL.startswith(("http://", "https://")), (
+        "the dispatch is no longer an out-of-process transport — re-derive this bound"
+    )
+    src = inspect.getsource(bridge.call_mcp_tool)
+    assert "sse_client(MCP_SSE_URL" in src, (
+        "call_mcp_tool no longer dispatches over SSE; if it now runs the tool "
+        "IN-PROCESS the contextvar would actually reach it, and this whole "
+        "residual should be re-measured rather than left as prose"
+    )
+
+    # The refusal keys on an import in THIS process, nothing more.
+    monkeypatch.setattr(si, "dispatch_context_module", lambda: object())
+    assert si.actor_channel_refusal("signal_ack") is None, (
+        "a bare local import is what lifts the refusal — that is the bound"
+    )
+    monkeypatch.setattr(si, "dispatch_context_module", lambda: None)
+    assert si.actor_channel_refusal("signal_ack")[0] == "no_caller_channel"
+
+
 def test_a_bearer_call_carries_no_seat_and_no_actor(
     registry, calls, surface, caller_channel
 ):

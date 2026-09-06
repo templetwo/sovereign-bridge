@@ -522,6 +522,35 @@ SEAT_SIGNABLE_TOOLS = frozenset(
 # would name the wrong closer while looking correct. So the tool is REFUSED to
 # seats rather than served through a degraded channel. Falling back to the
 # argument is exactly the fix this amendment removes.
+#
+# ⚠⚠ THE RESIDUAL, STATED EXACTLY, BECAUSE IT IS NOT CLOSED AND MUST NOT ARRIVE
+# AS A SURPRISE (the D6 discipline applied to D1). THE GUARD BELOW MEASURES THE
+# WRONG PROCESS.
+#
+#   `bridge.call_mcp_tool` dispatches over `sse_client(MCP_SSE_URL)` to
+#   127.0.0.1:3434, which is the sovereign-sse process. The stack's tool
+#   handlers run THERE. `set_caller_seat` runs HERE, in the bridge process. A
+#   `contextvars.ContextVar` is per-process, so nothing this bridge sets around
+#   the dispatch is visible to the handler that answers it — not today, and not
+#   after the stack ships `dispatch_context`, unless the stack ALSO carries the
+#   seat across the SSE hop (an MCP request field, a per-call header, a
+#   sse-side context set from one — the stack's design, not the bridge's).
+#
+#   TODAY THIS IS SAFE ONLY BY ACCIDENT OF TIMING: the module is absent, so
+#   `actor_channel_refusal` refuses and no seat reaches signal_ack. THE FAILURE
+#   IS ON A TIMER. The moment `sovereign_stack/dispatch_context.py` exists on
+#   this machine's importable stack, the guarded import here SUCCEEDS, the
+#   refusal lifts, signal_ack returns 200, and the handler one process over
+#   reads an unset contextvar and falls back to the shared server session — the
+#   exact wrong-closer record the refusal exists to prevent, arriving silently
+#   because the thing that lifted the guard was importability in a process that
+#   does not dispatch.
+#
+#   The bridge half of D1 is implemented as HQ specified and is NOT
+#   demonstrated end to end; `test_the_caller_channel_is_measured_in_the_WRONG_
+#   PROCESS` pins the bound so a green suite cannot be read as a working
+#   channel. Closing it is a contract question for HQ and the stack, not a
+#   thing this repo can decide alone.
 SEAT_ACTOR_TOOLS = frozenset({"signal_ack"})
 
 # Names a client must not be able to put on the wire for those tools. Scoped to
@@ -555,7 +584,14 @@ def dispatch_context_module():
 
 
 def actor_channel_refusal(tool: str) -> tuple[str, str] | None:
-    """Refuse a seat call whose identity has nowhere trustworthy to travel."""
+    """Refuse a seat call whose identity has nowhere trustworthy to travel.
+
+    ⚠ WHAT THIS ACTUALLY TESTS is whether `sovereign_stack.dispatch_context` is
+    IMPORTABLE IN THE BRIDGE PROCESS. That is not the same question as whether
+    the verified seat reaches the process that runs the tool — see the residual
+    stated in full above SEAT_ACTOR_TOOLS. Do not read a lifted refusal as a
+    working channel.
+    """
     if tool not in SEAT_ACTOR_TOOLS:
         return None
     if dispatch_context_module() is not None:

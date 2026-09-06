@@ -20,8 +20,26 @@ turned them into decisions D1–D10. Each is closed below with a test that fails
   alone would match nothing, silently, the day the upstream preimage changed. An unreadable
   index shuts the whole seat path, as an unreadable registry already does. The filter runs
   BEFORE the idempotency store is written, or a replay would serve the withheld record back
-  around the guard. Master path unchanged.
-  *`tests/test_seat_protected.py`, 19 tests.*
+  around the guard. **And a replay is RE-CERTIFIED, not served as stored** — the cache holds
+  what was protected when it was written, and the idempotency TTL is 24 hours, so a record
+  designated after a cached read would otherwise go on being served all day through the one
+  seat route that never reads the index. That route was the single exception to
+  fresh-per-request; it no longer is. Master path unchanged. The filter also *replaces* a
+  result and never *invents* one: an error envelope carries no `result` key on any other
+  auth path and does not grow a null one here.
+  *`tests/test_seat_protected.py`, 21 tests.*
+
+- **D1 RESIDUAL, STATED RATHER THAN CLAIMED — THE IN-PROCESS CHANNEL DOES NOT CROSS THE
+  DISPATCH.** The bridge sets the verified seat on `sovereign_stack.dispatch_context` around
+  the call and resets it in a `finally`, exactly as HQ specified. But `call_mcp_tool`
+  dispatches over SSE to 127.0.0.1:3434 — the sovereign-sse process — and a contextvar is
+  per-process, so nothing set here is visible to the handler that answers. Today that is
+  harmless only by timing: the module does not exist, so `signal_ack` is refused. When it
+  lands, the guarded import here succeeds, the refusal lifts, and `signal_ack` answers seats
+  whether or not the identity arrives, because the refusal keys on importability in a
+  process that does not dispatch. Not closed here; the stack must carry the seat across the
+  hop. Pinned so a green suite cannot be misread.
+  *`tests/test_seat_identity.py::test_the_caller_channel_is_measured_in_the_WRONG_PROCESS`.*
 
 - **F2, P2 — THE DESCRIPTOR RESIDUAL, STATED EXACTLY RATHER THAN CLOSED.** Identity is the
   kernel-reported peer **at ASGI entry**, which is after the headers and before the body: a

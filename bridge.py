@@ -506,6 +506,45 @@ def _idem_put(key: str, principal: str, tool: str, result: dict) -> None:
         pass
 
 
+def _certify_seat_result(
+    result: dict, seat_id: str, tool: str, protected_index, audit_pids: dict
+) -> dict:
+    """Drop every designated entry from a seat-bound response (D4, review F1).
+
+    Runs on BOTH routes out of /api/call: the freshly dispatched result AND an
+    idempotency replay. The replay leg is not belt-and-braces. A cache entry
+    was certified against the index as it stood when it was WRITTEN, so a
+    designation made since then would not reach a replaying caller for the
+    whole 24h TTL — and reading the index fresh on every request, which is the
+    property that makes a designation take effect immediately, would be
+    defeated by the one path that skips it.
+    """
+    try:
+        filtered, withheld = si.filter_protected(result.get("result"), protected_index)
+    except si.ProtectedIndexUnreadable as exc:
+        # Reached only by the response-size guard: a payload too large to walk
+        # cannot be certified, so it is withheld whole rather than returned
+        # with an unchecked tail.
+        si.audit(seat_id, tool, "denied", "protected_filter_incomplete", **audit_pids)
+        raise ScopeHTTPException(
+            status_code=403,
+            detail=(
+                f"The response to {tool!r} cannot be certified free of "
+                f"protected material ({exc}), so it is withheld whole."
+            ),
+        )
+    # REPLACE a result the envelope already carries; never INVENT one. An error
+    # envelope has no "result" key, and stamping a null one there would change
+    # the shape of every seat-path failure relative to every other path.
+    if "result" in result:
+        result["result"] = filtered
+    # STATED EVEN WHEN ZERO. "the filter ran and removed nothing" and "the
+    # filter did not run" are different facts and a reader must be able to tell
+    # them apart — an absent field would collapse them (SOP #2).
+    result["withheld_protected"] = withheld
+    return result
+
+
 async def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
     try:
         async with sse_client(MCP_SSE_URL, headers=_MCP_SSE_HEADERS) as (read, write):
@@ -1734,6 +1773,14 @@ async def call_tool_endpoint(
         cached = _idem_get(idem_key, principal, req.tool)
         if cached is not None:
             replay = dict(cached)
+            # ⚠ A REPLAY IS RE-CERTIFIED, NOT SERVED AS STORED. See
+            # _certify_seat_result: the cache holds what was protected when it
+            # was written, and this is the one seat route that would otherwise
+            # outlive a designation.
+            if seat_id is not None:
+                replay = _certify_seat_result(
+                    replay, seat_id, req.tool, protected_index, _audit_pids
+                )
             replay["idempotent_replay"] = True
             replay["duration_ms"] = round((time.time() - start) * 1000)
             return replay
@@ -1770,25 +1817,9 @@ async def call_tool_endpoint(
     # around the guard. The filter runs on the object that is both returned AND
     # cached.
     if seat_id is not None:
-        try:
-            filtered, withheld = si.filter_protected(result.get("result"), protected_index)
-        except si.ProtectedIndexUnreadable as exc:
-            # Reached only by the response-size guard: a payload too large to
-            # walk cannot be certified, so it is withheld whole rather than
-            # returned with an unchecked tail.
-            si.audit(seat_id, req.tool, "denied", "protected_filter_incomplete", **_audit_pids)
-            raise ScopeHTTPException(
-                status_code=403,
-                detail=(
-                    f"The response to {req.tool!r} cannot be certified free of "
-                    f"protected material ({exc}), so it is withheld whole."
-                ),
-            )
-        result["result"] = filtered
-        # STATED EVEN WHEN ZERO. "the filter ran and removed nothing" and "the
-        # filter did not run" are different facts and a reader must be able to
-        # tell them apart — an absent field would collapse them (SOP #2).
-        result["withheld_protected"] = withheld
+        result = _certify_seat_result(
+            result, seat_id, req.tool, protected_index, _audit_pids
+        )
 
     result["duration_ms"] = round((time.time() - start) * 1000)
 
