@@ -25,6 +25,7 @@ work; instances just prefer record_insight with addressed-letter shape.
 """
 
 import asyncio
+import hashlib
 import hmac
 import json
 import os
@@ -222,6 +223,7 @@ class CommsMessage(BaseModel):
 # === Auth ===
 import session_tokens as st
 import seat_identity as si
+import seat_socket as ss
 
 
 class ScopeHTTPException(HTTPException):
@@ -335,11 +337,18 @@ def check_auth_or_seat(
     routes (batch, tools, admin mint/revoke, approval, comms). Teaching it about
     seats would put the seat path on all of them by default — the opposite of
     default-deny. The seat surface is one route, on purpose.
+
+    THE PEER COMES FROM THE ASGI SCOPE EXTENSION, NEVER FROM A HEADER OR FROM
+    request.client. seat_socket stamps a kernel-verified identity there when the
+    request arrived on the seat's Unix socket; uvicorn builds an http scope with
+    no `extensions` key at all, so a TCP caller cannot manufacture one at any
+    price. `.get` returning None is the whole TCP denial, and it fails closed by
+    construction rather than by a check somebody has to remember to write.
     """
     if authorization is not None or not seat_header:
         return check_auth(authorization, allow_session=True)
 
-    peer = request.client.host if request.client else None
+    peer = (request.scope.get("extensions") or {}).get(ss.SEAT_PEER_EXT)
     try:
         return si.resolve_seat(peer, seat_header, request.headers)
     except si.SeatDenied as denied:
@@ -352,8 +361,54 @@ def check_auth_or_seat(
 # File-backed, TTL-pruned. A repeated idempotency_key replays the cached success
 # instead of re-calling the tool, so a client that lost the response can retry
 # without double-writing. A corrupt/missing cache never breaks a call.
+#
+# ⚠ THE STORAGE KEY IS NOT THE CALLER'S KEY, AND THAT IS THE FIX.
+#
+# Codex review 2026-09-06 (P1 CACHE): entries were retrieved by the supplied
+# idempotency_key ALONE, with no caller, tool or argument binding. Two
+# consequences, both proven live:
+#
+#   * A seat requesting an ALLOWED tool received a cached MASTER-ONLY result —
+#     200, idempotent_replay=true, zero upstream calls. Every scope check in
+#     this file ran and passed, and then the cache handed over an answer the
+#     scope check would never have permitted. A cache in front of an authz
+#     boundary that does not know about the boundary IS the boundary's hole.
+#   * A colliding key SUPPRESSED another seat's write: the second caller got
+#     the first caller's result and its own write never happened. Silent, and
+#     indistinguishable from success.
+#
+# Verifying the fields on retrieval would fix the first and not the second — a
+# collision would then be an error instead of a wrong answer, but the write is
+# still lost. So the PRINCIPAL, TOOL AND ARGUMENTS ARE HASHED INTO THE STORAGE
+# KEY: a colliding user key cannot name another principal's entry at all, and
+# two principals using "retry-1" simply have two different entries.
 _IDEM_PATH = Path(os.path.expanduser("~/.sovereign/bridge/idempotency.json"))
 _IDEM_TTL = 24 * 3600
+
+
+def _idem_principal(ctx) -> str:
+    """Who is asking, as one opaque string. Never None, never empty — an
+    unlabelled principal would pool every anonymous caller into one namespace,
+    which is the bug in miniature."""
+    if isinstance(ctx, dict):
+        if ctx.get("kind") == "seat":
+            return f"seat:{ctx.get('seat_id')}"
+        if ctx.get("token_id"):
+            return f"session:{ctx.get('token_id')}"
+    return "master"
+
+
+def _idem_storage_key(principal: str, tool: str, arguments: Any, client_key: str) -> str:
+    """The real cache key. Computed AFTER sign_arguments, so a seat's signed
+    call and an unsigned one are different entries — which they are.
+
+    Canonical JSON: sorted keys, no whitespace, `default=str` so an
+    unserialisable argument degrades to a stable string instead of raising and
+    knocking out the whole write path.
+    """
+    canonical = json.dumps(arguments, sort_keys=True, separators=(",", ":"), default=str)
+    material = "\x1f".join([principal, tool, canonical, client_key])
+    return hashlib.sha256(material.encode("utf-8", "replace")).hexdigest()
 
 
 def _idem_load() -> dict:
@@ -363,18 +418,24 @@ def _idem_load() -> dict:
         return {}
 
 
-def _idem_get(key: str):
+def _idem_get(key: str, principal: str, tool: str):
     entry = _idem_load().get(key)
-    if entry and (time.time() - entry.get("ts", 0)) < _IDEM_TTL:
-        return entry.get("result")
-    return None
+    if not entry or (time.time() - entry.get("ts", 0)) >= _IDEM_TTL:
+        return None
+    # Belt to the keying's suspenders. The hash already makes a cross-principal
+    # or cross-tool hit impossible; this makes a hash collision, or a cache file
+    # written by an older build with the old flat keys, fail CLOSED rather than
+    # replay somebody else's answer.
+    if entry.get("principal") != principal or entry.get("tool") != tool:
+        return None
+    return entry.get("result")
 
 
-def _idem_put(key: str, result: dict) -> None:
+def _idem_put(key: str, principal: str, tool: str, result: dict) -> None:
     try:
         now = time.time()
         d = {k: v for k, v in _idem_load().items() if (now - v.get("ts", 0)) < _IDEM_TTL}
-        d[key] = {"result": result, "ts": now}
+        d[key] = {"result": result, "ts": now, "principal": principal, "tool": tool}
         _IDEM_PATH.parent.mkdir(parents=True, exist_ok=True)
         _IDEM_PATH.write_text(json.dumps(d))
     except Exception:
@@ -719,6 +780,40 @@ async def _clock_probe_loop() -> None:
         await asyncio.sleep(CLOCK_PROBE_INTERVAL)
 
 
+def seat_socket_path() -> Path:
+    """Where the seat socket lives. Derived from seat_identity.sovereign_root()
+    so SOVEREIGN_ROOT redirection moves it — a module-level constant here would
+    make the tests' tmp redirection a no-op and bind the LIVE path instead,
+    which is the trap seat_identity.sovereign_root() already documents."""
+    return si.sovereign_root() / "hq" / "seats" / "bridge.sock"
+
+
+async def _start_seat_socket(app: FastAPI):
+    """Bind the seat socket, but ONLY if the seat registry exists.
+
+    THE REGISTRY IS ALREADY THE DEPLOY SWITCH (seat_identity's docstring: no
+    enable flag, because "a config that assumes a merge" is a shape this house
+    has been bitten by). Reusing it here means one switch, not two: no registry,
+    no socket, no listener, nothing to reason about. It also means this branch
+    binds nothing on a machine where Anthony has not turned the feature on —
+    including, today, this one.
+
+    Failure to bind is logged and swallowed on purpose: a bridge that will not
+    START because a supplementary listener could not bind has turned a
+    seat-path outage into a total outage. The seat path then simply stays shut,
+    which is the same answer it gives with no registry.
+    """
+    if not si.registry_path().exists():
+        return None
+    try:
+        server = await ss.start(app, seat_socket_path())
+        si.audit_log.info("seat socket listening at %s", seat_socket_path())
+        return server
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        si.audit_log.error("seat socket NOT started (%s): %r", seat_socket_path(), exc)
+        return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Runtime-freshness receipt: local `git` calls, bounded by GIT_PROBE_TIMEOUT
@@ -728,9 +823,16 @@ async def lifespan(app: FastAPI):
     # Start the read-only clock-drift probe daemon. It runs the first probe
     # itself (probe-then-sleep), so startup is NOT delayed waiting on sntp.
     task = asyncio.create_task(_clock_probe_loop())
+    seat_server = await _start_seat_socket(app)
     try:
         yield
     finally:
+        if seat_server is not None:
+            seat_server.close()
+            try:
+                await seat_server.wait_closed()
+            except Exception:
+                pass
         task.cancel()
         try:
             await task
@@ -1338,9 +1440,18 @@ async def call_tool_endpoint(
             "duration_ms": round((time.time() - start) * 1000),
         }
 
-    # idempotency (#3): replay a cached success for a repeated key; never double-write.
+    # idempotency (#3): replay a cached success for a repeated key; never
+    # double-write. Scoped to (principal, tool, arguments, key) — see the
+    # _IDEM_PATH block above for the two live escapes that scoping closes.
+    # Computed HERE, after the seat signer has run, so the arguments hashed are
+    # the arguments dispatched.
+    idem_key = None
     if req.idempotency_key:
-        cached = _idem_get(req.idempotency_key)
+        principal = _idem_principal(ctx)
+        idem_key = _idem_storage_key(
+            principal, req.tool, req.arguments, req.idempotency_key
+        )
+        cached = _idem_get(idem_key, principal, req.tool)
         if cached is not None:
             replay = dict(cached)
             replay["idempotent_replay"] = True
@@ -1352,8 +1463,8 @@ async def call_tool_endpoint(
         result["failure_class"] = "stack"  # (#7)
     result["duration_ms"] = round((time.time() - start) * 1000)
 
-    if req.idempotency_key and result.get("ok"):
-        _idem_put(req.idempotency_key, result)
+    if idem_key and result.get("ok"):
+        _idem_put(idem_key, _idem_principal(ctx), req.tool, result)
     return result
 
 
