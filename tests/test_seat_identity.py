@@ -677,27 +677,27 @@ def test_signal_ack_is_refused_when_the_stack_has_no_caller_channel(
 
 
 def test_the_caller_channel_is_measured_in_the_WRONG_PROCESS(monkeypatch):
-    """⚠ THE D1 RESIDUAL, PINNED. A PASSING TEST THAT DOCUMENTS A BOUND.
+    """⚠ THE HALF OF D1 THIS REPO CANNOT CLOSE, AND THE GUARD THAT MAKES ITS
+    ABSENCE SAFE.
 
     The three tests above prove this bridge sets and resets the contextvar
-    correctly around the dispatch. They cannot prove the STACK reads it,
-    because the stub that stands in for `dispatch_context` lives in the pytest
-    process and so does the fake upstream. The real dispatch does not:
-    `call_mcp_tool` opens `sse_client(MCP_SSE_URL)` to another process, and a
-    contextvar is per-process.
+    correctly around the dispatch. They cannot prove the STACK reads it: the
+    stub that stands in for `dispatch_context` and the fake upstream both live
+    in the pytest process. The real dispatch does not — `call_mcp_tool` opens
+    `sse_client(MCP_SSE_URL)` to the sovereign-sse process, and a contextvar is
+    per-process.
 
-    Two assertions, and together they are the whole finding:
+    HQ's specified condition was "refuse when the module is absent", which
+    assumes module-present implies identity-arrives. It does not. Worse, the
+    stack's dispatch entry SETS `CALLER_SEAT` from its own spiral session when
+    it arrives unset, so over the hop the outcome is not a refusal but the
+    SERVER stamped as the closer at HTTP 200. So the guard asks both questions
+    and fails closed on either.
 
-      1. the dispatch crosses a process boundary (an http:// SSE transport);
-      2. the refusal lifts on a LOCAL IMPORT SUCCEEDING — a fact about this
-         process, measured on a channel that terminates in this process.
-
-    So the day `sovereign_stack/dispatch_context.py` becomes importable here,
-    signal_ack starts returning 200 for seats whether or not the seat reaches
-    the handler. That is a fail-open on a timer, and it is the stack's half of
-    the contract to close (carry the seat across the SSE hop). This test exists
-    so nobody reads the green suite as evidence the channel works, and so the
-    day the assumption changes, something says so out loud.
+    This test is the tripwire on the assumption itself: if `call_mcp_tool` ever
+    becomes an in-process dispatch, the first assertion goes red, the guard
+    correctly stops firing, and somebody re-derives this instead of inheriting
+    a comment about a hop that no longer exists.
     """
     import inspect
 
@@ -706,18 +706,57 @@ def test_the_caller_channel_is_measured_in_the_WRONG_PROCESS(monkeypatch):
     )
     src = inspect.getsource(bridge.call_mcp_tool)
     assert "sse_client(MCP_SSE_URL" in src, (
-        "call_mcp_tool no longer dispatches over SSE; if it now runs the tool "
-        "IN-PROCESS the contextvar would actually reach it, and this whole "
-        "residual should be re-measured rather than left as prose"
+        "call_mcp_tool no longer dispatches over SSE. If it now runs the tool "
+        "IN-PROCESS the contextvar would actually reach it — re-measure the "
+        "residual and retire the guard rather than inheriting this comment"
+    )
+    assert si.dispatch_carries_context() is False, (
+        "the predicate disagrees with the source it reads"
     )
 
-    # The refusal keys on an import in THIS process, nothing more.
+    # A present module is NOT sufficient: the refusal stands, under its own
+    # reason, and the detail tells the operator not to hunt for a missing file.
     monkeypatch.setattr(si, "dispatch_context_module", lambda: object())
-    assert si.actor_channel_refusal("signal_ack") is None, (
-        "a bare local import is what lifts the refusal — that is the bound"
-    )
+    reason, detail = si.actor_channel_refusal("signal_ack")
+    assert reason == "channel_cannot_cross_dispatch"
+    assert "the file is there and the hop is the problem" in detail
+    assert "across the hop" in detail.lower()
+
+    # An absent module is the other refusal, and it keeps its own name.
     monkeypatch.setattr(si, "dispatch_context_module", lambda: None)
     assert si.actor_channel_refusal("signal_ack")[0] == "no_caller_channel"
+
+    # Neither refusal touches any other tool.
+    assert si.actor_channel_refusal("recall_insights") is None
+
+
+def test_an_unreadable_dispatch_is_a_refusal_not_a_permission(monkeypatch):
+    """FAIL CLOSED ON THE QUESTION ITSELF. `dispatch_carries_context` answers
+    by reading the dispatch's source; a dispatch whose source cannot be read is
+    a dispatch nobody can vouch for, and "I could not tell" must land on the
+    same side as "no"."""
+
+    class _Unreadable:
+        pass
+
+    monkeypatch.setattr(bridge, "call_mcp_tool", _Unreadable())
+    assert si.dispatch_carries_context() is False
+    monkeypatch.delattr(bridge, "call_mcp_tool")
+    assert si.dispatch_carries_context() is False
+
+
+def test_the_guard_retires_itself_when_the_dispatch_comes_in_process(monkeypatch):
+    """The other direction, so the guard is not a permanent denial by accident.
+    Replace the dispatch with one that runs here, and the seat really does
+    reach it — the predicate says so and the refusal lifts."""
+
+    async def in_process(tool, args):  # no SSE anywhere in this source
+        return {"ok": True, "result": None}
+
+    monkeypatch.setattr(bridge, "call_mcp_tool", in_process)
+    monkeypatch.setattr(si, "dispatch_context_module", lambda: object())
+    assert si.dispatch_carries_context() is True
+    assert si.actor_channel_refusal("signal_ack") is None
 
 
 def test_a_bearer_call_carries_no_seat_and_no_actor(

@@ -29,17 +29,24 @@ turned them into decisions D1–D10. Each is closed below with a test that fails
   auth path and does not grow a null one here.
   *`tests/test_seat_protected.py`, 21 tests.*
 
-- **D1 RESIDUAL, STATED RATHER THAN CLAIMED — THE IN-PROCESS CHANNEL DOES NOT CROSS THE
-  DISPATCH.** The bridge sets the verified seat on `sovereign_stack.dispatch_context` around
-  the call and resets it in a `finally`, exactly as HQ specified. But `call_mcp_tool`
-  dispatches over SSE to 127.0.0.1:3434 — the sovereign-sse process — and a contextvar is
-  per-process, so nothing set here is visible to the handler that answers. Today that is
-  harmless only by timing: the module does not exist, so `signal_ack` is refused. When it
-  lands, the guarded import here succeeds, the refusal lifts, and `signal_ack` answers seats
-  whether or not the identity arrives, because the refusal keys on importability in a
-  process that does not dispatch. Not closed here; the stack must carry the seat across the
-  hop. Pinned so a green suite cannot be misread.
-  *`tests/test_seat_identity.py::test_the_caller_channel_is_measured_in_the_WRONG_PROCESS`.*
+- **D1 IS NOT CLOSED, AND THE GUARD HQ SPECIFIED WOULD HAVE LIFTED ITSELF.** The bridge sets
+  the verified seat on `sovereign_stack.dispatch_context` around the call and resets it in a
+  `finally`, exactly as specified. But `call_mcp_tool` dispatches over SSE to 127.0.0.1:3434
+  — the sovereign-sse process, and this bridge's only dispatch — and a contextvar is
+  per-process, so nothing set here is visible to the handler. **The stack does not leave that
+  gap empty:** its dispatch entry sets `CALLER_SEAT` from its own spiral session when it
+  arrives unset, on the premise that "the bridge establishes its kernel-verified seat
+  in-process before calling in", which is false over this hop. The record would name **the
+  server** as the closer, at 200, with `outcome=allowed` in our own audit line.
+  "Refuse when the module is absent" assumes module-present == identity-arrives, so it would
+  have lifted the refusal on the next stack deploy with nothing going red. The guard now asks
+  both questions and fails closed on either — `no_caller_channel` and
+  `channel_cannot_cross_dispatch`, two facts, two strings, the second saying the file is
+  present and the hop is the problem. Nothing observable changes today; it changes the deploy
+  after. The end-to-end property is the stack's to close.
+  *`tests/test_seat_identity.py::test_the_caller_channel_is_measured_in_the_WRONG_PROCESS`,
+  `::test_an_unreadable_dispatch_is_a_refusal_not_a_permission`,
+  `::test_the_guard_retires_itself_when_the_dispatch_comes_in_process`.*
 
 - **F2, P2 — THE DESCRIPTOR RESIDUAL, STATED EXACTLY RATHER THAN CLOSED.** Identity is the
   kernel-reported peer **at ASGI entry**, which is after the headers and before the body: a
