@@ -404,7 +404,7 @@ def test_governance_tool_is_denied_to_a_seat(registry, calls):
     on the reason the code gives, which changes to 'unmapped' the moment the
     explicit denial goes away.
     """
-    for tool in ("set_policy", "open_protected_record", "resolve_thread_by_id", "govern"):
+    for tool in ("set_policy", "open_protected_record", "resolve_thread", "govern"):
         r = call(client(), tool, seat_hdr())
         assert r.status_code == 403, f"{tool} reached the stack"
         assert r.json()["failure_class"] == "scope"
@@ -412,51 +412,148 @@ def test_governance_tool_is_denied_to_a_seat(registry, calls):
     assert not calls
 
 
-def test_a_governance_tool_mapped_into_write_is_still_denied(monkeypatch):
-    """The scenario the explicit list exists for, simulated: someone adds a
-    governance tool to TOOL_SCOPES as 'write'. Default-deny no longer covers it.
-    SEAT_NEVER_TOOLS must."""
+def test_a_governance_tool_is_denied_however_it_is_classified_elsewhere(monkeypatch):
+    """The scenario the explicit list exists for: someone reclassifies a
+    governance tool somewhere else in the codebase. SEAT_NEVER_TOOLS must still
+    hold, because it is the only list that is ABOUT governance."""
     monkeypatch.setitem(st.TOOL_SCOPES, "set_policy", "write")
     assert si.seat_tool_allowed("set_policy") == (False, "governance")
     assert "set_policy" not in si.seat_allowed_tools()
 
 
-def test_session_scope_tools_are_denied_to_a_seat(registry, calls):
-    """close_session / spiral_inherit mutate global spiral state and sit in the
-    'session' scope, which a read+write grant does not carry. A seat is a
-    read+write grant, so it does not carry it either."""
+def test_session_lifecycle_tools_stay_as_they_were(registry, calls):
+    """ANTHONY'S RULING, the clause that is a NON-change: "close_session /
+    spiral_inherit stay as they were."
+
+    They mutate GLOBAL spiral state — the session id and phase every other seat
+    then reads — so widening the surface to all studio seats does not reach
+    them. This test exists because it is the easiest clause to lose while
+    implementing the widening around it.
+    """
     for tool in ("close_session", "spiral_inherit"):
-        assert not si.seat_tool_allowed(tool)[0]
+        assert si.seat_tool_allowed(tool) == (False, "governance"), tool
         assert call(client(), tool, seat_hdr()).status_code == 403
     assert not calls
 
 
-def test_unsignable_writes_are_denied(registry, calls):
-    """Every write on this path must sign itself. A write tool with no field to
-    sign into is refused rather than written unsigned — narrowing the surface,
-    never widening it."""
-    for tool in ("archive_exchange", "reflection_ack", "spiral_reflect"):
-        r = call(client(), tool, seat_hdr())
-        assert r.status_code == 403, f"{tool} was allowed to write unsigned"
-        assert "sign" in r.json()["detail"]
+def test_the_ruling_widened_the_surface_to_the_published_tools(registry, calls):
+    """ANTHONY'S RULING, 2026-09-06: "all studio seats are trusted."
+
+    THE SHAPE: allowed = published surface − governance − retired. Asserted as
+    the equation, not as a hand-copied list, so a future edit to any one of the
+    three constants moves the surface and this test follows it.
+
+    The counts are pinned separately below; here the point is that the surface
+    is no longer st.TOOL_SCOPES. Before the ruling a seat reached 21 of 100
+    published tools and could not call the boot door it is TOLD to call.
+    """
+    allowed = set(si.seat_allowed_tools())
+    expected = si.SEAT_TOOL_SURFACE - si.SEAT_NEVER_TOOLS - si.SEAT_RETIRED_TOOLS
+    assert allowed == expected
+    old_surface = {t for t, s in st.TOOL_SCOPES.items() if s in ("read", "write")}
+    assert len(allowed) > 2 * len(old_surface), "the ruling widened the surface"
+
+
+def test_the_widening_also_NARROWS_in_exactly_two_places(registry, calls):
+    """⚠ AN HONEST CONSEQUENCE, PINNED SO IT CANNOT BE DISCOVERED BY SURPRISE.
+
+    Anthony's ruling is a widening — 19 tools to 48 — but subtracting the
+    RETIRED set takes away two tools a read+write SESSION grant can still call
+    today: `ask_scribe` (read) and `reflection_ack` (write). So a seated Studio
+    terminal, which the ruling calls TRUSTED, reaches two fewer tools than an
+    outside visitor holding a scoped token. That is backwards on its face.
+
+    IT IS IMPLEMENTED THAT WAY ON PURPOSE, and the reason is jurisdiction, not
+    conviction. The stack has no RETIRED set, so this release derives one from
+    the 30-day census's Total-0 rows as instructed. The census's OWN §4 marks
+    `reflection_ack` with ★ — "keep these reachable" — so there is a live
+    argument that both belong back in the surface.
+
+    Two ways to make this test go green, and the difference matters: if the
+    stack lands a real RETIRED set that omits them, they return and the count
+    below moves. If Anthony rules that a seat is never narrower than a session
+    grant, add that subtraction to seat_tool_allowed. Neither is HQ's to decide
+    quietly (pol_20260831), so it is measured, named, and left where he can see
+    it rather than fixed by someone's judgement at 2am.
+    """
+    session_grant = {t for t, s in st.TOOL_SCOPES.items() if s in ("read", "write")}
+    lost = session_grant - set(si.seat_allowed_tools())
+    assert lost == {"ask_scribe", "reflection_ack"}
+    for tool in sorted(lost):
+        assert si.seat_tool_allowed(tool) == (False, "retired_unused_30d"), tool
+
+
+def test_tools_the_old_scope_map_never_carried_are_now_reachable(registry, calls):
+    """The ruling in its concrete form. Each of these was master-only by
+    default-deny an hour ago; each is an ordinary act for a seated terminal.
+
+    where_did_i_leave_off is the headline: every arriving seat is instructed to
+    call it, and no seat but the master could.
+    """
+    for tool in (
+        "where_did_i_leave_off",
+        "record_catch",
+        "record_learning",
+        "supersede_insight",
+        "thread_touch",
+        "self_model",
+        "the_ground",
+        "signals_summary",
+    ):
+        assert si.seat_tool_allowed(tool) == (True, "ok"), tool
+        assert call(client(), tool, seat_hdr()).status_code == 200, tool
+    assert len(calls) == 8
+
+
+def test_resolve_thread_by_id_is_a_seats_ordinary_act(registry, calls):
+    """The ruling names this one explicitly: keep it ALLOWED. Closing a thread
+    by its id is authorship. Bare `resolve_thread` — which resolves by MATCH,
+    across threads a seat may not own — stays governance."""
+    assert si.seat_tool_allowed("resolve_thread_by_id") == (True, "ok")
+    assert si.seat_tool_allowed("resolve_thread") == (False, "governance")
+    assert call(client(), "resolve_thread_by_id", seat_hdr()).status_code == 200
+
+
+def test_a_tool_the_stack_no_longer_serves_is_denied_as_retired(registry, calls):
+    """"minus anything the stack retires." The reason word says what was
+    actually measured — 30-day disuse — rather than claiming the tool is gone,
+    because the census this falls back to measures use, not retirement."""
+    allowed, reason = si.seat_tool_allowed("synthesize_now")
+    assert (allowed, reason) == (False, "retired_unused_30d")
+    r = call(client(), "synthesize_now", seat_hdr())
+    assert r.status_code == 403
+    assert "census" in r.json()["detail"]
     assert not calls
 
 
-def test_master_only_tool_is_denied_to_a_seat(registry, calls):
-    """Unmapped => master-only, by the same default-deny session tokens use.
-    where_did_i_leave_off is the named example and stays master-only."""
-    r = call(client(), "where_did_i_leave_off", seat_hdr())
+def test_governance_beats_retirement_when_a_tool_is_both(registry, calls):
+    """Six names are in both sets. The reason given must be the one that will
+    still be true after the next census: governance."""
+    both = si.SEAT_NEVER_TOOLS & si.SEAT_RETIRED_TOOLS
+    assert both, "the overlap is the premise of this test"
+    for tool in sorted(both & si.SEAT_TOOL_SURFACE):
+        assert si.seat_tool_allowed(tool) == (False, "governance"), tool
+
+
+def test_a_tool_the_stack_adds_later_is_denied_until_it_is_added_here(registry, calls):
+    """DEFAULT-DENY SURVIVED THE WIDENING, and this is the proof. The base set
+    is an ENUMERATION of what the stack publishes, not "whatever the caller
+    names", so a name this release never heard of is refused."""
+    assert si.seat_tool_allowed("some_tool_invented_next_week") == (False, "unpublished")
+    r = call(client(), "some_tool_invented_next_week", seat_hdr())
     assert r.status_code == 403
     assert not calls
 
 
-def test_seat_surface_is_derived_from_the_session_scope_map():
-    """Not hand-listed. If TOOL_SCOPES grows a read/write tool, the seat surface
-    follows it — and a new WRITE tool is denied until it can sign."""
-    allowed = set(si.seat_allowed_tools())
-    read_write = {t for t, s in st.TOOL_SCOPES.items() if s in ("read", "write")}
-    assert allowed <= read_write, "the seat path widened beyond read+write"
-    assert allowed >= {t for t, s in st.TOOL_SCOPES.items() if s == "read"}
+def test_the_published_surface_matches_the_stack_release_it_shipped_beside():
+    """The enumeration is a MEASUREMENT with a date on it, so pin its size. A
+    silent drift in this constant would silently change the policy: names lost
+    become `unpublished` denials, names invented become grants."""
+    assert len(si.SEAT_TOOL_SURFACE) == 100
+    assert len(si.seat_allowed_tools()) == 48
+    assert len(si.seat_denied_tools()) == 52
+    reasons = {r for _, r in si.seat_denied_tools()}
+    assert reasons == {"governance", "retired_unused_30d"}
 
 
 # ── Signing ─────────────────────────────────────────────────────────────────
@@ -488,11 +585,65 @@ def test_reads_that_declare_source_instance_are_signed_too(registry, calls):
 
 def test_unsignable_tools_are_never_injected_into(registry, calls):
     """Injecting source_instance into a tool that does not declare it is a hard
-    ValueError upstream (_reject_unknown_params) or a silent drop. Neither is
-    acceptable, so the bridge must not inject — which it enforces by denying
-    those tools outright. Belt: the signer itself refuses too."""
-    args = si.sign_arguments("archive_exchange", {"content": "x", "source": "y"}, SEAT)
-    assert "source_instance" not in args
+    ValueError upstream (_reject_unknown_params) or — worse — a SILENT DROP.
+
+    The ruling widened the surface, so these tools are now ALLOWED where they
+    used to be denied. That makes this test more important, not less: the
+    bridge must still not inject into them, because a bridge that believed it
+    signed while the record landed unattributed is the exact fail-open
+    record_insight lived under until 2026-08-28.
+    """
+    for tool in ("archive_exchange", "record_catch", "thread_touch", "supersede_insight"):
+        assert si.seat_tool_allowed(tool)[0] is True, tool
+        args = si.sign_arguments(tool, {"content": "x", "source": "y"}, SEAT)
+        assert "source_instance" not in args, tool
+
+
+def test_every_signable_tool_declares_source_instance_upstream():
+    """SEAT_SIGNABLE_TOOLS is a claim ABOUT THE STACK'S SCHEMAS, and a wrong
+    entry here is a silent drop, not a loud error. So it is checked against the
+    stack source rather than trusted — the constant was derived by parsing that
+    source, and this re-derives it.
+
+    Skips rather than fails when the stack tree is not on disk: a bridge
+    checkout without its companion repo is a legitimate state, and turning that
+    into a red suite would teach people to ignore a red suite.
+    """
+    import ast
+    from pathlib import Path as _P
+
+    candidates = [
+        _P.home() / ".cache" / "wt-release-stack" / "src" / "sovereign_stack" / "server.py",
+        _P.home() / "sovereign-stack" / "src" / "sovereign_stack" / "server.py",
+    ]
+    server = next((p for p in candidates if p.exists()), None)
+    if server is None:
+        pytest.skip("sovereign-stack source not on disk")
+
+    declaring = set()
+    for node in ast.walk(ast.parse(server.read_text())):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "Tool":
+            name = None
+            declares = False
+            for kw in node.keywords:
+                if kw.arg == "name" and isinstance(kw.value, ast.Constant):
+                    name = kw.value.value
+                if kw.arg == "inputSchema" and "'source_instance'" in ast.dump(kw.value):
+                    declares = True
+            if name and declares:
+                declaring.add(name)
+
+    assert si.SEAT_SIGNABLE_TOOLS <= declaring, (
+        "a tool is signed that the stack does not declare source_instance on — "
+        "the bridge would believe it signed while the record landed unattributed: "
+        f"{sorted(si.SEAT_SIGNABLE_TOOLS - declaring)}"
+    )
+    # ...and every allowed tool that CAN sign, does.
+    signable_and_allowed = declaring & set(si.seat_allowed_tools())
+    assert signable_and_allowed <= si.SEAT_SIGNABLE_TOOLS, (
+        "a tool the stack can attribute is going unsigned: "
+        f"{sorted(signable_and_allowed - si.SEAT_SIGNABLE_TOOLS)}"
+    )
 
 
 # ── The other two auth paths are untouched ──────────────────────────────────

@@ -196,31 +196,110 @@ PROXY_HEADERS = (
 
 # ── The seat tool surface ────────────────────────────────────────────────────
 #
-# "The same tool surface a read+write session grant gets today" — so the source
-# of truth is st.TOOL_SCOPES, reused EXACTLY. Nothing is widened here. Two
-# narrowings apply on top, and both are narrowings:
+# ANTHONY'S RULING, 2026-09-06: *"all studio seats are trusted."*
+#
+# WHAT THAT REPLACED, so the change is legible rather than mysterious. Until
+# this ruling the seat surface was st.TOOL_SCOPES — the read+write session-grant
+# map, 21 tools out of a published 100 — because a seat was modelled as a
+# scoped visitor. It is not. A seat is a terminal Anthony started on his own
+# machine, and CLAUDE.md had already measured the cost of the old model: a
+# scoped seat reaches 19 of 98 tools and cannot even call
+# `where_did_i_leave_off`, the boot door every arriving seat is TOLD to call.
+# The ruling closes that.
+#
+# THE SHAPE OF THE NEW SURFACE, and it is a subtraction, not an inversion:
+#
+#     allowed  =  the published tool surface
+#                 −  governance   (Anthony's, and only Anthony's)
+#                 −  retired      (what the stack no longer serves)
+#
+# DEFAULT-DENY SURVIVES, and that matters. The base set is an ENUMERATION of
+# what the stack publishes, captured below, not "everything the caller names".
+# A tool that appears upstream and is not in SEAT_TOOL_SURFACE is denied
+# `unpublished` until somebody adds it deliberately — the same direction of
+# failure as before, just with a much larger enumerated base.
 SEAT_SCOPES = ("read", "write")
 
-# 1. Governance-shaped, denied on this path regardless of what TOOL_SCOPES ever
-#    says. st.NEVER_TOOLS already hard-denies these to session tokens; repeating
-#    them here means a governance tool later mapped into read/write by mistake
-#    still cannot reach a seat. Default-deny already covers every one of them
-#    today (none is in TOOL_SCOPES) — this is the belt to that suspenders.
+# The published surface: every tool `list_tools` returns, resolved STATICALLY
+# from the stack's own source rather than typed from memory — server.py's
+# `list_tools` inline Tool(...) registrations (56) plus the eleven imported
+# *_TOOLS constants it splices in (44). Measured 2026-09-06 against
+# sovereign-stack release/2026-09-06 @ 32b6dc8, the release branch this bridge
+# release ships beside. 100 names.
+#
+# ⚠ NOT FETCHED AT REQUEST TIME, DELIBERATELY. An allowed-set that depends on a
+# live `get_tool_inventory()` call would put a network round-trip inside the
+# auth path, and — far worse — a failed fetch would have to resolve to either
+# "allow everything" or "allow nothing". Neither is an authorization decision.
+# A static enumeration cannot fail open; it can only go stale, and a stale
+# enumeration denies a NEW tool, which is the safe direction.
+SEAT_TOOL_SURFACE = frozenset(
+    {
+        "agent_reflect", "archive_exchange", "arrive", "arrive_delta",
+        "arrive_lineage", "ask_scribe", "check_mistakes", "close_session",
+        "comms_acknowledge", "comms_channels", "comms_get_acks", "comms_recall",
+        "comms_unread_bodies", "compass_check", "complete_experiment",
+        "connectivity_status", "context_retrieve", "current_policies",
+        "decline_protected_record", "derive", "end_session_review",
+        "get_compaction_context", "get_compaction_stats", "get_growth_summary",
+        "get_inheritable_context", "get_my_patterns", "get_open_threads",
+        "get_pending_experiments", "get_unresolved_uncertainties", "govern",
+        "guardian_alerts", "guardian_audit", "guardian_baseline",
+        "guardian_mcp_audit", "guardian_quarantine", "guardian_report",
+        "guardian_scan", "guardian_status", "handoff", "handoff_acted_on",
+        "handoff_acted_on_records", "handoff_archaeology", "heartbeat",
+        "inspect_claim", "link_threads", "list_exchanges",
+        "list_protected_thresholds", "mark_uncertainty", "metabolize",
+        "my_toolkit", "nape_ack", "nape_honks", "nape_honks_with_history",
+        "nape_observe", "nape_summary", "open_protected_record",
+        "post_fix_verify", "prior_alignment_summary", "prior_for_turn",
+        "propose_experiment", "recall_exchange", "recall_insights",
+        "recall_reflections", "record_breakthrough", "record_catch",
+        "record_collaborative_insight", "record_insight", "record_learning",
+        "record_open_thread", "record_prior_alignment", "reflection_ack",
+        "reflexive_surface", "resolve_thread", "resolve_thread_by_id",
+        "resolve_uncertainty", "retire_hypothesis", "route", "scan_thresholds",
+        "season_review", "self_model", "session_handoff", "set_policy",
+        "signal_ack", "signals_summary", "spiral_inherit", "spiral_reflect",
+        "spiral_status", "stack_write_check", "start_here",
+        "store_compaction_summary", "supersede_insight", "synthesize_now",
+        "the_ground", "thread_get_touches", "thread_touch", "triage_threads",
+        "watch_cancel", "watch_resample", "watch_status",
+        "where_did_i_leave_off",
+    }
+)
+
+# ── Subtraction 1: GOVERNANCE ───────────────────────────────────────────────
+# Anthony's, and it stays Anthony's whatever "trusted" comes to mean. The
+# enumeration is his, from the ruling itself; `st.NEVER_TOOLS` is folded in so
+# a name added there later cannot reach a seat by being forgotten here.
+#
+# TWO NAMES CAME OUT OF THIS SET AND THE REMOVALS ARE PART OF THE RULING:
+#   * resolve_thread_by_id — "it is a seat's ordinary act". Closing a thread you
+#     opened, by its id, is authorship, not governance. Bare `resolve_thread`
+#     (which resolves by MATCH, across threads a seat may not own) stays denied.
+#   * triage_threads — read-shaped, never named as governance, and it was in
+#     this set only because the old model swept it up with its neighbours.
 SEAT_NEVER_TOOLS = frozenset(st.NEVER_TOOLS) | frozenset(
     {
-        # policies
+        # policies / enactment — standing law is Anthony-only, always
         "set_policy",
         "govern",
-        # protected records
+        # protected records — the drawer and its designation index
         "designate_protected",
         "list_protected_thresholds",
         "open_protected_record",
         "decline_protected_record",
-        # deletes / retirement / state rewriting
+        # retirement / cross-thread state rewriting
         "retire",
+        "retire_hypothesis",
         "resolve_thread",
-        "resolve_thread_by_id",
-        "triage_threads",
+        # session lifecycle — "stay as they were": these mutate GLOBAL spiral
+        #   state (session id, phase) that every other seat then reads. They
+        #   were out of the seat surface before the ruling and the ruling did
+        #   not name them, so they stay out.
+        "close_session",
+        "spiral_inherit",
         # tokens / grants — bridge ADMIN ROUTES, not stack tools; unreachable
         #   from this path anyway (the seat path exists only on /api/call), but
         #   named so the denial is legible rather than incidental.
@@ -228,44 +307,106 @@ SEAT_NEVER_TOOLS = frozenset(st.NEVER_TOOLS) | frozenset(
         "revoke_token",
         # audit
         "audit_decoupling",
+        # ⚠ A JUDGEMENT CALL, FLAGGED RATHER THAN BURIED — AT ANTHONY'S GATE.
+        #   signal_ack did not exist when the ruling was made (it landed today
+        #   on sovereign-stack feat/signal-ledger). The stack's OWN
+        #   SIGNAL_TOOL_INTENTS declares its intent as "govern", so it is
+        #   denied here on the stack's own label. The argument the other way is
+        #   real and belongs on the record: it is shaped exactly like
+        #   resolve_thread_by_id — a watch seat closing a signal it owns — and
+        #   it carries its own producer-cannot-close-its-own guard upstream.
+        #   Widening governance is not HQ's call to make quietly
+        #   (pol_20260831), so it is denied until Anthony says otherwise. One
+        #   line to flip. signals_summary (intent "read") is ALLOWED.
+        "signal_ack",
     }
 )
 
-# 2. Unsignable writes. Anthony's requirement is that EVERY write signs itself.
-#    A write tool whose stack schema has no field that can carry the seat id
-#    cannot sign, and the stack's _reject_unknown_params turns an injected
-#    unknown key into a hard ValueError rather than a silent drop — so
-#    injecting anyway is not an option either. Fail closed: deny the write
-#    rather than let an unsigned one through. This set shrinks as the stack
-#    grows the field; it is a to-do list, not a policy.
-SEAT_UNSIGNABLE_WRITES = frozenset(
+# ── Subtraction 2: RETIRED ──────────────────────────────────────────────────
+# "minus anything the stack retires."
+#
+# ⚠ SOURCE, AND ITS HONEST LIMIT. The stack has NO `RETIRED` constant — checked
+# 2026-09-06 across sovereign-stack release/2026-09-06 @ 32b6dc8 and every
+# local and remote ref (`git grep RETIRED_TOOLS` over all refs: empty). So this
+# falls back to the named alternative: the 48 tools with Total 0 in the 30-day
+# census, ~/.sovereign/hq/lanes/runs/tool-census-30d_result.md (gpt-6-astra,
+# window 2026-08-06..2026-09-05).
+#
+# THAT SOURCE MEASURES DISUSE, NOT RETIREMENT, AND THE CENSUS SAYS SO ITSELF.
+# Its own §3 proposes these move "to explicit discovery, not physical deletion",
+# and its §4 marks THIRTY of the 48 with ★ — "keep these reachable" — because
+# they are the recovery/close/read half of a lifecycle whose other half is live
+# (protected-record open/decline, the guardian family, watch_status/cancel,
+# uncertainty and experiment lifecycle, archive lookup). Its own headline says
+# "no observed dated call" is "not proof of never-called".
+#
+# So this constant is a PLACEHOLDER STANDING IN FOR A DECISION THE STACK HAS
+# NOT MADE. It is deliberately one name, in one place: when the stack lands a
+# real RETIRED set, re-point this at it and delete the fallback. Until then a
+# seat denied here is told `retired_unused_30d`, which says what was actually
+# measured rather than claiming the tool is gone.
+SEAT_RETIRED_TOOLS = frozenset(
     {
-        "archive_exchange",
-        "reflection_ack",
-        "spiral_reflect",
+        "agent_reflect", "arrive_delta", "ask_scribe", "comms_acknowledge",
+        "comms_unread_bodies", "complete_experiment", "decline_protected_record",
+        "derive", "end_session_review", "govern", "guardian_alerts",
+        "guardian_audit", "guardian_baseline", "guardian_mcp_audit",
+        "guardian_quarantine", "guardian_report", "guardian_scan",
+        "guardian_status", "handoff_acted_on", "handoff_archaeology",
+        "link_threads", "list_exchanges", "list_protected_thresholds",
+        "mark_uncertainty", "metabolize", "nape_honks",
+        "nape_honks_with_history", "nape_observe", "open_protected_record",
+        "prior_alignment_summary", "propose_experiment", "recall_exchange",
+        "record_breakthrough", "record_collaborative_insight",
+        "record_prior_alignment", "reflection_ack", "resolve_thread",
+        "resolve_uncertainty", "retire_hypothesis", "route", "scan_thresholds",
+        "session_handoff", "stack_write_check", "store_compaction_summary",
+        "synthesize_now", "watch_cancel", "watch_resample", "watch_status",
     }
 )
 
 # Tools whose stack inputSchema declares source_instance, so the bridge can
-# stamp the seat id onto them. Explicit, never inferred: injecting into a tool
-# that does not declare the field is a hard error upstream.
+# stamp the seat id onto them. Explicit, never inferred — and DERIVED, not
+# remembered: resolved 2026-09-06 by parsing every `Tool(...)` registration in
+# sovereign-stack release/2026-09-06 @ 32b6dc8 and keeping the ones whose
+# inputSchema declares the property. Eight tools do; these are the six that
+# survive the two subtractions above (arrive_delta is retired, close_session is
+# governance).
 #
-# ⚠ DEPLOY ORDER: THE STACK GOES FIRST. record_open_thread's source_instance
-# lands on sovereign-stack branch feat/seat-identity-stamp (server.py schema +
-# dispatch, memory.py storage). Until that is merged and the SSE process is
-# running it, this bridge injects a field the stack does not declare — and
-# _reject_unknown_params is NOT applied to record_open_thread (it is invoked
-# for record_insight and recall_insights only, server.py:2964/3088), so the key
-# would be SILENTLY DROPPED rather than refused. The bridge would believe it
-# signed; the thread would land unattributed. That is exactly the fail-open
-# record_insight lived under until 2026-08-28. Deploying this bridge branch
-# without the stack branch is therefore not a partial win, it is the bug.
+# ⚠ WHY THE LIST CANNOT BE GUESSED, AND WHY SIGNING IS NOT A GATE ANY MORE.
+#
+# Injecting source_instance into a tool that does NOT declare it is one of two
+# failures, never a success: a hard ValueError where the stack applies
+# _reject_unknown_params (record_insight, recall_insights only —
+# server.py:2964/3088), and a SILENT DROP everywhere else. The silent drop is
+# the dangerous one: the bridge believes it signed, the record lands
+# unattributed, and nothing anywhere says so. That is precisely the fail-open
+# record_insight lived under until 2026-08-28.
+#
+# Before Anthony's ruling the bridge handled that by DENYING every write it
+# could not sign. The ruling replaces the gate: the surface is now his, not the
+# schema's. So the unsignable writes are ALLOWED and simply not stamped — and
+# the consequence is stated plainly rather than glossed: for a write outside
+# this set, the SEAT IS IN THE AUDIT LINE (seat + kernel-attested pid, stderr →
+# launchd) AND NOT IN THE RECORD. Attribution for those tools lives in the log,
+# not in the chronicle. Every name added here is a write that starts signing
+# itself, which is the direction to move; the way to move it is to add
+# source_instance to the tool's stack schema, never to inject harder.
+#
+# ⚠ DEPLOY ORDER: THE STACK GOES FIRST. record_open_thread's source_instance is
+# on sovereign-stack release/2026-09-06 (feat/seat-identity-stamp: server.py
+# schema + dispatch, memory.py storage). Ship this bridge against a stack that
+# lacks it and record_open_thread signs into the silent drop described above.
+# Deploying this bridge branch without the stack branch is not a partial win,
+# it is the bug.
 SEAT_SIGNABLE_TOOLS = frozenset(
     {
+        "arrive",
+        "arrive_lineage",
+        "handoff",
         "record_insight",
         "record_open_thread",
-        "handoff",
-        "arrive_lineage",
+        "where_did_i_leave_off",
     }
 )
 
@@ -613,43 +754,47 @@ def _unexpected_headers(headers: Any) -> list[str]:
 def seat_tool_allowed(tool: str) -> tuple[bool, str]:
     """Default-deny tool check for the seat path. Returns (allowed, reason).
 
-    `reason` is 'ok' or the audit-line word for WHY it was refused. Every branch
-    below is a denial; there is no path that returns True by falling through.
+    `reason` is 'ok' or the audit-line word for WHY it was refused.
+
+    THE ORDER IS THE POLICY, and it is read top-down:
+
+      1. not published   -> denied `unpublished`   (default-deny survives)
+      2. governance      -> denied `governance`    (Anthony's, always)
+      3. retired         -> denied `retired_unused_30d`
+      4. otherwise       -> ALLOWED. All studio seats are trusted.
+
+    Governance is checked BEFORE retirement so a governance tool that also
+    happens to be unused is refused for the reason that will still be true
+    tomorrow — a denial reason that changes when a usage census changes is not
+    a policy statement.
     """
+    if tool not in SEAT_TOOL_SURFACE:
+        return False, "unpublished"
     if tool in SEAT_NEVER_TOOLS:
         return False, "governance"
-    required = st.TOOL_SCOPES.get(tool)
-    if required is None:
-        return False, "unmapped"  # master-only by default-deny
-    if required not in SEAT_SCOPES:
-        return False, "out_of_scope"  # e.g. the 'session' scope
-    if required == "write" and tool not in SEAT_SIGNABLE_TOOLS:
-        # Includes SEAT_UNSIGNABLE_WRITES and anything write-shaped added later
-        # without a signing field — new write tools are denied until they can
-        # sign, which is the correct direction to fail.
-        return False, "unsignable"
+    if tool in SEAT_RETIRED_TOOLS:
+        return False, "retired_unused_30d"
     return True, "ok"
 
 
 _DENY_DETAIL = {
     "governance": (
-        "is governance-shaped (policies, protected records, thread resolution, "
-        "tokens/grants, audit) and is denied to seat identity regardless of "
-        "scope. Governance stays behind the master key on the Studio."
+        "is governance-shaped (policies, protected records, thread resolution "
+        "by match, retirement, session lifecycle, tokens/grants, audit) and is "
+        "denied to seat identity. All studio seats are trusted; governance is "
+        "still Anthony's alone, and being trusted is not being him."
     ),
-    "unmapped": (
-        "is not in the session-token scope map, so it is master-only by "
-        "default-deny. Seat identity reuses that map exactly and never widens it."
+    "retired_unused_30d": (
+        "had zero observed calls in the 30-day tool census (2026-08-06..09-05) "
+        "and is not served to seats. If it is in fact live, that is a stale "
+        "census entry rather than a judgement about the seat — say so and it "
+        "moves back."
     ),
-    "out_of_scope": (
-        "needs a scope outside read+write (it mutates global spiral state). "
-        "Seat identity carries read+write only."
-    ),
-    "unsignable": (
-        "is a write whose stack schema has no field that can carry a seat id, "
-        "so a seat could not sign it. Every write on this path must sign itself, "
-        "so it is refused rather than written unsigned. This is a gap in the "
-        "stack's tool schema, not a judgement about the seat."
+    "unpublished": (
+        "is not in the stack's published tool surface as this bridge release "
+        "recorded it, so it is master-only by default-deny. A tool the stack "
+        "added since is denied until it is added deliberately — a new name is "
+        "never trusted by silence."
     ),
 }
 
@@ -659,14 +804,21 @@ def deny_detail(tool: str, reason: str) -> str:
 
 
 def seat_allowed_tools() -> list[str]:
-    """The seat surface, derived from st.TOOL_SCOPES — never hand-listed."""
-    return sorted(t for t in st.TOOL_SCOPES if seat_tool_allowed(t)[0])
+    """The seat surface: the published surface minus governance minus retired.
+
+    Enumerated over SEAT_TOOL_SURFACE, NOT over st.TOOL_SCOPES. Iterating the
+    scope map was correct while the surface WAS the scope map; after Anthony's
+    ruling it would have reported 21 names for a 100-name surface — an
+    enumeration that silently describes a different policy than the one in
+    force, which is the shape this house calls a lossy index.
+    """
+    return sorted(t for t in SEAT_TOOL_SURFACE if seat_tool_allowed(t)[0])
 
 
 def seat_denied_tools() -> list[tuple[str, str]]:
-    """(tool, reason) for every mapped tool the seat path refuses."""
+    """(tool, reason) for every published tool the seat path refuses."""
     return sorted(
-        (t, seat_tool_allowed(t)[1]) for t in st.TOOL_SCOPES if not seat_tool_allowed(t)[0]
+        (t, seat_tool_allowed(t)[1]) for t in SEAT_TOOL_SURFACE if not seat_tool_allowed(t)[0]
     )
 
 
