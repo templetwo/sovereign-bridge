@@ -29,24 +29,39 @@ turned them into decisions D1–D10. Each is closed below with a test that fails
   auth path and does not grow a null one here.
   *`tests/test_seat_protected.py`, 21 tests.*
 
-- **D1 IS NOT CLOSED, AND THE GUARD HQ SPECIFIED WOULD HAVE LIFTED ITSELF.** The bridge sets
-  the verified seat on `sovereign_stack.dispatch_context` around the call and resets it in a
-  `finally`, exactly as specified. But `call_mcp_tool` dispatches over SSE to 127.0.0.1:3434
-  — the sovereign-sse process, and this bridge's only dispatch — and a contextvar is
-  per-process, so nothing set here is visible to the handler. **The stack does not leave that
-  gap empty:** its dispatch entry sets `CALLER_SEAT` from its own spiral session when it
-  arrives unset, on the premise that "the bridge establishes its kernel-verified seat
-  in-process before calling in", which is false over this hop. The record would name **the
-  server** as the closer, at 200, with `outcome=allowed` in our own audit line.
-  "Refuse when the module is absent" assumes module-present == identity-arrives, so it would
-  have lifted the refusal on the next stack deploy with nothing going red. The guard now asks
-  both questions and fails closed on either — `no_caller_channel` and
-  `channel_cannot_cross_dispatch`, two facts, two strings, the second saying the file is
-  present and the hop is the problem. Nothing observable changes today; it changes the deploy
-  after. The end-to-end property is the stack's to close.
-  *`tests/test_seat_identity.py::test_the_caller_channel_is_measured_in_the_WRONG_PROCESS`,
-  `::test_an_unreadable_dispatch_is_a_refusal_not_a_permission`,
-  `::test_the_guard_retires_itself_when_the_dispatch_comes_in_process`.*
+- **D1, ROUND 3 — THE CALLER IDENTITY RIDES THE TRANSPORT, AND THE GUARD ASKS THE FAR END.**
+  Round 2 carried the seat in an in-process `contextvars.ContextVar` and refused `signal_ack`
+  when `sovereign_stack.dispatch_context` was absent. Measured, that could not work and the
+  guard was unsafe: `call_mcp_tool` dispatches over SSE to the sovereign-sse process and it
+  is this bridge's only dispatch, a contextvar is per-process, and the stack sets
+  `CALLER_SEAT` from its **own** spiral session when it arrives unset — so the ledger would
+  have named the SERVER as the closer at HTTP 200 with `outcome=allowed` in our own audit
+  line. Worse, the guard keyed on importability in a process that does not dispatch, so it
+  would have **lifted itself on the next deploy** with no test going red.
+  HQ's contract: the bridge merges `X-Sovereign-Seat: <verified seat>` into the per-call
+  `sse_client` headers on the seat path (never on the bearer path, where the header is
+  ABSENT rather than blank); the stack reads it off the scope on the local `/sse` endpoint
+  and binds `CALLER_SEAT` before `server.run`; its heartbeat advertises
+  `caller_identity_channel: "x-sovereign-seat-sse-header"`. The bridge admits `signal_ack`
+  for seats only on an exact match with that advertisement, read over the heartbeat route it
+  already has and cached 60 s, and refuses everything else as `stack_has_no_caller_channel`
+  with a detail that names what was read. Every failure to ask — a heartbeat that will not
+  answer included — caches as "no channel": an unanswerable question about whether an
+  identity travels is a refusal, never a permission. The in-process set is GONE rather than
+  kept beside the header; two channels where one is inert leaves a reader no way to tell
+  which one carries.
+  *`tests/test_seat_identity.py::test_the_seat_header_is_on_the_wire_and_the_credential_is_still_there`
+  (asserts the `sse_client` headers argument, not a stub of `call_mcp_tool`),
+  `::test_a_call_with_no_seat_sends_no_seat_header`,
+  `::test_one_seats_header_does_not_leak_onto_the_next_call`,
+  `::test_signal_ack_is_refused_when_the_stack_advertises_no_channel`,
+  `::test_a_channel_by_another_name_is_not_this_channel`,
+  `::test_a_heartbeat_that_will_not_answer_is_a_refusal_not_a_permission`,
+  `::test_the_advertisement_is_admitted_when_the_stack_carries_it`,
+  `::test_the_advertisement_is_read_once_per_window_not_once_per_call`,
+  `::test_the_guard_does_not_ask_the_stack_about_every_other_tool`,
+  `::test_a_client_cannot_reach_the_channel_by_sending_the_header_itself`,
+  `::test_a_bearer_call_carries_no_seat_and_no_actor`.*
 
 - **F2, P2 — THE DESCRIPTOR RESIDUAL, STATED EXACTLY RATHER THAN CLOSED.** Identity is the
   kernel-reported peer **at ASGI entry**, which is after the headers and before the body: a

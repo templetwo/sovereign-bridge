@@ -124,7 +124,7 @@ def upstream(monkeypatch):
     box = {"result": {"ok": True, "result": None}}
     seen = []
 
-    async def fake(tool, args):
+    async def fake(tool, args, seat=None):
         seen.append((tool, args))
         return json.loads(json.dumps(box["result"]))
 

@@ -63,7 +63,7 @@ def client(monkeypatch, tmp_path):
     # -- observed 2026-08-16: 14 false grant records in ~/.sovereign/chronicle
     # from two runs of this file. Same shape as the boot_ritual tests asserting
     # against the live store: the token DB was isolated, the record was not.
-    async def fake_call_mcp_tool(tool_name, arguments):
+    async def fake_call_mcp_tool(tool_name, arguments, seat=None):
         return {"ok": True, "stubbed": tool_name}
 
     monkeypatch.setattr(bridge, "call_mcp_tool", fake_call_mcp_tool)

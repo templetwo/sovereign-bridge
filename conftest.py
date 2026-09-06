@@ -208,8 +208,15 @@ def surface(monkeypatch):
         return PINNED_SURFACE
 
     monkeypatch.setattr(seat_identity, "published_surface", _pinned)
+    # THE CALLER-IDENTITY ADVERTISEMENT IS THE SAME KIND OF AMBIENT STATE and
+    # gets the same treatment: it is a 60-second module-level cache, so one
+    # test's stubbed heartbeat would otherwise decide the next test's
+    # signal_ack. Cleared on both sides, so neither ordering nor timing can
+    # carry an answer between tests.
+    seat_identity.reset_caller_channel_cache()
     yield PINNED_SURFACE
     seat_identity.reset_published_cache()
+    seat_identity.reset_caller_channel_cache()
 
 
 

@@ -158,7 +158,7 @@ def test_unhandled_exception_carries_timestamp(monkeypatch):
     handler's response is observed instead of being re-raised by TestClient."""
     monkeypatch.setattr(bridge, "check_auth", lambda *a, **k: None)
 
-    async def boom(tool, args):
+    async def boom(tool, args, seat=None):
         raise RuntimeError("unanticipated raise")
 
     monkeypatch.setattr(bridge, "call_mcp_tool", boom)

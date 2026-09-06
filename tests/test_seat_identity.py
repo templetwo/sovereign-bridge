@@ -135,64 +135,88 @@ def registry(monkeypatch, tmp_path):
 
 @pytest.fixture
 def calls(monkeypatch):
-    """Record every (tool, arguments) that reaches the stack."""
-    seen = []
+    """Record every (tool, arguments, seat) that reaches the stack.
 
-    async def fake(tool, args):
+    `.seats` is a parallel list rather than a third tuple element so the dozens
+    of existing assertions on `calls[0][1]` keep meaning what they say.
+    """
+
+    class _Seen(list):
+        pass
+
+    seen = _Seen()
+    seen.seats = []
+
+    async def fake(tool, args, seat=None):
         seen.append((tool, args))
+        seen.seats.append(seat)
         return {"ok": True, "result": {"echo": tool}}
 
     monkeypatch.setattr(bridge, "call_mcp_tool", fake)
     return seen
 
 
+def _run(coro):
+    """Drive one coroutine to completion. Used by the transport-level tests,
+    which call `call_mcp_tool` directly rather than through the app."""
+    import asyncio
+
+    return asyncio.run(coro)
+
+
 @pytest.fixture
-def caller_channel(monkeypatch, calls):
-    """A stand-in for `sovereign_stack.dispatch_context`, plus a tap on it.
+def stack_channel(monkeypatch):
+    """The stack's ADVERTISEMENT of the caller-identity channel, stubbed.
 
-    ⚠ A STUB, BECAUSE THE REAL MODULE DOES NOT EXIST YET. The stack round adds
-    it; this bridge release must be provable before and after that lands, and a
-    test that could only run against a deployed stack is a test nobody runs.
-    The stub implements the exact contract the bridge uses —
-    `set_caller_seat(seat) -> token` and `reset_caller_seat(token)` over a real
-    `contextvars.ContextVar` — so what is exercised is the bridge's use of the
-    channel, which is the half this repo owns.
+    ⚠ STUBBED, NEVER THE LIVE HEARTBEAT. The guard's whole job is to believe
+    the far end of the SSE hop, so a test that read the real one would be
+    measuring whichever stack happens to be deployed on this machine at the
+    moment the suite runs — green on Anthony's box, red on a clean checkout,
+    and silently green again the day somebody deploys. Stubbing it is what
+    makes the guard's own logic the thing under test.
 
-    Records three things, each answering a different question:
-      seen    — the seat the STACK would have observed, read inside dispatch.
-      after   — the value in-context immediately after the reset. Read there
-                because reading it from the test thread afterwards returns None
-                whether or not the reset ran: a test that cannot fail.
-      balance — set/reset pairing. Non-zero is a leak even if `after` is clean.
+    Set `box["payload"]` to a dict to change what the stack says, or to an
+    exception instance to make the heartbeat refuse to answer at all.
     """
-    import contextvars
+    box = {"payload": {"caller_identity_channel": si.CALLER_CHANNEL_NAME}}
+    asked = []
 
-    var = contextvars.ContextVar("caller_seat_test", default=None)
-    state = {"seen": [], "after": [], "balance": 0}
+    async def fake_heartbeat():
+        asked.append(True)
+        payload = box["payload"]
+        if isinstance(payload, BaseException):
+            raise payload
+        return payload
 
-    class _Stub:
-        @staticmethod
-        def set_caller_seat(seat):
-            state["balance"] += 1
-            return var.set(seat)
+    monkeypatch.setattr(bridge, "_stack_heartbeat_payload", fake_heartbeat)
+    si.reset_caller_channel_cache()
+    box["asked"] = asked
+    yield box
+    si.reset_caller_channel_cache()
 
-        @staticmethod
-        def reset_caller_seat(token):
-            state["balance"] -= 1
-            if token is not None:
-                var.reset(token)
-            state["after"].append(var.get())
 
-    monkeypatch.setattr(si, "dispatch_context_module", lambda: _Stub)
+@pytest.fixture
+def sse_headers(monkeypatch):
+    """Capture the headers of the real per-call SSE session.
 
-    inner = bridge.call_mcp_tool
+    ⚠ THIS IS THE ONLY PLACE THE CHANNEL IS ACTUALLY PROVEN. Every other test
+    in this file stubs `call_mcp_tool`, which is one layer ABOVE the transport
+    — a stub would happily accept a seat the real code never put on the wire.
+    Here the real `call_mcp_tool` runs and `sse_client` is what gets replaced,
+    so what is asserted is the argument that leaves this process.
 
-    async def recording(tool, args):
-        state["seen"].append(var.get())
-        return await inner(tool, args)
+    The fake raises after recording; `call_mcp_tool` catches it and returns its
+    own error envelope, which is all these tests need and avoids reimplementing
+    an MCP session to learn one dict.
+    """
+    seen = []
 
-    monkeypatch.setattr(bridge, "call_mcp_tool", recording)
-    return state
+    def fake_sse_client(url, headers=None):
+        seen.append({"url": url, "headers": headers})
+        raise RuntimeError("recorded, not connected")
+
+    monkeypatch.setattr(bridge, "sse_client", fake_sse_client)
+    return seen
 
 
 def client(env_seat=SEAT, verified=None):
@@ -572,75 +596,89 @@ def test_tools_the_old_scope_map_never_carried_are_now_reachable(registry, calls
     assert len(calls) == 8
 
 
-def test_signal_ack_is_a_watch_seats_ordinary_act(registry, calls, surface, caller_channel):
-    """HQ DECISION D1, 2026-09-06 - a REVERSAL of the previous release, pinned.
-
+def test_signal_ack_is_a_watch_seats_ordinary_act(registry, calls, surface, stack_channel):
+    """D1. The seat surface shipped with `signal_ack` on SEAT_NEVER_TOOLS, and
     `signal_ack` shipped DENIED as governance, on the stack's own `govern`
-    intent label, flagged at Anthony's gate rather than decided quietly. HQ
-    ruled the other way: acknowledging a signal is the watch seat's operational
-    act, and Anthony's governance list is laws, policies, seat permissions,
-    ring placement and deletes. Classifying it govern left the designated watch
-    seat with no way to close anything it was seated to watch.
-    """
+    category. Acknowledging a signal is what a watch seat exists to do."""
     assert "signal_ack" not in si.SEAT_NEVER_TOOLS
     assert si.seat_tool_allowed("signal_ack", surface) == (True, "ok")
     r = call(client(), "signal_ack", seat_hdr(), signal_id="sig-1", state="acknowledged")
-    assert r.status_code == 200, r.text
+    assert r.status_code == 200
     assert calls[0][0] == "signal_ack"
 
 
-def test_the_verified_seat_travels_in_process_not_as_an_argument(
-    registry, calls, surface, caller_channel
+def test_the_verified_seat_travels_as_a_header_not_as_an_argument(
+    registry, calls, surface, stack_channel
 ):
-    """D1 AS AMENDED, 2026-09-06 — and the amendment is the security property.
+    """D1 AS RE-AMENDED, HQ round 3 — and the amendment is the security property.
 
     The first implementation injected `actor_seat` into signal_ack's arguments
     and the stack trusted it "because the bridge overwrites it". An ARGUMENT is
     a channel every caller can write to, so that trust rested on the bridge
-    being the only writer — not a property the stack can check. The identity
-    now travels through `sovereign_stack.dispatch_context`, a contextvar
-    nothing on the wire can reach, and the stack refuses the argument outright.
+    being the only writer — not a property the stack can check. The second
+    moved it to an in-process contextvar, which could not cross the SSE hop at
+    all. It now rides the per-call SSE session as `X-Sovereign-Seat`, set by
+    this bridge from the identity it verified against the kernel.
 
-    Asserted BOTH ways: the seat is visible in the context at dispatch time,
-    and no closer-shaped argument is on the call.
+    Asserted BOTH ways: the dispatch is handed the verified seat, and no
+    closer-shaped argument is on the call.
     """
     call(client(), "signal_ack", seat_hdr(), signal_id="sig-1", state="acted", reason="fixed")
-    assert caller_channel["seen"] == [SEAT], "the stack could not see the calling seat"
+    assert calls.seats == [SEAT], "the dispatch was not handed the verified seat"
     assert calls[0][1] == {"signal_id": "sig-1", "state": "acted", "reason": "fixed"}
 
 
-def test_the_context_is_reset_after_the_call(registry, calls, surface, caller_channel):
-    """⚠ A LEAKED CONTEXTVAR ATTRIBUTES THE NEXT CALLER'S WRITE TO THE LAST ONE.
-
-    `after` is read INSIDE the request's own context, immediately after the
-    reset — the only place the question can actually be asked. Reading the var
-    from the test's thread afterwards would return None whether the reset
-    happened or not, which is a test that cannot fail.
-    """
-    call(client(), "signal_ack", seat_hdr(), signal_id="sig-1", state="acknowledged")
-    assert caller_channel["seen"] == [SEAT]
-    assert caller_channel["after"] == [None], "the seat outlived its request"
-    assert caller_channel["balance"] == 0, "set and reset are not paired"
+def test_the_seat_header_is_on_the_wire_and_the_credential_is_still_there(sse_headers):
+    """The transport-level proof. The header must reach `sse_client`, and
+    merging it must not drop the bridge's own Authorization header — a channel
+    that quietly costs you your credential is a different outage."""
+    _run(bridge.call_mcp_tool("signal_ack", {}, seat=SEAT))
+    assert len(sse_headers) == 1
+    sent = sse_headers[0]["headers"]
+    assert sent[bridge.SEAT_HEADER] == SEAT
+    for key, value in (bridge._MCP_SSE_HEADERS or {}).items():
+        assert sent[key] == value, "merging the seat dropped the bridge's own header"
 
 
-def test_the_context_is_reset_even_when_the_stack_raises(
-    registry, surface, caller_channel, monkeypatch
+def test_a_call_with_no_seat_sends_no_seat_header(sse_headers):
+    """⚠ ABSENT, NOT EMPTY, NOT None. A stack that validates the header would
+    reject a blank one loudly, but a stack that merely reads it would take
+    `""` for an identity. A call with no seat must be indistinguishable from a
+    caller that has never heard of seats."""
+    _run(bridge.call_mcp_tool("recall_insights", {}))
+    sent = sse_headers[0]["headers"]
+    assert sent is None or bridge.SEAT_HEADER not in sent
+    assert bridge._mcp_headers_for(None) is bridge._MCP_SSE_HEADERS
+
+
+def test_one_seats_header_does_not_leak_onto_the_next_call(sse_headers):
+    """The module-level header dict must not be mutated. If it were, the first
+    seat call would seat every later call — bearer traffic included — and the
+    failure would be invisible until the wrong seat appeared in a record."""
+    _run(bridge.call_mcp_tool("signal_ack", {}, seat=SEAT))
+    _run(bridge.call_mcp_tool("recall_insights", {}))
+    assert bridge.SEAT_HEADER not in (sse_headers[1]["headers"] or {})
+    assert bridge.SEAT_HEADER not in (bridge._MCP_SSE_HEADERS or {})
+
+
+def test_a_client_cannot_reach_the_channel_by_sending_the_header_itself(
+    registry, calls, surface, stack_channel
 ):
-    """The `finally` earns its keep here. An upstream that raises is exactly
-    where a leak is most likely and least noticed."""
-
-    async def boom(tool, args):
-        raise RuntimeError("upstream exploded")
-
-    monkeypatch.setattr(bridge, "call_mcp_tool", boom)
-    with pytest.raises(RuntimeError):
-        call(client(), "signal_ack", seat_hdr(), signal_id="sig-1", state="acknowledged")
-    assert caller_channel["after"] == [None], "the seat leaked past a failed call"
-    assert caller_channel["balance"] == 0
+    """The inbound `X-Sovereign-Seat` is a DECLARATION checked against the
+    kernel peer; the outbound one is this bridge's ASSERTION. They share a name
+    and nothing else. A process seated as one identity that declares another is
+    refused at the door — this pins that the refusal happens BEFORE anything is
+    put on the wire."""
+    r = call(
+        client(env_seat="hq-claude-studio"), "signal_ack", seat_hdr(SEAT),
+        signal_id="sig-1", state="acknowledged",
+    )
+    assert r.status_code == 401, "a mismatched seat was not stopped at the door"
+    assert not calls, "a mismatched seat reached the stack"
 
 
 def test_a_client_supplied_actor_is_refused_not_overwritten(
-    registry, calls, surface, caller_channel
+    registry, calls, surface, stack_channel
 ):
     """Five names, each an attempt to name the closer. Refused, not silently
     replaced: overwriting leaves the caller believing it named the actor, and
@@ -655,118 +693,98 @@ def test_a_client_supplied_actor_is_refused_not_overwritten(
     assert not calls, "a call carrying a forged actor reached the stack"
 
 
-def test_signal_ack_is_refused_when_the_stack_has_no_caller_channel(
-    registry, calls, surface, monkeypatch
+def test_signal_ack_is_refused_when_the_stack_advertises_no_channel(
+    registry, calls, surface, stack_channel
 ):
-    """FAIL CLOSED AGAINST AN OLDER STACK, rather than falling back.
+    """FAIL CLOSED AGAINST A STACK THAT DOES NOT READ THE HEADER.
 
-    Without `dispatch_context` the closer would be stamped from the server's
-    shared spiral session — the SERVER, not the seat — so the record would name
-    the wrong actor while looking correct. Refusing is the honest answer, and
-    the reason names the deploy order rather than blaming the caller.
+    An older stack falls back to its own shared spiral session, so the record
+    would name the SERVER as the closer while returning 200. Refusing is the
+    honest answer, and the reason names what was actually read rather than
+    asserting an absence.
     """
-    monkeypatch.setattr(si, "dispatch_context_module", lambda: None)
+    stack_channel["payload"] = {"version": "1.7.0"}
     r = call(client(), "signal_ack", seat_hdr(), signal_id="sig-1", state="acknowledged")
     assert r.status_code == 403
-    assert "dispatch_context" in r.json()["detail"]
-    assert "Deploy the stack release first" in r.json()["detail"]
+    detail = r.json()["detail"]
+    assert "carries no caller_identity_channel field" in detail
+    assert si.CALLER_CHANNEL_NAME in detail
     assert not calls
-    # ...and it is signal_ack ONLY. An absent channel must not take the rest of
-    # the seat surface down with it.
+    # ...and it is signal_ack ONLY. A stack that cannot carry an identity must
+    # not take the rest of the seat surface down with it.
     assert call(client(), "recall_insights", seat_hdr()).status_code == 200
 
 
-def test_the_caller_channel_is_measured_in_the_WRONG_PROCESS(monkeypatch):
-    """⚠ THE HALF OF D1 THIS REPO CANNOT CLOSE, AND THE GUARD THAT MAKES ITS
-    ABSENCE SAFE.
-
-    The three tests above prove this bridge sets and resets the contextvar
-    correctly around the dispatch. They cannot prove the STACK reads it: the
-    stub that stands in for `dispatch_context` and the fake upstream both live
-    in the pytest process. The real dispatch does not — `call_mcp_tool` opens
-    `sse_client(MCP_SSE_URL)` to the sovereign-sse process, and a contextvar is
-    per-process.
-
-    HQ's specified condition was "refuse when the module is absent", which
-    assumes module-present implies identity-arrives. It does not. Worse, the
-    stack's dispatch entry SETS `CALLER_SEAT` from its own spiral session when
-    it arrives unset, so over the hop the outcome is not a refusal but the
-    SERVER stamped as the closer at HTTP 200. So the guard asks both questions
-    and fails closed on either.
-
-    This test is the tripwire on the assumption itself: if `call_mcp_tool` ever
-    becomes an in-process dispatch, the first assertion goes red, the guard
-    correctly stops firing, and somebody re-derives this instead of inheriting
-    a comment about a hop that no longer exists.
-    """
-    import inspect
-
-    assert bridge.MCP_SSE_URL.startswith(("http://", "https://")), (
-        "the dispatch is no longer an out-of-process transport — re-derive this bound"
-    )
-    src = inspect.getsource(bridge.call_mcp_tool)
-    assert "sse_client(MCP_SSE_URL" in src, (
-        "call_mcp_tool no longer dispatches over SSE. If it now runs the tool "
-        "IN-PROCESS the contextvar would actually reach it — re-measure the "
-        "residual and retire the guard rather than inheriting this comment"
-    )
-    assert si.dispatch_carries_context() is False, (
-        "the predicate disagrees with the source it reads"
-    )
-
-    # A present module is NOT sufficient: the refusal stands, under its own
-    # reason, and the detail tells the operator not to hunt for a missing file.
-    monkeypatch.setattr(si, "dispatch_context_module", lambda: object())
-    reason, detail = si.actor_channel_refusal("signal_ack")
-    assert reason == "channel_cannot_cross_dispatch"
-    assert "the file is there and the hop is the problem" in detail
-    assert "across the hop" in detail.lower()
-
-    # An absent module is the other refusal, and it keeps its own name.
-    monkeypatch.setattr(si, "dispatch_context_module", lambda: None)
-    assert si.actor_channel_refusal("signal_ack")[0] == "no_caller_channel"
-
-    # Neither refusal touches any other tool.
-    assert si.actor_channel_refusal("recall_insights") is None
+def test_a_channel_by_another_name_is_not_this_channel(
+    registry, calls, surface, stack_channel
+):
+    """EXACT MATCH, NOT A FAMILY RESEMBLANCE. A stack reading identity from
+    somewhere else is a stack this bridge is not speaking to, and admitting a
+    near-match is how a contract decays into a convention."""
+    stack_channel["payload"] = {"caller_identity_channel": "x-sovereign-seat"}
+    r = call(client(), "signal_ack", seat_hdr(), signal_id="sig-1", state="acknowledged")
+    assert r.status_code == 403
+    assert "'x-sovereign-seat'" in r.json()["detail"]
+    assert not calls
 
 
-def test_an_unreadable_dispatch_is_a_refusal_not_a_permission(monkeypatch):
-    """FAIL CLOSED ON THE QUESTION ITSELF. `dispatch_carries_context` answers
-    by reading the dispatch's source; a dispatch whose source cannot be read is
-    a dispatch nobody can vouch for, and "I could not tell" must land on the
-    same side as "no"."""
+def test_a_heartbeat_that_will_not_answer_is_a_refusal_not_a_permission(
+    registry, calls, surface, stack_channel
+):
+    """⚠ THE UNANSWERABLE QUESTION LANDS ON THE SAME SIDE AS "NO". The guard
+    cannot tell a stack that reads the header from one that does not if it
+    cannot ask, and "I could not check" has to deny."""
+    stack_channel["payload"] = RuntimeError("egress: connection refused")
+    r = call(client(), "signal_ack", seat_hdr(), signal_id="sig-1", state="acknowledged")
+    assert r.status_code == 403
+    assert "did not answer" in r.json()["detail"]
+    assert "connection refused" in r.json()["detail"]
+    assert not calls
 
-    class _Unreadable:
-        pass
 
-    monkeypatch.setattr(bridge, "call_mcp_tool", _Unreadable())
-    assert si.dispatch_carries_context() is False
-    monkeypatch.delattr(bridge, "call_mcp_tool")
-    assert si.dispatch_carries_context() is False
+def test_the_advertisement_is_admitted_when_the_stack_carries_it(
+    registry, calls, surface, stack_channel
+):
+    """The other direction, so the guard is not a permanent denial by accident."""
+    assert stack_channel["payload"]["caller_identity_channel"] == si.CALLER_CHANNEL_NAME
+    r = call(client(), "signal_ack", seat_hdr(), signal_id="sig-1", state="acknowledged")
+    assert r.status_code == 200
+    assert calls.seats == [SEAT]
 
 
-def test_the_guard_retires_itself_when_the_dispatch_comes_in_process(monkeypatch):
-    """The other direction, so the guard is not a permanent denial by accident.
-    Replace the dispatch with one that runs here, and the seat really does
-    reach it — the predicate says so and the refusal lifts."""
+def test_the_advertisement_is_read_once_per_window_not_once_per_call(
+    registry, calls, surface, stack_channel
+):
+    """A round trip in front of every seat call would make the guard a tax on
+    ordinary traffic. Cached for CALLER_CHANNEL_CACHE_SECONDS."""
+    for _ in range(3):
+        r = call(client(), "signal_ack", seat_hdr(), signal_id="s", state="acknowledged")
+        assert r.status_code == 200
+    assert len(stack_channel["asked"]) == 1
+    si.reset_caller_channel_cache()
+    assert call(
+        client(), "signal_ack", seat_hdr(), signal_id="s", state="acknowledged"
+    ).status_code == 200
+    assert len(stack_channel["asked"]) == 2
 
-    async def in_process(tool, args):  # no SSE anywhere in this source
-        return {"ok": True, "result": None}
 
-    monkeypatch.setattr(bridge, "call_mcp_tool", in_process)
-    monkeypatch.setattr(si, "dispatch_context_module", lambda: object())
-    assert si.dispatch_carries_context() is True
-    assert si.actor_channel_refusal("signal_ack") is None
+def test_the_guard_does_not_ask_the_stack_about_every_other_tool(
+    registry, calls, surface, stack_channel
+):
+    """The channel is checked for the tools that need an identity. A read that
+    stamps no closer must not pay for a heartbeat round trip."""
+    assert call(client(), "recall_insights", seat_hdr()).status_code == 200
+    assert stack_channel["asked"] == []
 
 
 def test_a_bearer_call_carries_no_seat_and_no_actor(
-    registry, calls, surface, caller_channel
+    registry, calls, surface, stack_channel
 ):
     """THE GUARD D1 SAYS TO KEEP. A request with an Authorization header is
     decided by the bearer path and never reaches resolve_seat, so nothing is
-    set: the context stays empty, no argument is injected, and the stack falls
-    back to its own identity resolution. Adding X-Sovereign-Seat to a bearer
-    call must not buy a verified-looking actor."""
+    sent: no seat header, no injected argument, and the stack falls back to its
+    own identity resolution. Adding X-Sovereign-Seat to a bearer call must not
+    buy a verified-looking actor."""
     r = call(
         client(),
         "signal_ack",
@@ -774,9 +792,9 @@ def test_a_bearer_call_carries_no_seat_and_no_actor(
         signal_id="sig-1",
         state="acknowledged",
     )
-    assert r.status_code == 200, r.text
-    assert "actor_seat" not in calls[0][1]
-    assert caller_channel["seen"] == [None], "a bearer call named a seat to the stack"
+    assert r.status_code == 200
+    assert calls.seats == [None], "a bearer call named a seat to the stack"
+    assert calls[0][1] == {"signal_id": "sig-1", "state": "acknowledged"}
 
 
 def test_resolve_thread_by_id_is_a_seats_ordinary_act(registry, calls, surface):

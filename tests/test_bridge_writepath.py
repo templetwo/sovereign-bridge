@@ -24,7 +24,7 @@ def client(monkeypatch, tmp_path):
 
 
 def _mock_tool(monkeypatch, recorder):
-    async def fake(tool, args):
+    async def fake(tool, args, seat=None):
         recorder.append((tool, args))
         return {"ok": True, "result": {"echo": tool}}
 
@@ -56,7 +56,7 @@ def test_idempotent_replay(client, monkeypatch):
 
 
 def test_failure_class_stack(client, monkeypatch):
-    async def fail(tool, args):
+    async def fail(tool, args, seat=None):
         return {"ok": False, "error": "tool blew up"}
 
     monkeypatch.setattr(bridge, "call_mcp_tool", fail)
@@ -65,7 +65,7 @@ def test_failure_class_stack(client, monkeypatch):
 
 
 def test_failure_class_egress(client, monkeypatch):
-    async def fail(tool, args):
+    async def fail(tool, args, seat=None):
         return {"ok": False, "error": "Connection refused", "failure_class": "egress"}
 
     monkeypatch.setattr(bridge, "call_mcp_tool", fail)

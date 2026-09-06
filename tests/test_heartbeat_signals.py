@@ -142,7 +142,7 @@ def _unimportable(monkeypatch):
 def _upstream(monkeypatch, result):
     seen = []
 
-    async def fake(tool, args):
+    async def fake(tool, args, seat=None):
         seen.append((tool, args))
         return result
 
@@ -291,7 +291,7 @@ def test_a_slow_stack_tool_is_bounded(monkeypatch):
     _unimportable(monkeypatch)
     monkeypatch.setattr(bridge, "HEARTBEAT_TOOL_TIMEOUT", 0.05)
 
-    async def slow(tool, args):
+    async def slow(tool, args, seat=None):
         await asyncio.sleep(5)
         return {"ok": True, "result": {"unacked_signals": dict(LIVE)}}
 

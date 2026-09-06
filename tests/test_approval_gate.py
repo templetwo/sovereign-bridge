@@ -56,7 +56,7 @@ def client(monkeypatch, tmp_path):
 
     recorded = []
 
-    async def fake_tool(tool, args):
+    async def fake_tool(tool, args, seat=None):
         recorded.append((tool, args))
         return {"ok": True, "result": "recorded"}
 
@@ -352,7 +352,7 @@ def test_confirm_response_not_blocked_by_slow_provenance_write(client, monkeypat
     write_may_finish = threading.Event()
     write_started = threading.Event()
 
-    async def slow_tool(tool, args):
+    async def slow_tool(tool, args, seat=None):
         write_started.set()
         # Block far longer than any sane request timeout, on a thread the
         # event loop can still schedule around — proves the response path

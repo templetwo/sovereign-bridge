@@ -70,7 +70,7 @@ def seated(monkeypatch, tmp_path):
 def calls(monkeypatch):
     seen = []
 
-    async def fake(tool, args):
+    async def fake(tool, args, seat=None):
         seen.append((tool, args))
         return {"ok": True, "result": {"echo": tool}}
 

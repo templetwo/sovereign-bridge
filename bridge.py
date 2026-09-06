@@ -177,6 +177,38 @@ if not BEARER_TOKEN:
 # 2026-06-12) — present it on every upstream MCP connect.
 _MCP_SSE_HEADERS = {"Authorization": f"Bearer {BEARER_TOKEN}"} if BEARER_TOKEN else None
 
+# ── THE CALLER-IDENTITY CHANNEL (HQ, 2026-09-06, round 3) ──────────────────
+# The verified seat rides on the per-call SSE session as an HTTP header. The
+# stack's `handle_sse` reads it off the ASGI scope on the plain local /sse
+# endpoint, validates it, and binds CALLER_SEAT before `server.run`.
+#
+# ⚠ WHY NOT THE CONTEXTVAR THIS BRIDGE USED TO SET. `set_caller_seat` runs in
+# the bridge process; the stack's handlers run in sovereign-sse; a
+# `contextvars.ContextVar` is per-process, so the identity never arrived. Worse
+# than not arriving: the stack establishes CALLER_SEAT from its OWN spiral
+# session when it arrives unset, so the ledger would have named the SERVER as
+# the closer at HTTP 200. The in-process set is GONE rather than kept beside
+# this one — two channels where one is inert is a reader with no way to tell
+# which one carries.
+#
+# ⚠ THE SAME HEADER NAME ARRIVES INBOUND AND MEANS SOMETHING WEAKER. Inbound,
+# `X-Sovereign-Seat` is a client DECLARATION checked against the kernel-verified
+# peer. Outbound it is this bridge ASSERTING the identity it already verified.
+# The outbound value is built here from the verified seat and never copied from
+# the request, so a client cannot reach the stack's channel by sending a header.
+SEAT_HEADER = "X-Sovereign-Seat"
+
+
+def _mcp_headers_for(seat: str | None) -> dict | None:
+    """Per-call SSE headers. A fresh dict per call: mutating the module-level
+    one would leak the last seat onto the next caller's session, including onto
+    bearer calls, which is the shape this channel exists to prevent."""
+    if seat is None:
+        return _MCP_SSE_HEADERS
+    headers = dict(_MCP_SSE_HEADERS or {})
+    headers[SEAT_HEADER] = seat
+    return headers
+
 # Caller context — captured per request by middleware for auth logging and
 # the public-traffic rate limiter.
 _caller_ua: ContextVar[str | None] = ContextVar("caller_ua", default=None)
@@ -545,9 +577,15 @@ def _certify_seat_result(
     return result
 
 
-async def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
+async def call_mcp_tool(tool_name: str, arguments: dict, seat: str | None = None) -> dict:
+    """Dispatch one tool over a per-call SSE session.
+
+    `seat` is the KERNEL-VERIFIED seat identity, or None. It is passed on the
+    seat path only; a bearer or session-token call sends no seat header at all,
+    so the stack cannot mistake an unauthenticated caller for a seated one.
+    """
     try:
-        async with sse_client(MCP_SSE_URL, headers=_MCP_SSE_HEADERS) as (read, write):
+        async with sse_client(MCP_SSE_URL, headers=_mcp_headers_for(seat)) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.call_tool(tool_name, arguments=arguments)
@@ -1324,6 +1362,26 @@ def _signals_unmeasured(exc: Exception, route: str | None = None) -> dict:
     }
 
 
+async def _stack_heartbeat_payload() -> dict:
+    """The stack's OWN heartbeat object, over the route this bridge already has.
+
+    Shared by the caller-identity guard (`seat_identity.caller_channel`) and
+    kept deliberately thin: it raises on every shape it cannot vouch for, so a
+    caller can never mistake "the stack did not answer" for "the stack answered
+    and the field is absent". Both are refusals, but they are different facts
+    and the refusal detail says which.
+    """
+    envelope = await asyncio.wait_for(
+        call_mcp_tool("heartbeat", {}), timeout=HEARTBEAT_TOOL_TIMEOUT
+    )
+    if not isinstance(envelope, dict) or not envelope.get("ok"):
+        raise RuntimeError(str((envelope or {}).get("error") or "heartbeat failed"))
+    payload = envelope.get("result")
+    if not isinstance(payload, dict):
+        raise RuntimeError("the stack heartbeat returned no object")
+    return payload
+
+
 SIGNALS_TOOL_ROUTE = "stack tool heartbeat"
 
 
@@ -1695,7 +1753,7 @@ async def call_tool_endpoint(
         # channel to carry the verified seat cannot serve the tool at all.
         for check in (
             si.actor_argument_refusal(req.tool, req.arguments),
-            si.actor_channel_refusal(req.tool),
+            await si.actor_channel_refusal(req.tool, fetch=_stack_heartbeat_payload),
         ):
             if check is not None:
                 si.audit(seat_id, req.tool, "denied", check[0], **_audit_pids)
@@ -1785,25 +1843,16 @@ async def call_tool_endpoint(
             replay["duration_ms"] = round((time.time() - start) * 1000)
             return replay
 
-    # ⚠ THE VERIFIED SEAT TRAVELS IN-PROCESS AROUND THE DISPATCH, NOT ON THE
-    # WIRE (D1 as amended, 2026-09-06). `sovereign_stack.dispatch_context`
-    # holds a contextvar the stack reads when it needs to name the caller —
-    # signal_ack's closer today. A contextvar cannot be set by anything that
-    # arrives over HTTP, which is what makes the stack's refusal of a
-    # caller-supplied actor enforceable instead of conventional.
+    # ⚠ THE VERIFIED SEAT RIDES THE PER-CALL SSE SESSION AS A HEADER, NOT AS AN
+    # ARGUMENT AND NOT AS A CONTEXTVAR (HQ round 3, 2026-09-06). See
+    # `_mcp_headers_for` for why the in-process channel could not work and why
+    # it was removed rather than kept alongside.
     #
-    # Set for EVERY seat call, not only the tools that read it: a channel that
-    # is armed selectively is a channel whose absence means two different
-    # things, and the next tool to need an identity should find one there.
-    # RESET IN A FINALLY, because this coroutine's context is reused and a
-    # leaked seat would attribute the NEXT caller's write to the last one.
-    _ctx_module = si.dispatch_context_module() if seat_id is not None else None
-    _ctx_token = _ctx_module.set_caller_seat(seat_id) if _ctx_module is not None else None
-    try:
-        result = await call_mcp_tool(req.tool, req.arguments)
-    finally:
-        if _ctx_module is not None:
-            _ctx_module.reset_caller_seat(_ctx_token)
+    # Sent for EVERY seat call, not only the tools that read it: a channel armed
+    # selectively is a channel whose absence means two different things, and the
+    # next tool to need an identity should find one there. `seat_id` is None on
+    # every other auth path, and the header is then absent entirely.
+    result = await call_mcp_tool(req.tool, req.arguments, seat=seat_id)
     if not result.get("ok") and "failure_class" not in result:
         result["failure_class"] = "stack"  # (#7)
 

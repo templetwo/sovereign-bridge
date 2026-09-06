@@ -574,7 +574,7 @@ def live(monkeypatch, tmp_path):
     (tool, arguments) that would have reached the stack."""
     seen: list[tuple[str, dict]] = []
 
-    async def fake(tool, args):
+    async def fake(tool, args, seat=None):
         seen.append((tool, args))
         return {"ok": True, "result": {"echo": tool}}
 
@@ -838,7 +838,7 @@ dispatched = []
 stamps = []
 
 
-async def fake(tool, args):
+async def fake(tool, args, seat=None):
     dispatched.append((tool, args))
     return {"ok": True, "result": {"synthetic": True}}
 

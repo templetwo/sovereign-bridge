@@ -194,37 +194,41 @@ only while another component is configured a certain way is not a boundary), `ht
 limited to GET/HEAD, `file_hash` probes confined to the sovereign root, an unknown probe type
 refused, and a `watch_id` must be one plain path segment.
 
-**The closer identity travels in-process, never as an argument.** `signal_ack` stamps who
-closed a signal; the bridge sets the verified seat on
-`sovereign_stack.dispatch_context` around the dispatch and resets it in a `finally`. A
-client supplying `actor`, `actor_seat`, `closed_by`, `owner` or `source_seat` is refused
-rather than overwritten, and a stack with no such module cannot serve `signal_ack` to a seat
-at all — a field trusted because of *who usually sets it* is not verified, it is assumed.
+**The closer identity travels on the transport, never as an argument.** `signal_ack`
+stamps who closed a signal. The bridge merges `X-Sovereign-Seat: <kernel-verified seat>`
+into the headers of the per-call SSE session it already opens; the stack's `handle_sse`
+reads it off the ASGI scope on the plain local `/sse` endpoint, validates it, and binds
+`CALLER_SEAT` before `server.run`. A client supplying `actor`, `actor_seat`, `closed_by`,
+`owner` or `source_seat` is refused rather than overwritten — a field trusted because of
+*who usually sets it* is not verified, it is assumed.
 
-> ⚠ **AND THE CHANNEL DOES NOT REACH THE STACK. `signal_ack` is refused to seats for that
-> reason, not only when the module is missing.** `call_mcp_tool` dispatches over SSE to
-> `MCP_SSE_URL` (127.0.0.1:3434) — the **sovereign-sse process** — and it is this bridge's
-> only dispatch (`bridge_core`, the in-process shim, is not used here). The stack's handlers
-> run there; `set_caller_seat` runs in the bridge process; a `contextvars.ContextVar` is
-> per-process. **And the stack does not leave the gap empty:** its dispatch entry establishes
-> `CALLER_SEAT` from its *own* spiral session whenever it arrives unset, on the stated premise
-> that "the bridge establishes its kernel-verified seat in-process before calling in". That
-> premise is false over this hop, so the ledger would name **the server** as the closer, at
-> HTTP 200, with `outcome=allowed` in this bridge's audit line.
->
-> HQ's specified guard — refuse when `sovereign_stack.dispatch_context` is absent — treats
-> module-present as identity-arrives. It is not. So the guard asks **both** questions and
-> fails closed on either: `no_caller_channel` when the module is missing,
-> `channel_cannot_cross_dispatch` when it is present but the dispatch cannot carry it. The
-> second reason says explicitly that the file is there and the hop is the problem, so nobody
-> spends an evening looking for a missing module. **This changes nothing observable today**
-> (the module is absent from the live tree and the tool is already refused); it changes what
-> happens on the deploy after. **The bridge half of D1 is implemented as specified; the
-> end-to-end property is not closed and cannot be closed from this repo** — the stack must
-> carry the seat across the hop (an MCP request field or per-call header resolved into
-> `CALLER_SEAT` server-side), or this bridge must dispatch in-process, at which point the
-> guard retires itself.
-> Pinned by `tests/test_seat_identity.py::test_the_caller_channel_is_measured_in_the_WRONG_PROCESS`.
+The same header name arrives inbound and means something weaker: **inbound it is a client
+DECLARATION** checked against the kernel-verified peer, **outbound it is this bridge
+ASSERTING** an identity it already verified. The outbound value is built from the verified
+seat and never copied from the request, and the module-level header dict is never mutated,
+so one seat's header cannot leak onto the next call.
+
+**A seat is served `signal_ack` only when the stack says it reads that channel.** The guard
+asks the stack's own heartbeat for `caller_identity_channel` (over the tool route the bridge
+already has, cached 60 s) and admits the tool only on an exact match with
+`x-sovereign-seat-sse-header`. Anything else — an older stack, a heartbeat that will not
+answer, a field of the wrong shape, a channel by another name — is `403
+stack_has_no_caller_channel`, and **the detail names what was actually read** rather than
+asserting an absence. Without that confirmation the stack falls back to its own shared
+spiral session and the ledger would name **the server** as the closer while the call
+returned 200.
+
+> ⚠ **WHY THE GUARD ASKS THE FAR END, WRITTEN DOWN BECAUSE THE OBVIOUS GUARD WAS UNSAFE.**
+> The first design carried the seat in a `contextvars.ContextVar`
+> (`sovereign_stack.dispatch_context`) and refused when that module was absent. Measured:
+> `call_mcp_tool` dispatches over SSE to 127.0.0.1:3434 — the **sovereign-sse process**, and
+> it is this bridge's only dispatch (`bridge_core`, the in-process shim, is not used here).
+> A contextvar is per-process, so the identity never arrived. And the stack does not leave
+> the gap empty: its dispatch entry sets `CALLER_SEAT` from its own spiral session when it
+> arrives unset. Refusing on *module absent* keyed on importability **in a process that does
+> not dispatch**, so it would have lifted itself on the next stack deploy with nothing here
+> changing and no test going red. The lesson kept in the code: **measure the contract at the
+> far end of the hop, never infer it at the near end.**
 
 **Signing:** the bridge *overrides* `source_instance` with the seat id on every call whose
 stack schema **declares** that field (`arrive`, `arrive_lineage`, `handoff`,

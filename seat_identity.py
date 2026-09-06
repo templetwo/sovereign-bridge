@@ -510,51 +510,54 @@ SEAT_SIGNABLE_TOOLS = frozenset(
 # because of who *usually* sets it is a `owner`-string in a new coat, and the
 # stack's own review had already thrown that pattern out once.
 #
-# THE CHANNEL IS NOW IN-PROCESS: `sovereign_stack.dispatch_context` carries a
-# `contextvars.ContextVar` the bridge SETS around the dispatch and the stack
-# READS. A contextvar cannot be written by anything on the wire, so the stack's
-# refusal of the five argument names below is enforceable rather than
+# THE CHANNEL IS OUT OF BAND OF THE ARGUMENTS: the seat rides the transport,
+# not the call. A caller can put anything in `arguments`; it cannot choose the
+# headers of the SSE session this bridge opens on its behalf. That is what makes
+# the stack's refusal of the five argument names below enforceable rather than
 # conventional. The stack round 3 refuses `actor`, `actor_seat`, `owner`,
 # `closed_by` and `source_seat` on signal_ack outright.
 #
-# FAIL CLOSED WHEN THE CHANNEL IS ABSENT. Against a stack older than round 3
-# there is no contextvar to set, so a seat's signal_ack would be stamped with
-# the shared server spiral session — the SERVER, not the seat — and the record
-# would name the wrong closer while looking correct. So the tool is REFUSED to
-# seats rather than served through a degraded channel. Falling back to the
-# argument is exactly the fix this amendment removes.
+# FAIL CLOSED WHEN THE CHANNEL IS ABSENT. Against a stack that does not read
+# the header, a seat's signal_ack would be stamped with the shared server
+# spiral session — the SERVER, not the seat — and the record would name the
+# wrong closer while looking correct. So the tool is REFUSED to seats rather
+# than served through a degraded channel. Falling back to the argument is
+# exactly the fix this amendment removes.
 #
-# ⚠⚠ AND HQ'S MECHANISM FOR THE ABOVE WAS A PROXY THAT IS NOT BICONDITIONAL.
-# "Refuse when the module is absent" assumes module-present == identity-arrives.
-# It does not, for this bridge.
+# ⚠⚠ AND THE CHANNEL IS THE PER-CALL SSE HEADER, NOT A CONTEXTVAR (HQ round 3,
+# 2026-09-06). The round-2 amendment specified an in-process
+# `contextvars.ContextVar` (`sovereign_stack.dispatch_context`). MEASURED, IT
+# COULD NOT WORK AND ITS GUARD WAS UNSAFE:
 #
 #   `bridge.call_mcp_tool` dispatches over `sse_client(MCP_SSE_URL)` to
-#   127.0.0.1:3434, the sovereign-sse process, where the stack's handlers run.
-#   `set_caller_seat` runs HERE. A `contextvars.ContextVar` is per-process.
-#   Nothing this bridge sets around the dispatch is visible to the handler.
-#   `bridge_core` (the stack's in-process shim) appears nowhere in this repo:
-#   the SSE hop is not one route among several, it is the only one.
+#   127.0.0.1:3434, the sovereign-sse process, and it is this bridge's ONLY
+#   dispatch — `bridge_core`, the stack's in-process shim, appears nowhere in
+#   this repo. A contextvar is per-process, so the identity never arrived. And
+#   the stack does not leave the gap empty: its dispatch entry establishes
+#   CALLER_SEAT from its OWN spiral session when it arrives unset, so the ledger
+#   would have named THE SERVER as the closer, at HTTP 200, with
+#   `outcome=allowed` in this bridge's own audit line. The guard as first
+#   specified — refuse when the module is absent — keyed on importability in a
+#   process that does not dispatch, so it would have LIFTED ITSELF on the next
+#   stack deploy with nothing here changing and no test going red.
 #
-#   AND THE FAILURE IS NOT "UNSET, SO REFUSE". The stack's own dispatch entry
-#   establishes CALLER_SEAT from its OWN spiral session whenever it arrives
-#   unset — reasoning, in its comment, that "the bridge establishes its
-#   kernel-verified seat in-process before calling in". Over SSE that premise
-#   is false, so the ledger would stamp THE SERVER as the closer, at HTTP 200,
-#   with `outcome=allowed` in this bridge's audit line. A wrong name that looks
-#   right, which is the exact class this review round exists to hunt.
+# THE CHANNEL NOW: the bridge merges `X-Sovereign-Seat: <verified seat>` into
+# the headers of the per-call SSE session it already opens. The stack's
+# `handle_sse` reads it off the ASGI scope on the plain local /sse endpoint,
+# validates `^[a-z0-9][a-z0-9-]{2,63}$`, and binds CALLER_SEAT before
+# `server.run`. Its native heartbeat advertises
+# `caller_identity_channel: "x-sovereign-seat-sse-header"`.
 #
-#   SO THE GUARD ASKS BOTH QUESTIONS (`actor_channel_refusal` +
-#   `dispatch_carries_context`) AND FAILS CLOSED ON EITHER. Checking only
-#   importability would have shipped a guard that lifts ITSELF on the next
-#   stack deploy — nothing would change here, no test would go red, and the
-#   first wrong record would be the notification. This changes nothing
-#   observable today (signal_ack is already refused, the module is absent from
-#   the live tree); it changes what happens on the deploy after.
-#
-#   NOT CLOSED, AND NOT CLOSEABLE FROM THIS REPO. The bridge half is
-#   implemented as HQ specified. The end-to-end property needs the stack to
-#   carry the seat ACROSS the hop. Stated in README.md; pinned by
-#   `tests/test_seat_identity.py::test_the_caller_channel_is_measured_in_the_WRONG_PROCESS`.
+# THE GUARD NOW ASKS THE STACK, NOT THE FILESYSTEM. `caller_channel()` reads
+# that advertisement over the heartbeat route this bridge already has, caches it
+# for 60 s, and `signal_ack` is admitted for seats ONLY when it equals the exact
+# token. Everything else — an older stack, a heartbeat that will not answer, a
+# field of the wrong shape, a channel name we do not recognise — is a refusal
+# whose detail NAMES WHAT WAS READ. The contract is now measured at the far end
+# of the hop instead of inferred at the near end, which is the whole correction.
+# The in-process set is GONE rather than kept beside the header: two channels
+# where one is inert leaves a reader no way to tell which one carries.
+
 SEAT_ACTOR_TOOLS = frozenset({"signal_ack"})
 
 # Names a client must not be able to put on the wire for those tools. Scoped to
@@ -565,120 +568,115 @@ SEAT_ACTOR_TOOLS = frozenset({"signal_ack"})
 SEAT_ACTOR_FORBIDDEN_ARGS = ("actor", "actor_seat", "closed_by", "owner", "source_seat")
 
 
-def dispatch_context_module():
-    """`sovereign_stack.dispatch_context`, or None when the stack predates it.
+CALLER_CHANNEL_NAME = "x-sovereign-seat-sse-header"
+CALLER_CHANNEL_CACHE_SECONDS = 60.0
 
-    ⚠ IMPORTED PER CALL, NOT AT MODULE SCOPE. A module-scope import resolved
-    once would pin this bridge to "absent" for the life of the process, so
-    deploying the stack without restarting the bridge would leave signal_ack
-    refused indefinitely while the code that answers it sits one process over.
-    That is SOP #12's shape and this house has now written it twice in one
-    file; a failed import is not cached in sys.modules, so the retry is cheap.
+# advertised: the string the stack last said it reads the caller identity from,
+# or None. note: how we know, in words, so a refusal can name what was read
+# rather than asserting an absence. expires: 0.0 = never read.
+_caller_channel_cache: dict[str, Any] = {
+    "advertised": None,
+    "note": "the stack heartbeat has not been read yet",
+    "expires": 0.0,
+}
+
+
+def reset_caller_channel_cache() -> None:
+    """Drop the cached advertisement. For tests, and for a deploy that wants the
+    next call to re-ask instead of waiting out the window."""
+    _caller_channel_cache.update(
+        advertised=None,
+        note="the stack heartbeat has not been read yet",
+        expires=0.0,
+    )
+
+
+async def caller_channel(fetch: Any = None) -> tuple[str | None, str]:
+    """What the STACK says it reads the caller identity from. (value, how).
+
+    Read from the stack's native heartbeat over the tool route this bridge
+    already has — the same credential, no new grant — and cached for
+    CALLER_CHANNEL_CACHE_SECONDS so a seat's ordinary traffic does not put a
+    round trip in front of every call.
+
+    ⚠ THE POINT OF ASKING THE FAR END. The round-2 guard asked whether a module
+    imported HERE, in the process that does not dispatch, and would have lifted
+    itself on a deploy. This asks the process that actually answers the tool
+    whether it reads the header this bridge sends. It is still an advertisement
+    rather than a proof — a stack could advertise the channel and not read it —
+    but it is measured across the hop the identity has to cross, and it cannot
+    turn green because a file appeared on this side of it.
+
+    ⚠ EVERY FAILURE CACHES AS "NO CHANNEL", INCLUDING A HEARTBEAT THAT WOULD NOT
+    ANSWER. An unanswerable question about whether an identity travels is a
+    refusal, never a permission, and the note carries the reason so an operator
+    is told which of several different failures happened.
     """
-    try:
-        from sovereign_stack import dispatch_context
+    now = time.time()
+    if now < _caller_channel_cache["expires"]:
+        return _caller_channel_cache["advertised"], _caller_channel_cache["note"]
 
-        if not hasattr(dispatch_context, "set_caller_seat") or not hasattr(
-            dispatch_context, "reset_caller_seat"
-        ):
-            return None
-        return dispatch_context
-    except Exception:  # noqa: BLE001 — absence and breakage are the same answer
-        return None
-
-
-def dispatch_carries_context() -> bool:
-    """Can a contextvar set here reach the code that runs the tool?
-
-    ⚠ THIS IS THE HALF THE ORIGINAL GUARD DID NOT ASK, AND IT IS THE HALF THAT
-    DECIDES. A `contextvars.ContextVar` is per-PROCESS. `bridge.call_mcp_tool`
-    dispatches over `sse_client(MCP_SSE_URL)` to 127.0.0.1:3434 — the
-    sovereign-sse process — so the identity set around that call is invisible
-    to the handler that answers it. Importability of `dispatch_context` in THIS
-    process says nothing about that hop.
-
-    Answered by reading the dispatch's own source rather than by a flag,
-    because a flag is a claim about the code and this is the code. Anything
-    that cannot be read is FALSE: an unanswerable question about whether an
-    identity travels is a refusal, never a permission.
-
-    It retires itself correctly. The day the bridge dispatches in-process (a
-    native shim, `bridge_core`), the SSE marker is gone from the source, this
-    returns True, and the guard stops firing without anyone remembering to
-    remove it. A test-installed in-process fake is the same fact, honestly
-    reported: with that fake, the context really does reach the dispatch.
-    """
-    try:
-        import bridge  # local import: bridge imports THIS module at its top
-    except Exception:  # noqa: BLE001
-        return False
-    call = getattr(bridge, "call_mcp_tool", None)
-    if call is None:
-        return False
-    try:
-        source = inspect.getsource(call)
-    except (OSError, TypeError):
-        return False
-    return "sse_client(" not in source and "MCP_SSE_URL" not in source
+    advertised: str | None = None
+    if fetch is None:
+        note = "no route to the stack heartbeat was supplied to the guard"
+    else:
+        try:
+            payload = await fetch()
+        except Exception as exc:  # noqa: BLE001 — every failure is one answer
+            note = f"the stack heartbeat did not answer ({exc})"
+        else:
+            value = (
+                payload.get("caller_identity_channel")
+                if isinstance(payload, dict)
+                else None
+            )
+            if isinstance(value, str) and value.strip():
+                advertised = value.strip()
+                note = (
+                    "the stack heartbeat advertises "
+                    f"caller_identity_channel={advertised!r}"
+                )
+            else:
+                note = (
+                    "the stack heartbeat answered and carries no "
+                    "caller_identity_channel field"
+                )
+    _caller_channel_cache.update(
+        advertised=advertised, note=note, expires=now + CALLER_CHANNEL_CACHE_SECONDS
+    )
+    return advertised, note
 
 
-def actor_channel_refusal(tool: str) -> tuple[str, str] | None:
+async def actor_channel_refusal(
+    tool: str, fetch: Any = None
+) -> tuple[str, str] | None:
     """Refuse a seat call whose identity has nowhere trustworthy to travel.
 
-    TWO QUESTIONS, NOT ONE, AND THE SECOND WAS THE MISSING HALF OF D1.
-
-      1. does a channel EXIST — is `sovereign_stack.dispatch_context`
-         importable here (HQ's stated condition); and
-      2. can this bridge's dispatch CARRY it — see `dispatch_carries_context`.
-
-    HQ's mechanism assumed the two were the same question. They are not, and
-    the divergence is written down in the stack itself: `server.py` establishes
-    `CALLER_SEAT` from its OWN spiral session whenever it arrives unset,
-    reasoning that "the bridge establishes its kernel-verified seat in-process
-    before calling in". That premise is false for THIS bridge — `call_mcp_tool`
-    is its only dispatch and it is an SSE hop to another process. So over that
-    hop the outcome is not "no identity, refuse"; it is the SERVER'S SHARED
-    SESSION STAMPED AS THE CLOSER, at HTTP 200, with `outcome=allowed` in this
-    bridge's own audit line. A wrong name that looks right is the failure this
-    whole review round exists to hunt.
-
-    Checking only (1) would therefore have shipped a guard that lifts itself on
-    the next stack deploy while the thing it guards gets worse, not better.
+    Admitted only when the stack advertises the EXACT channel this bridge
+    sends. Not "some channel", not "a channel whose name looks close": a stack
+    that reads identity from somewhere else is a stack this bridge is not
+    speaking to, and guessing at a near-match is how a contract drifts into a
+    convention.
     """
     if tool not in SEAT_ACTOR_TOOLS:
         return None
-    if dispatch_context_module() is None:
-        return (
-            "no_caller_channel",
-            (
-                f"Tool {tool!r} needs the verified seat identity to reach the "
-                "stack, and this stack has no `sovereign_stack.dispatch_context` "
-                "to carry it. Without that channel the closer would be stamped "
-                "from the server's shared spiral session rather than from the "
-                "seat that closed the signal — a record naming the wrong actor "
-                "while looking correct. Refused rather than served through a "
-                "channel a caller could write to. Deploy the stack release first."
-            ),
-        )
-    if not dispatch_carries_context():
-        return (
-            "channel_cannot_cross_dispatch",
-            (
-                f"Tool {tool!r} needs the verified seat identity to reach the "
-                "stack. `sovereign_stack.dispatch_context` IS present here, but "
-                "this bridge dispatches over SSE to another process and a "
-                "contextvar does not cross a process boundary — so the seat set "
-                "around the call is invisible to the handler that answers it, "
-                "and the stack would stamp its own shared spiral session as the "
-                "closer. Do not go looking for a missing file: the file is "
-                "there and the hop is the problem. Closing this needs the stack "
-                "to carry the seat ACROSS the hop (an MCP request field or a "
-                "per-call header, resolved into CALLER_SEAT on the server side), "
-                "or this bridge to dispatch in-process. Until then the tool is "
-                "refused rather than served with an attribution nobody checked."
-            ),
-        )
-    return None
+    advertised, note = await caller_channel(fetch)
+    if advertised == CALLER_CHANNEL_NAME:
+        return None
+    return (
+        "stack_has_no_caller_channel",
+        (
+            f"Tool {tool!r} stamps who closed a signal, so it is served to a "
+            "seat only when the stack confirms it reads the identity this "
+            f"bridge sends — the per-call SSE header {CALLER_CHANNEL_NAME!r}. "
+            f"It does not: {note}. Without that confirmation the stack falls "
+            "back to its own shared spiral session and the ledger would name "
+            "the SERVER as the closer while the call returned 200 — a wrong "
+            "name that looks right. Refused rather than served with an "
+            "attribution nobody checked. Deploy the stack release first."
+        ),
+    )
+
 
 
 def actor_argument_refusal(tool: str, arguments: Any) -> tuple[str, str] | None:
@@ -1640,9 +1638,9 @@ def sign_arguments(tool: str, arguments: dict[str, Any], seat_id: str) -> dict[s
     header wins, because the header is the thing the bridge actually verified.
 
     ⚠ ONE FIELD, NOT TWO. An earlier draft of D1 also stamped `actor_seat` for
-    signal_ack here. That is gone: the closer identity travels in-process
-    (`dispatch_context`), never as an argument — see SEAT_ACTOR_TOOLS above for
-    why an argument could not carry it honestly.
+    signal_ack here. That is gone: the closer identity travels on the per-call
+    SSE session as `X-Sovereign-Seat`, never as an argument — see
+    SEAT_ACTOR_TOOLS above for why an argument could not carry it honestly.
     """
     if not isinstance(arguments, dict):
         return arguments

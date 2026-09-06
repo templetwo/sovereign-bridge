@@ -36,7 +36,7 @@ def client(monkeypatch, tmp_path):
 
     recorded = []
 
-    async def fake_tool(tool, args):
+    async def fake_tool(tool, args, seat=None):
         recorded.append((tool, args))
         return {"ok": True, "result": "recorded"}
 
