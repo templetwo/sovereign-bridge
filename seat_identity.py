@@ -1129,9 +1129,14 @@ def filter_protected(payload: Any, index: ProtectedIndex) -> tuple[Any, int]:
 # from the response text. That is a blunt instrument and it is deliberately
 # blunt: it does not need to understand any tool's formatting, so a tool that
 # renders 150 characters, or 400, or across a line break, is covered by the
-# same rule. What it costs is a chronicle scan per text read (measured: 1589
-# files, 3690 entries, 7.4 MB, 0.10 s) and the risk of over-redaction, which is
-# the safe direction.
+# same rule. What it costs is a chronicle scan per text read (measured on the
+# live store: 1589 files, 3690 entries, 7.4 MB, 63.5 ms) plus 6.5 ms per 100 KB
+# of response, and the risk of over-redaction, which is the safe direction.
+#
+# ⚠ PROTECTED_BODY_SCAN_MAX_FILES IS A DEADLINE, NOT A CEILING. The live
+# chronicle is 1589 shards against a bound of 20,000. When it crosses that, TEXT
+# reads begin REFUSING — correctly, but as an outage. Better a known date than a
+# surprise: re-measure when the shard count passes roughly 15,000.
 #
 # FAIL CLOSED AT EVERY EDGE. A designated id whose body cannot be located, a
 # body too short to redact without destroying the response, a scan that hits
@@ -1151,22 +1156,44 @@ PROTECTED_BODIES_MAX_BYTES = 4 * 1024 * 1024
 PROTECTED_TEXT_MAX_BYTES = 4 * 1024 * 1024
 WITHHELD_MARK = "[withheld: protected]"
 
-# The fields that carry a record's BODY. Deliberately not "every string in the
-# entry": redacting metadata would strip domain names and timestamps out of
-# ordinary prose, and over-redaction that destroys a response is its own kind
-# of failure. `content` is the field the claim id is derived from and the one
-# `context_retrieve` renders.
-_BODY_FIELDS = (
-    "content",
-    "question",
-    "context",
-    "note",
-    "body",
-    "text",
-    "what_i_learned",
-    "what_surprised_me",
-    "what_to_pick_up",
+# ⚠ BODIES ARE COLLECTED BY EXCLUSION, NOT BY AN ALLOWLIST — and that reversal
+# is N1's own lesson applied to N1's own fix. An enumerated list of body fields
+# is a list of the doors somebody thought of, and the set of doors is open: the
+# first draft here listed nine names, and a live designated record carries
+# `emotion_note` (248 characters of lived material), which was not among them.
+# The record would have resolved, contributed only its `content`, and the note
+# would have gone out in rendered prose with `withheld_protected` counting the
+# other half.
+#
+# So every string value in the entry is a body UNLESS its key is a LABEL. The
+# label list is short, closed, and about identity rather than content:
+# redacting a domain would strip domain names out of ordinary output, and
+# over-redaction that destroys a response is its own kind of failure. A field
+# nobody has classified is treated as content, which is the safe side.
+_METADATA_FIELDS = frozenset(
+    {
+        "timestamp", "occurred_at", "entry_timestamp",
+        "domain", "layer", "vantage", "intensity", "emotional_intensity",
+        "observed_emotion", "emotion_source", "truth_basis",
+        "claim_id", "id", "ref", "supersedes", "superseded_by",
+        "session_id", "source_instance", "thread", "thread_id",
+        "verified_by", "action", "designated_by", "stakes_archive_id",
+        "subject", "by", "reason", "status",
+    }
 )
+
+
+def _entry_bodies(entry: dict) -> list[str]:
+    """Every content-bearing string in an entry, longest first."""
+    out = [
+        value
+        for key, value in entry.items()
+        if key not in _METADATA_FIELDS
+        and isinstance(value, str)
+        and len(value) >= PROTECTED_BODY_MIN_LENGTH
+    ]
+    out.sort(key=len, reverse=True)
+    return out
 
 
 class ProtectedBodiesUnavailable(Exception):
@@ -1239,12 +1266,7 @@ def load_protected_bodies(index: ProtectedIndex) -> tuple[str, ...]:
             cid = derive_claim_id(entry)
             if cid is None or cid not in wanted:
                 continue
-            bodies = [
-                entry[field]
-                for field in _BODY_FIELDS
-                if isinstance(entry.get(field), str) and entry[field]
-            ]
-            found[cid] = bodies
+            found[cid] = (_entry_bodies(entry), sorted(entry))
             wanted.discard(cid)
         if not wanted:
             break
@@ -1261,14 +1283,21 @@ def load_protected_bodies(index: ProtectedIndex) -> tuple[str, ...]:
     out: list[str] = []
     total = 0
     for cid in sorted(found):
-        for body in found[cid]:
-            if len(body) < PROTECTED_BODY_MIN_LENGTH:
-                raise ProtectedBodiesUnavailable(
-                    f"designated claim {cid[:12]} has a body of "
-                    f"{len(body)} characters, below the {PROTECTED_BODY_MIN_LENGTH} "
-                    "needed to search for it without redacting ordinary language; "
-                    "text-producing reads cannot be certified against it"
-                )
+        bodies, keys = found[cid]
+        # ⚠ RESOLVED IS NOT THE SAME AS SEARCHABLE. A record that was found but
+        # yields nothing long enough to look for would otherwise pass through
+        # here contributing NOTHING, and the text read would return
+        # `withheld_protected: 0` — "I looked and found nothing" wearing the
+        # costume of "there is nothing", one layer inside the fix that exists
+        # to stop exactly that.
+        if not bodies:
+            raise ProtectedBodiesUnavailable(
+                f"designated claim {cid[:12]} resolves to an entry carrying no "
+                f"body of at least {PROTECTED_BODY_MIN_LENGTH} characters "
+                f"(fields: {', '.join(keys)}), so a rendered response cannot be "
+                "certified free of it"
+            )
+        for body in bodies:
             total += len(body)
             if total > PROTECTED_BODIES_MAX_BYTES:
                 raise ProtectedBodiesUnavailable(
@@ -1286,7 +1315,7 @@ def _grams(body: str) -> frozenset[str]:
     )
 
 
-def _redact_string(text: str, prepared) -> tuple[str, int]:
+def _redact_string(text: str, bodies: tuple[str, ...], grams: frozenset[str]) -> tuple[str, int]:
     """Replace every designated body, and every long fragment of one. (text, n).
 
     TWO RULES, because one of them alone leaks:
@@ -1300,19 +1329,33 @@ def _redact_string(text: str, prepared) -> tuple[str, int]:
     Overlapping and adjacent hits merge into ONE replacement, so a paragraph of
     withheld material is one mark rather than a hundred.
     """ % PROTECTED_BODY_GRAM
-    if not text or not prepared:
+    if not text or not bodies:
         return text, 0
 
     spans: list[tuple[int, int]] = []
-    for body, grams in prepared:
+    # Whole-body containment: a C-speed find per body, cheap at any size.
+    for body in bodies:
         start = text.find(body)
         while start != -1:
             spans.append((start, start + len(body)))
             start = text.find(body, start + 1)
-        if grams and len(text) >= PROTECTED_BODY_GRAM:
-            for i in range(len(text) - PROTECTED_BODY_GRAM + 1):
-                if text[i : i + PROTECTED_BODY_GRAM] in grams:
-                    spans.append((i, i + PROTECTED_BODY_GRAM))
+    # ⚠ ONE PASS OVER THE TEXT FOR ALL BODIES AT ONCE. The grams of every
+    # designated body live in ONE set, so the cost is O(len(text)) no matter
+    # how many records are designated — not O(len(text) x bodies). The
+    # alternative, searching the text once per body, put a synchronous Python
+    # loop proportional to designations x response size inside an async
+    # handler, where it blocks every other caller.
+    #
+    # MEASURED, against the live designation set (5 bodies, 7,895 merged grams):
+    # 10 KB of text 0.7 ms, 100 KB 6.5 ms, 1 MB 64 ms. The chronicle scan that
+    # produces the bodies is 63.5 ms over the live store. So a text read costs
+    # roughly 70 ms more than it did, and PROTECTED_TEXT_MAX_BYTES bounds the
+    # tail at about a quarter second.
+    if grams and len(text) >= PROTECTED_BODY_GRAM:
+        window = PROTECTED_BODY_GRAM
+        for i in range(len(text) - window + 1):
+            if text[i : i + window] in grams:
+                spans.append((i, i + window))
     if not spans:
         return text, 0
 
@@ -1347,10 +1390,9 @@ def redact_protected_text(payload: Any, bodies: tuple[str, ...]) -> tuple[Any, i
         # having been walked, and returning it unchanged is honest.
         return payload, 0
 
-    prepared = tuple(
-        (body, _grams(body) if len(body) >= PROTECTED_BODY_GRAM else frozenset())
-        for body in bodies
-    )
+    grams: frozenset[str] = frozenset().union(
+        *(_grams(body) for body in bodies if len(body) >= PROTECTED_BODY_GRAM)
+    ) if any(len(b) >= PROTECTED_BODY_GRAM for b in bodies) else frozenset()
     seen_bytes = 0
     total = 0
 
@@ -1364,7 +1406,7 @@ def redact_protected_text(payload: Any, bodies: tuple[str, ...]) -> tuple[Any, i
                     "bytes of text, more than can be certified free of protected "
                     "material"
                 )
-            redacted, n = _redact_string(node, prepared)
+            redacted, n = _redact_string(node, bodies, grams)
             total += n
             return redacted
         if isinstance(node, dict):

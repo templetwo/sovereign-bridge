@@ -584,6 +584,19 @@ def _certify_seat_result(
     if protected_bodies:
         try:
             filtered, redacted = si.redact_protected_text(filtered, protected_bodies)
+            # ⚠ AND THE ERROR STRING, WHICH IS ALSO THE STACK'S PROSE. A failed
+            # tool call carries the handler's own message verbatim
+            # (`call_mcp_tool` lifts `result.content[0].text`), and a handler
+            # that formats entry content into a failure — "could not supersede
+            # claim …: content mismatch: <body>" — would deliver it to a seat
+            # through a field the certifier never walked. Same class as N1: not
+            # the result, but content reaching a seat through a key nobody
+            # thought to certify.
+            if isinstance(result.get("error"), str):
+                result["error"], from_error = si.redact_protected_text(
+                    result["error"], protected_bodies
+                )
+                redacted += from_error
         except si.ProtectedBodiesUnavailable as exc:
             si.audit(seat_id, tool, "denied", "protected_text_uncertifiable", **audit_pids)
             raise ScopeHTTPException(

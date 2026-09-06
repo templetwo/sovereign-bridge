@@ -520,6 +520,74 @@ def test_a_short_whole_body_is_caught_by_the_containment_rule(seated, upstream, 
     assert out["withheld_protected"] == 1
 
 
+def test_a_body_field_NOBODY_LISTED_is_still_a_body(seated, upstream, tmp_path):
+    """⚠ N1'S OWN LESSON, APPLIED TO N1'S OWN FIX. The first draft collected
+    bodies from an allowlist of nine field names — which is an enumerated list
+    of the doors somebody thought of, the exact shape F1 already demonstrated
+    once. A live designated record carries `emotion_note`, 248 characters of
+    lived material, which was not among them: the record would have resolved,
+    contributed only its `content`, and the note would have gone out in
+    rendered prose while `withheld_protected` counted the other half.
+
+    Bodies are now collected by EXCLUSION: every string in the entry is content
+    unless its key is a short, closed list of LABELS.
+    """
+    record = {
+        "timestamp": "2026-05-05T00:00:00Z",
+        "domain": "synthetic,lived,fixture",
+        "content": "the ordinary content field of a lived synthetic record here",
+        "emotion_note": (
+            "a synthetic note in a field no allowlist mentioned, long enough "
+            "to be searched for and to matter"
+        ),
+    }
+    shard = tmp_path / "chronicle" / "insights" / "synthetic-fixture" / "entries.jsonl"
+    shard.write_text(json.dumps(record) + "\n" + json.dumps(ORDINARY) + "\n")
+    seated(
+        json.dumps({"action": "protect", "claim_id": claim_id(record),
+                    "stakes_archive_id": "f" * 64, "designated_by": "t"}) + "\n"
+    )
+    upstream["result"] = {"ok": True, "result": "she wrote: " + record["emotion_note"]}
+    out = call("start_here").json()
+    assert record["emotion_note"] not in out["result"]
+    assert si.WITHHELD_MARK in out["result"]
+    assert out["withheld_protected"] == 1
+
+
+def test_a_LABEL_is_not_redacted_out_of_ordinary_prose(seated, upstream):
+    """The other side of collecting by exclusion. A designated record's DOMAIN
+    is 60-odd characters of label, and it names a subject, not a body —
+    redacting it would strip domain names out of every response that mentions
+    one. Over-redaction that destroys a response is its own kind of failure."""
+    upstream["result"] = {
+        "ok": True,
+        "result": f"searched the domain {SECRET['domain']} and found nothing new",
+    }
+    out = call("start_here").json()
+    assert SECRET["domain"] in out["result"]
+    assert out["withheld_protected"] == 0
+
+
+def test_the_stacks_ERROR_STRING_is_certified_too(seated, upstream):
+    """⚠ CONTENT REACHING A SEAT THROUGH A KEY NOBODY WALKED — the same class as
+    N1, one field over. A failed tool call carries the stack handler's own
+    message verbatim, and a handler that formats entry content into a failure
+    ("content mismatch: <body>") would hand it to a seat while
+    `withheld_protected` said zero, because the certifier only ever walked
+    `result`."""
+    upstream["result"] = {
+        "ok": False,
+        "failure_class": "tool",
+        "error": "could not supersede: content mismatch: " + SECRET["content"],
+    }
+    out = call("context_retrieve", query="x").json()
+    assert out["ok"] is False
+    assert SECRET["content"] not in out["error"]
+    assert si.WITHHELD_MARK in out["error"]
+    assert out["withheld_protected"] == 1
+    assert "could not supersede" in out["error"], "the diagnosis survived"
+
+
 def test_an_ordinary_body_is_not_touched(seated, upstream):
     """Over-redaction is the safe direction and still has a floor: text that is
     not a designated body must come back whole, or the guard is just an outage
@@ -562,13 +630,18 @@ def test_an_unlocatable_body_does_not_take_the_structured_surface_down(
     assert call("record_insight", content="x", domain="d").status_code == 200
 
 
-def test_a_short_designated_body_refuses_rather_than_redacting_the_language(
-    seated, upstream
-):
-    """A body of a handful of characters cannot be searched for without
-    redacting ordinary words. Ignoring it would leak; redacting it would
-    destroy every response. Refusing is the only honest third answer, and it
-    names the length."""
+def test_a_record_that_resolves_to_NOTHING_SEARCHABLE_refuses(seated, upstream):
+    """⚠ RESOLVED IS NOT THE SAME AS SEARCHABLE, and the gap between them is
+    where this fix could have grown its own fail-open.
+
+    A designated record whose every field is shorter than the floor is FOUND —
+    so it is not "missing" — and contributes no body, so the read would return
+    `withheld_protected: 0`. That is "I looked and found nothing" wearing the
+    costume of "there is nothing", one layer inside the fix built to stop
+    exactly that. A body of a handful of characters cannot be searched for
+    without redacting ordinary words either: ignoring it leaks, redacting it
+    destroys every response, so refusing is the honest third answer and it
+    names the fields the record did carry."""
     tiny = {"timestamp": "2026-03-03T00:00:00Z", "domain": "synthetic,tiny", "content": "ab"}
     (Path(os.environ["SOVEREIGN_CHRONICLE"]) / "insights" / "synthetic-fixture" / "entries.jsonl").write_text(
         json.dumps(SECRET) + "\n" + json.dumps(ORDINARY) + "\n" + json.dumps(tiny) + "\n"
@@ -579,7 +652,9 @@ def test_a_short_designated_body_refuses_rather_than_redacting_the_language(
     )
     r = call("context_retrieve", query="x")
     assert r.status_code == 403
-    assert "below the" in r.json()["detail"]
+    detail = r.json()["detail"]
+    assert "carrying no body of at least" in detail
+    assert "content" in detail, "the refusal must name what the record did carry"
 
 
 def test_a_text_response_the_walker_cannot_read_is_refused(seated, monkeypatch):

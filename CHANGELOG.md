@@ -45,6 +45,18 @@ turned them into decisions D1–D10. Each is closed below with a test that fails
   counting each site. Unresolvable body, too-short body, scan or payload past its bound,
   unreadable node — each refuses. A published tool in no class is refused rather than
   defaulted. Residual stated: runs shorter than 40 characters are not matched.
+  **Two fail-opens inside the fix itself, caught in review and closed.** (1) Bodies were
+  collected from an ALLOWLIST of nine field names — an enumerated list of the doors somebody
+  thought of, which is the exact shape F1 demonstrated once already. A live designated record
+  carries `emotion_note` (248 characters of lived material) outside that list: it would have
+  resolved, contributed only its `content`, and shipped the note in prose while
+  `withheld_protected` counted the other half. Collection is now by EXCLUSION — every string
+  is content unless its key is a label — and a record that resolves to nothing searchable
+  REFUSES rather than contributing zero. (2) The certifier walked `result` and not `error`,
+  so a handler that formats entry content into a failure message would deliver it through a
+  key nobody certified. Both walked now. Measured cost: 63.5 ms for the chronicle scan over
+  the live store, 6.5 ms per 100 KB of response (one pass over the text for all bodies, not
+  one per body).
   *`tests/test_seat_protected.py::test_context_retrieve_no_longer_hands_a_seat_the_rendered_body`,
   `::test_a_body_split_across_a_formatting_boundary_is_still_caught`,
   `::test_a_designated_body_that_cannot_be_located_refuses_the_text_read`,
