@@ -1753,7 +1753,9 @@ async def call_tool_endpoint(
         # channel to carry the verified seat cannot serve the tool at all.
         for check in (
             si.actor_argument_refusal(req.tool, req.arguments),
-            await si.actor_channel_refusal(req.tool, fetch=_stack_heartbeat_payload),
+            await si.actor_channel_refusal(
+                req.tool, fetch=_stack_heartbeat_payload, seat=seat_id
+            ),
         ):
             if check is not None:
                 si.audit(seat_id, req.tool, "denied", check[0], **_audit_pids)
@@ -1852,7 +1854,12 @@ async def call_tool_endpoint(
     # selectively is a channel whose absence means two different things, and the
     # next tool to need an identity should find one there. `seat_id` is None on
     # every other auth path, and the header is then absent entirely.
-    result = await call_mcp_tool(req.tool, req.arguments, seat=seat_id)
+    # A name the stack's /sse door would refuse is not sent at all: the connect
+    # would 400 and take the seat's whole surface with it. `signal_ack` is
+    # already refused above in that case, so nothing is served with a missing
+    # identity — see seat_identity.SEAT_HEADER_VALUE_RE.
+    wire_seat = seat_id if si.seat_can_ride_the_channel(seat_id) else None
+    result = await call_mcp_tool(req.tool, req.arguments, seat=wire_seat)
     if not result.get("ok") and "failure_class" not in result:
         result["failure_class"] = "stack"  # (#7)
 

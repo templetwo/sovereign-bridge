@@ -47,6 +47,7 @@ no-op:
 
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -64,6 +65,7 @@ from suite_support import (  # noqa: E402
     PINNED_PUBLISHED,
     PINNED_RETIRED,
     release_stack_surface,
+    stack_release_tree,
 )
 import seat_socket as ss  # noqa: E402
 import session_tokens as st  # noqa: E402
@@ -775,6 +777,74 @@ def test_the_guard_does_not_ask_the_stack_about_every_other_tool(
     stamps no closer must not pay for a heartbeat round trip."""
     assert call(client(), "recall_insights", seat_hdr()).status_code == 200
     assert stack_channel["asked"] == []
+
+
+def test_a_seat_name_the_stack_would_refuse_is_never_put_on_the_wire(
+    registry, calls, surface, stack_channel
+):
+    """⚠ THE BRIDGE CHOOSES THE VALUE, SO THE BRIDGE OWES THE CHECK.
+
+    The stack refuses a `/sse` CONNECT whose `X-Sovereign-Seat` does not match
+    its pattern — HTTP 400, the whole session. Correct on its side and
+    catastrophic on ours if we send one anyway: a seat whose registry name has
+    an underscore or a capital would lose EVERY tool, not just the one that
+    needs an identity, and the reason would arrive as an opaque upstream 400
+    saying nothing about seat names.
+
+    So the header is withheld, the ordinary surface keeps working (those tools
+    sign themselves with `source_instance`, not through this channel), and only
+    `signal_ack` is refused — with a reason naming the name and the pattern.
+    """
+    bad = "HQ_Studio"
+    registry({bad: {"substrate": "anthropic", "kind": "seated", "enabled": True}})
+    c = client(env_seat=bad)
+
+    r = call(c, "recall_insights", {"X-Sovereign-Seat": bad})
+    assert r.status_code == 200, "an unusable seat name took down the whole surface"
+    assert calls.seats == [None], "a name the stack would refuse went on the wire"
+
+    r = call(
+        c, "signal_ack", {"X-Sovereign-Seat": bad},
+        signal_id="sig-1", state="acknowledged",
+    )
+    assert r.status_code == 403
+    detail = r.json()["detail"]
+    assert bad in detail
+    assert si.SEAT_HEADER_VALUE_RE.pattern in detail
+    assert len(calls) == 1, "signal_ack was served without an identity"
+
+
+def test_every_seat_name_this_house_uses_can_ride_the_channel():
+    """The names actually in the registry, checked against the mirrored
+    pattern, so the guard above is a tripwire and not a live denial."""
+    for seat in (
+        "grok-build-studio", "hq-claude-studio", "seat-codex",
+        "dispatch-grok", "seat-grok", "dispatch-codex",
+    ):
+        assert si.seat_can_ride_the_channel(seat), seat
+    for bad in ("HQ_Studio", "hq studio", "-leading", "ab", "x" * 65, "", None, 7):
+        assert not si.seat_can_ride_the_channel(bad), bad
+
+
+def test_the_mirrored_seat_pattern_still_matches_the_stacks_own():
+    """⚠ THE DRIFT ALARM ON A COPIED CONSTANT. `SEAT_HEADER_VALUE_RE` mirrors
+    `sovereign_stack.sse_server.SEAT_VALUE_RE`. A widening upstream only leaves
+    this bridge stricter, which fails closed. A NARROWING upstream would make
+    this bridge send names the stack now refuses, and every call from such a
+    seat would start failing at connect. Read the real one and compare."""
+    tree = stack_release_tree()
+    if tree is None:
+        pytest.skip(
+            "the stack release worktree is not present, so the mirrored "
+            "seat-name pattern cannot be checked against its source"
+        )
+    source = (tree / "sovereign_stack" / "sse_server.py").read_text()
+    found = re.search(r'SEAT_VALUE_RE = re\.compile\(r"([^"]+)"\)', source)
+    assert found, "the stack no longer declares SEAT_VALUE_RE where this test looks"
+    assert found.group(1) == si.SEAT_HEADER_VALUE_RE.pattern, (
+        "the bridge's mirrored seat-name pattern has drifted from the stack's: "
+        f"stack={found.group(1)!r} bridge={si.SEAT_HEADER_VALUE_RE.pattern!r}"
+    )
 
 
 def test_a_bearer_call_carries_no_seat_and_no_actor(

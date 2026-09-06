@@ -569,6 +569,33 @@ SEAT_ACTOR_FORBIDDEN_ARGS = ("actor", "actor_seat", "closed_by", "owner", "sourc
 
 
 CALLER_CHANNEL_NAME = "x-sovereign-seat-sse-header"
+
+# ⚠ THE VALUE HAS TO BE ONE THE STACK WILL ACCEPT, AND THIS BRIDGE IS THE PARTY
+# THAT CHOOSES IT. A MIRROR of `sovereign_stack.sse_server.SEAT_VALUE_RE`. The
+# stack refuses a `/sse` CONNECT carrying a header it cannot parse — HTTP 400,
+# loudly, which is the right call on its side — but that refusal is the whole
+# session, so a seat whose registry name does not match this pattern would lose
+# its ENTIRE surface the day the stack deploys, with the reason arriving as an
+# opaque upstream 400 rather than as anything about seat names.
+#
+# So the bridge checks first and DEGRADES INSTEAD OF BREAKING: a name that
+# cannot ride is simply not sent, the seat keeps every tool that does not need
+# an identity (their attribution rides `source_instance`, not this header), and
+# `signal_ack` — the one tool whose correctness depends on the identity
+# ARRIVING — is refused with a reason that says which name and which pattern.
+#
+# A MIRRORED CONSTANT CAN DRIFT, so say so rather than pretend otherwise: this
+# is a copy, the stack's is canonical, and a widening there simply leaves this
+# bridge stricter than it needs to be — which fails closed. A NARROWING there
+# is the dangerous direction, and it shows up as a 400 on connect, not as a
+# wrong record.
+SEAT_HEADER_VALUE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
+
+
+def seat_can_ride_the_channel(seat: Any) -> bool:
+    """Is this verified seat name one the stack's /sse door will take?"""
+    return isinstance(seat, str) and bool(SEAT_HEADER_VALUE_RE.match(seat))
+
 CALLER_CHANNEL_CACHE_SECONDS = 60.0
 
 # advertised: the string the stack last said it reads the caller identity from,
@@ -648,7 +675,7 @@ async def caller_channel(fetch: Any = None) -> tuple[str | None, str]:
 
 
 async def actor_channel_refusal(
-    tool: str, fetch: Any = None
+    tool: str, fetch: Any = None, seat: Any = None
 ) -> tuple[str, str] | None:
     """Refuse a seat call whose identity has nowhere trustworthy to travel.
 
@@ -660,6 +687,22 @@ async def actor_channel_refusal(
     """
     if tool not in SEAT_ACTOR_TOOLS:
         return None
+    if seat is not None and not seat_can_ride_the_channel(seat):
+        return (
+            "seat_name_cannot_ride_the_channel",
+            (
+                f"Tool {tool!r} stamps who closed a signal, and the seat name "
+                f"{seat!r} cannot be carried on the channel that identity "
+                f"travels: the stack accepts {SEAT_HEADER_VALUE_RE.pattern} on "
+                "the X-Sovereign-Seat header and refuses the whole connection "
+                "otherwise. The header is therefore not sent at all — the rest "
+                "of this seat's surface is unaffected, because those tools sign "
+                "themselves with source_instance rather than through this "
+                "channel — and this tool is refused rather than served with the "
+                "stack's own session standing in for the closer. Rename the "
+                "seat in the registry to close this."
+            ),
+        )
     advertised, note = await caller_channel(fetch)
     if advertised == CALLER_CHANNEL_NAME:
         return None
