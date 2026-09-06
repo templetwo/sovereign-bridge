@@ -6,7 +6,13 @@ BRIDGE_URL = os.getenv("BRIDGE_URL", "http://127.0.0.1:8100")
 BRIDGE_PORT = int(os.getenv("BRIDGE_PORT", "8100"))
 BRIDGE_TOKEN = ""
 
-TOKEN_FILE = Path.home() / ".config" / "sovereign-bridge.env"
+# SOVEREIGN_BRIDGE_ENV_FILE — the same test seam bridge.py carries, kept in
+# step so a suite that isolates one module does not silently read the real
+# credential file through the other. Unset, this is the deployed path exactly.
+TOKEN_FILE = Path(
+    os.environ.get("SOVEREIGN_BRIDGE_ENV_FILE")
+    or (Path.home() / ".config" / "sovereign-bridge.env")
+)
 if TOKEN_FILE.exists():
     for line in TOKEN_FILE.read_text().splitlines():
         if line.startswith("BRIDGE_TOKEN="):

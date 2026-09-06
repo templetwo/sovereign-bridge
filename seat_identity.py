@@ -57,11 +57,14 @@ deploy switch, and deleting it is the kill switch.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import re
 import stat
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -115,9 +118,11 @@ def audit(
     outcome: str,
     reason: str,
     peer_pid: int | None = None,
+    seat_pid: int | None = None,
+    accept_pid: int | None = None,
 ) -> None:
     """One line per seat-identity request, always exactly one. Seat ids, tool
-    names and a pid only — no bearer, no token, no argument bodies, nothing
+    names and pids only — no bearer, no token, no argument bodies, nothing
     secret.
 
     `peer_pid` IS THE POINT OF THE WHOLE MECHANISM, so it belongs on the line.
@@ -127,11 +132,34 @@ def audit(
     vouched for — the only field that later distinguishes a seat's real agent
     process from a one-liner somebody spawned. (It was resolved, returned, and
     dropped on the floor in the first draft: a field written and unwired.)
+
+    ⚠ THREE PIDS, BECAUSE ONE PID CANNOT TELL THE STORY (Codex review
+    2026-09-06, F2; HQ decision D6). The README said the connection's opener is
+    "recorded ... in the audit line" and it was NOT — `accept_pid` and
+    `seat_pid` survived in the protocol extension and died at the auth context.
+    A promise in the documentation that the code does not keep is worse than a
+    missing field, because the next reader believes the forensics exist.
+
+      peer_pid   — who SENT this request. The kernel's answer, re-read per
+                   request. This is the identity that decided the call.
+      seat_pid   — whose ENVIRONMENT named the seat: peer_pid itself, or the
+                   nearest ancestor whose environment macOS would show. When
+                   these differ, the seat was INHERITED, not declared.
+      accept_pid — who OPENED the connection. When this differs from peer_pid
+                   the descriptor changed hands mid-connection, which is the
+                   signature of the handoff F2 names and the one thing a log
+                   reader most needs to see. It decides NOTHING.
+
+    Present on the DENIAL line too, deliberately: `seat_mismatch` is precisely
+    the event where the three pids are worth reading, and a forensic field that
+    only appears on success is not forensics.
     """
     audit_log.info(
-        "seat=%s pid=%s tool=%s outcome=%s reason=%s",
+        "seat=%s pid=%s seat_pid=%s accept_pid=%s tool=%s outcome=%s reason=%s",
         _audit_field(seat_id),
         _audit_field(peer_pid) if peer_pid is not None else "-",
+        _audit_field(seat_pid) if seat_pid is not None else "-",
+        _audit_field(accept_pid) if accept_pid is not None else "-",
         _audit_field(tool),
         _audit_field(outcome),
         _audit_field(reason),
@@ -205,81 +233,182 @@ PROXY_HEADERS = (
 # machine, and CLAUDE.md had already measured the cost of the old model: a
 # scoped seat reaches 19 of 98 tools and cannot even call
 # `where_did_i_leave_off`, the boot door every arriving seat is TOLD to call.
-# The ruling closes that.
 #
-# THE SHAPE OF THE NEW SURFACE, and it is a subtraction, not an inversion:
+# THE SHAPE OF THE SURFACE, AND IT HAS EXACTLY ONE SUBTRACTION:
 #
-#     allowed  =  the published tool surface
-#                 −  governance   (Anthony's, and only Anthony's)
-#                 −  retired      (what the stack no longer serves)
+#     allowed  =  what the stack PUBLISHES right now  −  governance
 #
-# DEFAULT-DENY SURVIVES, and that matters. The base set is an ENUMERATION of
-# what the stack publishes, captured below, not "everything the caller names".
-# A tool that appears upstream and is not in SEAT_TOOL_SURFACE is denied
-# `unpublished` until somebody adds it deliberately — the same direction of
-# failure as before, just with a much larger enumerated base.
+# ⚠ ONE SOURCE, AND THE SECOND ONE IS GONE (HQ decision D2, 2026-09-06, from
+# Codex review question (b)). The first release of this feature carried TWO
+# hand-copied constants: a 100-name `SEAT_TOOL_SURFACE` transcribed from the
+# stack's `list_tools`, and a 48-name `SEAT_RETIRED_TOOLS` derived from a
+# 30-day usage census because the stack had no retirement of its own. BOTH ARE
+# DELETED. The stack now HAS `RETIRED_TOOLS` (release/2026-09-06, 9c42290) and
+# `list_tools` already filters by it, so the published list IS the answer and
+# copying it here could only ever go stale in a direction nobody would notice.
+# The review measured the two derivations agreeing exactly — symmetric
+# difference empty — which is the moment to delete the copy, not to keep it.
+#
+# ⚠ THE HONEST CONSEQUENCE, STATED BECAUSE IT INVERTS A FINDING THE PREVIOUS
+# RELEASE PINNED. The deleted census set is what took `ask_scribe` and
+# `reflection_ack` away from seats while a scoped session grant could still
+# call them — the "narrows in exactly two places" defect. Deriving from the
+# live surface fixes it in the only honest way: those names are now denied
+# because THE STACK retired them, not because this bridge guessed. And it cuts
+# the other way too, which is the half worth saying out loud: run this bridge
+# against a stack that has NOT retired anything (live `main` today), and a seat
+# reaches every one of the ~86 non-governance names that stack publishes,
+# `ask_scribe` and `watch_status` included. That is correct — the seat surface
+# is the stack's surface minus Anthony's — and it is one more reason THE STACK
+# DEPLOYS FIRST.
 SEAT_SCOPES = ("read", "write")
 
-# The published surface: every tool `list_tools` returns, resolved STATICALLY
-# from the stack's own source rather than typed from memory — server.py's
-# `list_tools` inline Tool(...) registrations (56) plus the eleven imported
-# *_TOOLS constants it splices in (44). Measured 2026-09-06 against
-# sovereign-stack release/2026-09-06 @ 32b6dc8, the release branch this bridge
-# release ships beside. 100 names.
-#
-# ⚠ NOT FETCHED AT REQUEST TIME, DELIBERATELY. An allowed-set that depends on a
-# live `get_tool_inventory()` call would put a network round-trip inside the
-# auth path, and — far worse — a failed fetch would have to resolve to either
-# "allow everything" or "allow nothing". Neither is an authorization decision.
-# A static enumeration cannot fail open; it can only go stale, and a stale
-# enumeration denies a NEW tool, which is the safe direction.
-SEAT_TOOL_SURFACE = frozenset(
-    {
-        "agent_reflect", "archive_exchange", "arrive", "arrive_delta",
-        "arrive_lineage", "ask_scribe", "check_mistakes", "close_session",
-        "comms_acknowledge", "comms_channels", "comms_get_acks", "comms_recall",
-        "comms_unread_bodies", "compass_check", "complete_experiment",
-        "connectivity_status", "context_retrieve", "current_policies",
-        "decline_protected_record", "derive", "end_session_review",
-        "get_compaction_context", "get_compaction_stats", "get_growth_summary",
-        "get_inheritable_context", "get_my_patterns", "get_open_threads",
-        "get_pending_experiments", "get_unresolved_uncertainties", "govern",
-        "guardian_alerts", "guardian_audit", "guardian_baseline",
-        "guardian_mcp_audit", "guardian_quarantine", "guardian_report",
-        "guardian_scan", "guardian_status", "handoff", "handoff_acted_on",
-        "handoff_acted_on_records", "handoff_archaeology", "heartbeat",
-        "inspect_claim", "link_threads", "list_exchanges",
-        "list_protected_thresholds", "mark_uncertainty", "metabolize",
-        "my_toolkit", "nape_ack", "nape_honks", "nape_honks_with_history",
-        "nape_observe", "nape_summary", "open_protected_record",
-        "post_fix_verify", "prior_alignment_summary", "prior_for_turn",
-        "propose_experiment", "recall_exchange", "recall_insights",
-        "recall_reflections", "record_breakthrough", "record_catch",
-        "record_collaborative_insight", "record_insight", "record_learning",
-        "record_open_thread", "record_prior_alignment", "reflection_ack",
-        "reflexive_surface", "resolve_thread", "resolve_thread_by_id",
-        "resolve_uncertainty", "retire_hypothesis", "route", "scan_thresholds",
-        "season_review", "self_model", "session_handoff", "set_policy",
-        "signal_ack", "signals_summary", "spiral_inherit", "spiral_reflect",
-        "spiral_status", "stack_write_check", "start_here",
-        "store_compaction_summary", "supersede_insight", "synthesize_now",
-        "the_ground", "thread_get_touches", "thread_touch", "triage_threads",
-        "watch_cancel", "watch_resample", "watch_status",
-        "where_did_i_leave_off",
-    }
-)
 
-# ── Subtraction 1: GOVERNANCE ───────────────────────────────────────────────
+class SeatSurfaceUnavailable(Exception):
+    """Neither route could say what the stack publishes.
+
+    THE ONLY SAFE ANSWER IS NO ANSWER. An authorization decision needs the
+    published set; without it the two available defaults are "allow everything"
+    and "deny everything", and the first is not an authorization decision at
+    all. So this raises and the caller returns 503 — the door is BROKEN, which
+    is a different sentence from "you are refused", and the caller deserves the
+    one that is true.
+    """
+
+
+# How long one resolution serves. Short enough that a stack deploy is visible
+# without a bridge restart; long enough that a burst of seat calls does not
+# become a burst of MCP round-trips.
+PUBLISHED_CACHE_SECONDS = 60.0
+
+_published_cache: dict[str, Any] = {"surface": None, "expires": 0.0}
+
+
+class Surface:
+    """What the stack publishes, and (when knowable) what it retired.
+
+    `retired` is populated only on the local-import route, because the fetch
+    route can see what IS published and never what was removed. A denial word
+    is therefore `retired` when we know, `unpublished` when we do not — the
+    DECISION is identical either way, and only the reason the caller reads
+    changes. A reason that overstated what was measured is the thing this house
+    keeps catching itself doing.
+    """
+
+    __slots__ = ("published", "retired", "source")
+
+    def __init__(self, published: frozenset[str], retired: frozenset[str], source: str) -> None:
+        self.published = published
+        self.retired = retired
+        self.source = source
+
+
+def _published_from_import() -> Surface:
+    """Route 1: the stack's own registry, in this process. No network.
+
+    ⚠ THE IMPORT IS ATTEMPTED INSIDE THIS FUNCTION, ONCE PER CACHE WINDOW, AND
+    THAT IS DELIBERATE. Resolving it once at module scope is exactly the shape
+    the signal-ledger fallback exists to correct (SOP #12): deploy the stack,
+    restart nothing, and a module-scope import failure would pin this bridge to
+    the fetch route — or to a stale answer — for the life of the process. A
+    FAILED import is not cached in sys.modules, so retrying costs a failed
+    lookup; a SUCCESSFUL one is, so the retry after that is free.
+    """
+    from sovereign_stack.server import RETIRED_TOOLS, _registered_tools
+
+    retired = frozenset(RETIRED_TOOLS)
+    published = frozenset(t.name for t in _registered_tools() if t.name not in retired)
+    if not published:
+        raise RuntimeError("the stack registry published no tools at all")
+    return Surface(published, retired, "sovereign_stack.server registry (local import)")
+
+
+def _published_from_listing(listed: Any) -> Surface:
+    """Route 2: whatever the bridge's own `list_tools` round-trip returned.
+
+    Accepts MCP Tool objects or bare strings so the seam is trivially fakeable
+    in a test without importing the MCP types.
+    """
+    names = set()
+    for item in listed or []:
+        name = getattr(item, "name", item)
+        if isinstance(name, str) and name:
+            names.add(name)
+    if not names:
+        raise RuntimeError("the stack listed no tools at all")
+    return Surface(frozenset(names), frozenset(), "stack list_tools (bridge credential)")
+
+
+def reset_published_cache() -> None:
+    """Drop the cached surface. For tests, and for anything that must force a
+    re-resolution; there is no production caller."""
+    _published_cache["surface"] = None
+    _published_cache["expires"] = 0.0
+
+
+async def published_surface(fetch: Any = None) -> Surface:
+    """What the stack publishes right now, cached for PUBLISHED_CACHE_SECONDS.
+
+    Local import first — it is in-process and cannot be delayed by a hung
+    upstream. The `fetch` seam (bridge passes `_list_tools_raw`, which carries
+    the bridge's own credential) is the fallback for a bridge whose companion
+    stack tree is not importable.
+
+    FAIL CLOSED: when neither route answers, this RAISES. It never returns an
+    empty surface that would read as "the stack publishes nothing" and deny
+    every tool with the word `unpublished`, which is a false statement about
+    the world dressed as a policy.
+    """
+    now = time.monotonic()
+    cached = _published_cache["surface"]
+    if cached is not None and now < _published_cache["expires"]:
+        return cached
+
+    import_error: Exception | None = None
+    try:
+        surface = _published_from_import()
+    except Exception as exc:  # noqa: BLE001 — either route may fail any way
+        import_error = exc
+        surface = None
+
+    if surface is None:
+        if fetch is None:
+            raise SeatSurfaceUnavailable(
+                "The seat surface could not be resolved: the stack registry is "
+                f"not importable ({type(import_error).__name__}: {import_error}) "
+                "and no tool-listing fallback was supplied. Seat requests are "
+                "refused until one of the two answers — this is a bridge fault, "
+                "not a caller error."
+            )
+        try:
+            surface = _published_from_listing(await fetch())
+        except Exception as exc:  # noqa: BLE001
+            raise SeatSurfaceUnavailable(
+                "The seat surface could not be resolved by EITHER route, so no "
+                "tool can be authorized. Local import: "
+                f"{type(import_error).__name__}: {import_error}. Stack listing: "
+                f"{type(exc).__name__}: {exc}. Seat requests are refused until "
+                "one of the two answers — this is a bridge fault, not a caller "
+                "error."
+            ) from exc
+
+    _published_cache["surface"] = surface
+    _published_cache["expires"] = now + PUBLISHED_CACHE_SECONDS
+    return surface
+
+
+# ── The only subtraction: GOVERNANCE ────────────────────────────────────────
 # Anthony's, and it stays Anthony's whatever "trusted" comes to mean. The
 # enumeration is his, from the ruling itself; `st.NEVER_TOOLS` is folded in so
 # a name added there later cannot reach a seat by being forgotten here.
 #
-# TWO NAMES CAME OUT OF THIS SET AND THE REMOVALS ARE PART OF THE RULING:
+# THREE NAMES CAME OUT OF THIS SET AND THE REMOVALS ARE PART OF THE RULING:
 #   * resolve_thread_by_id — "it is a seat's ordinary act". Closing a thread you
 #     opened, by its id, is authorship, not governance. Bare `resolve_thread`
 #     (which resolves by MATCH, across threads a seat may not own) stays denied.
 #   * triage_threads — read-shaped, never named as governance, and it was in
 #     this set only because the old model swept it up with its neighbours.
+#   * signal_ack — see below.
 SEAT_NEVER_TOOLS = frozenset(st.NEVER_TOOLS) | frozenset(
     {
         # policies / enactment — standing law is Anthony-only, always
@@ -307,61 +436,18 @@ SEAT_NEVER_TOOLS = frozenset(st.NEVER_TOOLS) | frozenset(
         "revoke_token",
         # audit
         "audit_decoupling",
-        # ⚠ A JUDGEMENT CALL, FLAGGED RATHER THAN BURIED — AT ANTHONY'S GATE.
-        #   signal_ack did not exist when the ruling was made (it landed today
-        #   on sovereign-stack feat/signal-ledger). The stack's OWN
-        #   SIGNAL_TOOL_INTENTS declares its intent as "govern", so it is
-        #   denied here on the stack's own label. The argument the other way is
-        #   real and belongs on the record: it is shaped exactly like
-        #   resolve_thread_by_id — a watch seat closing a signal it owns — and
-        #   it carries its own producer-cannot-close-its-own guard upstream.
-        #   Widening governance is not HQ's call to make quietly
-        #   (pol_20260831), so it is denied until Anthony says otherwise. One
-        #   line to flip. signals_summary (intent "read") is ALLOWED.
-        "signal_ack",
-    }
-)
-
-# ── Subtraction 2: RETIRED ──────────────────────────────────────────────────
-# "minus anything the stack retires."
-#
-# ⚠ SOURCE, AND ITS HONEST LIMIT. The stack has NO `RETIRED` constant — checked
-# 2026-09-06 across sovereign-stack release/2026-09-06 @ 32b6dc8 and every
-# local and remote ref (`git grep RETIRED_TOOLS` over all refs: empty). So this
-# falls back to the named alternative: the 48 tools with Total 0 in the 30-day
-# census, ~/.sovereign/hq/lanes/runs/tool-census-30d_result.md (gpt-6-astra,
-# window 2026-08-06..2026-09-05).
-#
-# THAT SOURCE MEASURES DISUSE, NOT RETIREMENT, AND THE CENSUS SAYS SO ITSELF.
-# Its own §3 proposes these move "to explicit discovery, not physical deletion",
-# and its §4 marks THIRTY of the 48 with ★ — "keep these reachable" — because
-# they are the recovery/close/read half of a lifecycle whose other half is live
-# (protected-record open/decline, the guardian family, watch_status/cancel,
-# uncertainty and experiment lifecycle, archive lookup). Its own headline says
-# "no observed dated call" is "not proof of never-called".
-#
-# So this constant is a PLACEHOLDER STANDING IN FOR A DECISION THE STACK HAS
-# NOT MADE. It is deliberately one name, in one place: when the stack lands a
-# real RETIRED set, re-point this at it and delete the fallback. Until then a
-# seat denied here is told `retired_unused_30d`, which says what was actually
-# measured rather than claiming the tool is gone.
-SEAT_RETIRED_TOOLS = frozenset(
-    {
-        "agent_reflect", "arrive_delta", "ask_scribe", "comms_acknowledge",
-        "comms_unread_bodies", "complete_experiment", "decline_protected_record",
-        "derive", "end_session_review", "govern", "guardian_alerts",
-        "guardian_audit", "guardian_baseline", "guardian_mcp_audit",
-        "guardian_quarantine", "guardian_report", "guardian_scan",
-        "guardian_status", "handoff_acted_on", "handoff_archaeology",
-        "link_threads", "list_exchanges", "list_protected_thresholds",
-        "mark_uncertainty", "metabolize", "nape_honks",
-        "nape_honks_with_history", "nape_observe", "open_protected_record",
-        "prior_alignment_summary", "propose_experiment", "recall_exchange",
-        "record_breakthrough", "record_collaborative_insight",
-        "record_prior_alignment", "reflection_ack", "resolve_thread",
-        "resolve_uncertainty", "retire_hypothesis", "route", "scan_thresholds",
-        "session_handoff", "stack_write_check", "store_compaction_summary",
-        "synthesize_now", "watch_cancel", "watch_resample", "watch_status",
+        #
+        # ⚠ signal_ack IS NOT HERE ANY MORE — HQ decision D1, 2026-09-06.
+        #   The first release denied it on the stack's own `govern` intent
+        #   label, flagged as a judgement call at Anthony's gate. HQ ruled the
+        #   other way and the stack round moved with it: SIGNAL_TOOL_INTENTS
+        #   now reads "write". THE REASON ON THE RECORD: acknowledging a signal
+        #   is the watch seat's operational act — the thing the seat exists to
+        #   do — while Anthony's governance list is laws, policies, seat
+        #   permissions, ring placement and deletes. Classifying it govern left
+        #   the designated watch seat with no closure path at all. The closer
+        #   is taken from a TRUSTED ACTOR rather than a typed string: the
+        #   bridge injects `actor_seat` below from the identity it verified.
     }
 )
 
@@ -370,8 +456,8 @@ SEAT_RETIRED_TOOLS = frozenset(
 # remembered: resolved 2026-09-06 by parsing every `Tool(...)` registration in
 # sovereign-stack release/2026-09-06 @ 32b6dc8 and keeping the ones whose
 # inputSchema declares the property. Eight tools do; these are the six that
-# survive the two subtractions above (arrive_delta is retired, close_session is
-# governance).
+# survive the subtractions above (arrive_delta is retired by the stack,
+# close_session is governance).
 #
 # ⚠ WHY THE LIST CANNOT BE GUESSED, AND WHY SIGNING IS NOT A GATE ANY MORE.
 #
@@ -409,6 +495,609 @@ SEAT_SIGNABLE_TOOLS = frozenset(
         "where_did_i_leave_off",
     }
 )
+
+# ── THE CLOSER IDENTITY: AN IN-PROCESS CHANNEL, NOT AN ARGUMENT ─────────────
+#
+# HQ decision D1, AMENDED 2026-09-06 after Astra's re-review of the stack round.
+#
+# ⚠ THE FIRST IMPLEMENTATION OF THIS WAS AN ARGUMENT AND THAT WAS THE DEFECT.
+# The bridge injected `actor_seat` into signal_ack's arguments and the stack
+# trusted it "because the bridge overwrites it". But an ARGUMENT is a channel
+# every caller can write to, so the stack's trust rested on the bridge being
+# the only writer — which is not a property the stack can check, and is false
+# for any caller reaching the stack another way. A field that is trusted
+# because of who *usually* sets it is a `owner`-string in a new coat, and the
+# stack's own review had already thrown that pattern out once.
+#
+# THE CHANNEL IS NOW IN-PROCESS: `sovereign_stack.dispatch_context` carries a
+# `contextvars.ContextVar` the bridge SETS around the dispatch and the stack
+# READS. A contextvar cannot be written by anything on the wire, so the stack's
+# refusal of the five argument names below is enforceable rather than
+# conventional. The stack round 3 refuses `actor`, `actor_seat`, `owner`,
+# `closed_by` and `source_seat` on signal_ack outright.
+#
+# FAIL CLOSED WHEN THE CHANNEL IS ABSENT. Against a stack older than round 3
+# there is no contextvar to set, so a seat's signal_ack would be stamped with
+# the shared server spiral session — the SERVER, not the seat — and the record
+# would name the wrong closer while looking correct. So the tool is REFUSED to
+# seats rather than served through a degraded channel. Falling back to the
+# argument is exactly the fix this amendment removes.
+SEAT_ACTOR_TOOLS = frozenset({"signal_ack"})
+
+# Names a client must not be able to put on the wire for those tools. Scoped to
+# SEAT_ACTOR_TOOLS rather than applied globally on purpose: `owner` and `actor`
+# are ordinary words that another tool may legitimately take, and a blanket ban
+# would be a guard whose blast radius nobody measured. On signal_ack every one
+# of them is an attempt to name the closer.
+SEAT_ACTOR_FORBIDDEN_ARGS = ("actor", "actor_seat", "closed_by", "owner", "source_seat")
+
+
+def dispatch_context_module():
+    """`sovereign_stack.dispatch_context`, or None when the stack predates it.
+
+    ⚠ IMPORTED PER CALL, NOT AT MODULE SCOPE. A module-scope import resolved
+    once would pin this bridge to "absent" for the life of the process, so
+    deploying the stack without restarting the bridge would leave signal_ack
+    refused indefinitely while the code that answers it sits one process over.
+    That is SOP #12's shape and this house has now written it twice in one
+    file; a failed import is not cached in sys.modules, so the retry is cheap.
+    """
+    try:
+        from sovereign_stack import dispatch_context
+
+        if not hasattr(dispatch_context, "set_caller_seat") or not hasattr(
+            dispatch_context, "reset_caller_seat"
+        ):
+            return None
+        return dispatch_context
+    except Exception:  # noqa: BLE001 — absence and breakage are the same answer
+        return None
+
+
+def actor_channel_refusal(tool: str) -> tuple[str, str] | None:
+    """Refuse a seat call whose identity has nowhere trustworthy to travel."""
+    if tool not in SEAT_ACTOR_TOOLS:
+        return None
+    if dispatch_context_module() is not None:
+        return None
+    return (
+        "no_caller_channel",
+        (
+            f"Tool {tool!r} needs the verified seat identity to reach the stack, "
+            "and this stack has no `sovereign_stack.dispatch_context` to carry "
+            "it. Without that channel the closer would be stamped from the "
+            "server's shared spiral session rather than from the seat that "
+            "closed the signal — a record naming the wrong actor while looking "
+            "correct. Refused rather than served through a channel a caller "
+            "could write to. Deploy the stack release first."
+        ),
+    )
+
+
+def actor_argument_refusal(tool: str, arguments: Any) -> tuple[str, str] | None:
+    """Strip, then refuse, any client-supplied closer name. (reason, detail).
+
+    BOTH, AND THE ORDER IS THE POINT. The refusal is what the caller sees; the
+    strip is what protects the record if some later edit ever downgrades the
+    refusal to a warning. A guard whose whole effect depends on one `raise`
+    surviving future editing is a guard with one point of failure.
+    """
+    if tool not in SEAT_ACTOR_TOOLS or not isinstance(arguments, dict):
+        return None
+    present = [name for name in SEAT_ACTOR_FORBIDDEN_ARGS if name in arguments]
+    if not present:
+        return None
+    for name in present:
+        arguments.pop(name, None)
+    return (
+        "client_supplied_actor",
+        (
+            f"Tool {tool!r} was called with {present!r}. The closer identity is "
+            "not a field a caller may set: it travels in-process from the seat "
+            "identity this bridge verified against the kernel. A caller-supplied "
+            "actor is the `owner` string the stack's own review threw out, and "
+            "it is refused rather than quietly overwritten — silently replacing "
+            "it would leave the caller believing it had named the closer."
+        ),
+    )
+
+# ── PROTECTED MATERIAL: THE BOUNDARY THE TOOL NAMES DID NOT HOLD ────────────
+#
+# Codex review 2026-09-06, F1 (P1). The seat gate refused `open_protected_record`
+# by name and let `inspect_claim`, `recall_insights` and `archive_exchange`
+# return a designated record's body or its archived STAKES through the real
+# route. Anthony reserves his children and protected family material to himself
+# (pol_20260831). A seat must never receive it, and "the drawer's dedicated
+# tool is denied" was never that guarantee: the drawer is a designation, not a
+# door, and every read that can address a claim by id is another way in.
+#
+# THIS FIX LIVES AT THE BRIDGE AND DOES NOT WAIT FOR THE STACK. Some of the
+# behaviour is inherited from the stack's coupled-retrieval model, and that is
+# a real argument for fixing it upstream too — but "the other repo will get to
+# it" is not a boundary, and this bridge is what admits the seat.
+#
+# TWO MECHANISMS, because there are two ways to reach a record:
+#   (i)  ADDRESSED BY ID   -> refuse the call outright (inspect_claim,
+#        archive_exchange). The caller named the thing; there is nothing to
+#        filter, only a call to refuse.
+#   (ii) RETURNED IN A LIST -> post-filter the response, drop the designated
+#        entries, and SAY SO (`withheld_protected`). Silence about a filtered
+#        read is the fail-open this house hunts (SOP #2); a filter that hides
+#        its own subtraction has only moved the lie.
+PROTECTED_INDEX_MAX_BYTES = 4 * 1024 * 1024
+
+# Tools that take a designated id as an ARGUMENT. Refused, never filtered.
+PROTECTED_ID_TOOLS = frozenset({"inspect_claim", "archive_exchange"})
+
+# Argument names that can carry a claim id or an archive id into those tools.
+_PROTECTED_ID_ARGS = ("claim_id", "archive_id", "id", "ref", "exchange_id")
+
+# The claim-id preimage, reimplemented from sovereign_stack.provenance:
+# sha256(timestamp \x1f domain \x1f content).
+_CLAIM_FIELD_SEP = "\x1f"
+_CLAIM_PREIMAGE_FIELDS = ("timestamp", "domain", "content")
+
+
+class ProtectedIndexUnreadable(Exception):
+    """The designation index could not be read, so nothing can be cleared.
+
+    FAIL CLOSED AND SAY WHY. Without the index the bridge cannot tell a
+    protected record from any other, and the only two available defaults are
+    "return everything" and "return nothing". For material Anthony reserves to
+    himself the second is the only defensible one, so this raises and the seat
+    path refuses the affected tools with this reason attached.
+    """
+
+
+def chronicle_root() -> Path:
+    """Where the chronicle lives, resolved FRESH, by the stack's own precedence.
+
+    SOVEREIGN_CHRONICLE, then SOVEREIGN_ROOT/chronicle — copied deliberately
+    from sovereign_stack.provenance.default_chronicle_root so the bridge and
+    the stack can never disagree about WHICH protected.jsonl is the index. A
+    guard reading a different file from the one the stack enforces on is not a
+    guard.
+    """
+    override = os.environ.get("SOVEREIGN_CHRONICLE")
+    if override:
+        return Path(override)
+    return sovereign_root() / "chronicle"
+
+
+def protected_index_path() -> Path:
+    return chronicle_root() / "protected.jsonl"
+
+
+def derive_claim_id(entry: Any) -> str | None:
+    """The canonical claim id for a chronicle entry, or None if it is not one.
+
+    ⚠ THIS IS A COPY OF UPSTREAM LOGIC AND THEREFORE A DRIFT RISK, WHICH IS WHY
+    IT IS NOT THE ONLY SIGNAL THE FILTER USES. If the stack ever changes the
+    preimage, a filter resting on this alone would match nothing, silently, and
+    protected content would flow — a fail-open inside the fix for a fail-open.
+    `_is_protected_entry` therefore ORs three independent signals, and
+    tests/test_seat_protected.py re-derives this against the real
+    `provenance.derive_claim_id` whenever the stack source is importable.
+    """
+    if not isinstance(entry, dict):
+        return None
+    if not any(f in entry for f in _CLAIM_PREIMAGE_FIELDS):
+        return None
+    parts = []
+    for field in _CLAIM_PREIMAGE_FIELDS:
+        value = entry.get(field, "")
+        if value is None:
+            value = ""
+        parts.append(value if isinstance(value, str) else str(value))
+    return hashlib.sha256(_CLAIM_FIELD_SEP.join(parts).encode("utf-8")).hexdigest()
+
+
+class ProtectedIndex:
+    """The designated claim ids and the archive ids holding their stakes."""
+
+    __slots__ = ("claim_ids", "archive_ids")
+
+    def __init__(self, claim_ids: frozenset[str], archive_ids: frozenset[str]) -> None:
+        self.claim_ids = claim_ids
+        self.archive_ids = archive_ids
+
+    def __bool__(self) -> bool:
+        return bool(self.claim_ids or self.archive_ids)
+
+
+def load_protected_index() -> ProtectedIndex:
+    """Read + fold `protected.jsonl`. Raises ProtectedIndexUnreadable on ANY
+    doubt about the file.
+
+    READ FRESH PER REQUEST, like the registry: designating a record must take
+    effect immediately, not after a cache window or a restart.
+
+    ⚠ STRICTER THAN THE STACK'S OWN READER, ON PURPOSE. `protected.load_protected`
+    SKIPS corrupt lines ("matching the chronicle read convention"), which is the
+    right call for a reader assembling a view. It is the wrong call for a GUARD:
+    a skipped line is a designation the bridge did not see, and a designation
+    the bridge does not see is a record it will hand to a seat. So here any
+    unparseable line, any non-object line, any absent-but-unreadable file makes
+    the whole index unusable and the affected tools refuse.
+    """
+    path = protected_index_path()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        # An index that does not exist is a machine with nothing designated.
+        # That is a real, common state (a fresh checkout, a test root) and is
+        # NOT the same as one we could not read.
+        return ProtectedIndex(frozenset(), frozenset())
+    except OSError as exc:
+        raise ProtectedIndexUnreadable(f"{type(exc).__name__}: {exc}") from exc
+    try:
+        st_info = os.fstat(fd)
+        if not stat.S_ISREG(st_info.st_mode):
+            raise ProtectedIndexUnreadable(
+                f"the protected designation index at {path} is not a regular file"
+            )
+        chunks: list[bytes] = []
+        remaining = PROTECTED_INDEX_MAX_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    except ProtectedIndexUnreadable:
+        raise
+    except OSError as exc:
+        raise ProtectedIndexUnreadable(f"{type(exc).__name__}: {exc}") from exc
+    finally:
+        os.close(fd)
+    if len(raw) > PROTECTED_INDEX_MAX_BYTES:
+        raise ProtectedIndexUnreadable(
+            "the protected designation index exceeds the bridge's size cap, so "
+            "it cannot be read whole — and a partially read index of protected "
+            "material is worse than none"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProtectedIndexUnreadable(f"UnicodeDecodeError: {exc}") from exc
+
+    # Fold: latest action per claim wins, `unprotect` nullifies. Same rule as
+    # sovereign_stack.protected.fold_protected, so the two cannot disagree
+    # about which records are live designations.
+    fold: dict[str, dict] = {}
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError as exc:
+            raise ProtectedIndexUnreadable(
+                f"line {lineno} of the protected designation index is not JSON "
+                f"({exc}); a designation the bridge cannot parse is a record it "
+                "would otherwise hand to a seat"
+            ) from exc
+        if not isinstance(record, dict):
+            raise ProtectedIndexUnreadable(
+                f"line {lineno} of the protected designation index is not an object"
+            )
+        action = record.get("action")
+        cid = record.get("claim_id")
+        if action not in ("protect", "unprotect") or not isinstance(cid, str):
+            raise ProtectedIndexUnreadable(
+                f"line {lineno} of the protected designation index has no usable "
+                "action/claim_id pair"
+            )
+        if action == "unprotect":
+            fold.pop(cid, None)
+        else:
+            fold[cid] = record
+    archives = {
+        str(r["stakes_archive_id"]).strip()
+        for r in fold.values()
+        if isinstance(r.get("stakes_archive_id"), str) and r["stakes_archive_id"].strip()
+    }
+    return ProtectedIndex(frozenset(fold), frozenset(archives))
+
+
+def _id_touches(candidate: Any, designated: frozenset[str]) -> bool:
+    """True when `candidate` addresses something in `designated`.
+
+    ⚠ PREFIXES, IN BOTH DIRECTIONS, AND THAT IS NOT PEDANTRY. `inspect_claim`
+    resolves "full 64-hex OR a unique prefix", and `load_stakes` re-resolves an
+    archive id the same way. An exact-match check would therefore be walked
+    straight past by a caller who supplied twelve hex characters — the same
+    finding again, one release later. A designated id that is a prefix of the
+    candidate is caught too, so a longer-but-related handle cannot slip either.
+
+    Case-insensitive because hex is written both ways.
+    """
+    if not isinstance(candidate, str):
+        return False
+    text = candidate.strip().lower()
+    if not text:
+        return False
+    for known in designated:
+        low = known.lower()
+        if low.startswith(text) or text.startswith(low):
+            return True
+    return False
+
+
+def protected_call_refusal(
+    tool: str, arguments: Any, index: ProtectedIndex
+) -> tuple[str, str] | None:
+    """Refuse a seat call that ADDRESSES a designated record. (reason, detail).
+
+    Returns None when the call may proceed. The index is passed IN rather than
+    loaded here, so the same read serves this pre-call check and the post-call
+    filter: two loads would open a window in which a record is designated
+    between the check and the response, and closing that by construction costs
+    one parameter.
+    """
+    if tool not in PROTECTED_ID_TOOLS or not index:
+        return None
+    designated = index.claim_ids | index.archive_ids
+    if not isinstance(arguments, dict):
+        return None
+    for key in _PROTECTED_ID_ARGS:
+        if _id_touches(arguments.get(key), designated):
+            return (
+                "protected",
+                (
+                    f"Tool {tool!r} was asked for a record designated protected. "
+                    "Protected material — Anthony's children and protected family "
+                    "material among it — is reserved to him and is never returned "
+                    "to a seat, by any tool, under any id or prefix of one. This "
+                    "is not a scope you can be granted."
+                ),
+            )
+    return None
+
+
+def _is_protected_entry(node: dict, index: ProtectedIndex) -> bool:
+    """Three independent signals, ORed. Any one of them withholds.
+
+    1. THE STACK ALREADY SAID SO. `_protected` / `_stakes` / `_stakes_withheld`
+       are what sovereign_stack.protected attaches at its own read chokepoint.
+       When it has spoken, believe it.
+    2. A DECLARED claim_id that touches a designation (prefix-safe).
+    3. A DERIVED claim id that touches a designation.
+
+    Three rather than one because each fails in a different direction: (1) is
+    absent whenever the stack's chokepoint did not run, (2) is absent whenever
+    the caller passed with_ids=false, and (3) breaks silently if the upstream
+    preimage ever changes. Only the OR of them is hard to walk past.
+    """
+    if node.get("_protected") or node.get("_stakes_withheld") or "_stakes" in node:
+        return True
+    if _id_touches(node.get("claim_id"), index.claim_ids):
+        return True
+    derived = derive_claim_id(node)
+    return bool(derived and derived in index.claim_ids)
+
+
+# A response big enough to walk forever is a response we refuse to certify.
+_FILTER_MAX_NODES = 200_000
+
+
+def filter_protected(payload: Any, index: ProtectedIndex) -> tuple[Any, int]:
+    """Drop every designated entry anywhere in a tool response. (payload, count).
+
+    ⚠ SHAPE-AGNOSTIC ON PURPOSE. The lane names `recall_insights`,
+    `season_review` and `thread_get_touches` "and any other read that returns
+    entries by claim id" — and an enumerated list of readers is exactly the
+    fail-open F1 already demonstrated once: the guard names the doors somebody
+    thought of, and the set of doors is open. So this walks the WHOLE response
+    of EVERY seat call and drops what it recognises. A response with no
+    chronicle entries in it is returned unchanged and costs one walk.
+
+    Entries are DROPPED, not withheld-in-place, and the count is returned so the
+    caller can state the subtraction. Returning a redacted stub would leak the
+    locator fields (timestamp, domain, the two-word index) that the stack's own
+    threshold surface exists to gate.
+    """
+    if not index:
+        return payload, 0
+    dropped = 0
+    budget = _FILTER_MAX_NODES
+
+    def walk(node: Any) -> Any:
+        nonlocal dropped, budget
+        budget -= 1
+        if budget < 0:
+            raise ProtectedIndexUnreadable(
+                "the response is too large to certify as free of protected "
+                "material; refusing rather than returning an unchecked tail"
+            )
+        if isinstance(node, dict):
+            return {k: walk(v) for k, v in node.items()}
+        if isinstance(node, list):
+            kept = []
+            for item in node:
+                if isinstance(item, dict) and _is_protected_entry(item, index):
+                    dropped += 1
+                    continue
+                kept.append(walk(item))
+            return kept
+        return node
+
+    # A single top-level dict that IS a protected entry (inspect_claim-shaped
+    # payloads) is replaced wholesale rather than walked into.
+    if isinstance(payload, dict) and _is_protected_entry(payload, index):
+        return (
+            {
+                "withheld": "protected",
+                "note": (
+                    "This record is designated protected and is not returned to "
+                    "seat identity."
+                ),
+            },
+            1,
+        )
+    return walk(payload), dropped
+
+
+# ── POST-FIX PROBES: CLASSIFY BY ARGUMENTS, NOT BY THE WRAPPER NAME ─────────
+#
+# Codex review 2026-09-06, F5 (P2, conditional). `post_fix_verify` is allowed
+# to seats, the seat gate checks only the tool NAME, and with
+# POST_FIX_ALLOW_COMMAND=1 in the stack's environment a probe of type
+# `command` runs arbitrary commands — the reviewer rewrote a fixture
+# `hq/seats/registry.json` to `{}` through it and got a 200.
+#
+# ⚠ THE HOST FLAG IS OFF TODAY AND THAT IS NOT THE POINT. HQ checked
+# ~/Library/LaunchAgents/com.templetwo.sovereign-bridge.plist: it does not set
+# the flag, so this is conditional. A guard that holds because a DIFFERENT
+# component's environment happens to be configured a certain way is a guard
+# held by luck. The seat path refuses these probes regardless of the flag, so
+# turning the flag on for the master path never silently widens the seat path.
+_PROBE_SAFE_HTTP_METHODS = frozenset({"GET", "HEAD"})
+_WATCH_MODES = frozenset({"status", "resample", "cancel"})
+# One path segment. `.` and `..` are excluded by requiring a leading
+# alphanumeric, so the pattern says the rule rather than relying on a second
+# check somebody could later delete.
+_WATCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _inside_sovereign_root(candidate: str) -> bool:
+    """True when `candidate` resolves inside SOVEREIGN_ROOT.
+
+    Resolved, not string-compared: `..` and symlinked parents are exactly what
+    a path check has to survive. A path that cannot be resolved is FALSE — the
+    unknown case is the refusing case.
+    """
+    try:
+        root = sovereign_root().resolve()
+        target = Path(candidate).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return target == root or root in target.parents
+
+
+def probe_call_refusal(tool: str, arguments: Any) -> tuple[str, str] | None:
+    """Refuse a seat `post_fix_verify` call by what it ASKS FOR. (reason, detail).
+
+    Four rules, each from F5:
+      * type='command'                  -> always refused to seats.
+      * type='http' with a non-GET/HEAD -> refused: a POST probe is a write
+        wearing a health check's name.
+      * type='file_hash' outside root   -> refused: hashing an arbitrary path
+        is a read primitive over the whole filesystem.
+      * an UNKNOWN probe type           -> refused. A type this bridge cannot
+        classify cannot be classified as safe, and the stack may add one
+        tomorrow.
+      * mode status/resample/cancel     -> allowed, UNLESS the watch_id is not
+        a plain identifier. Watches are addressed as
+        <root>/post_fix/watches/<watch_id>.json, so a watch_id is a PATH
+        SEGMENT that the stack interpolates into a filename.
+
+    ⚠ THE WATCH_ID RULE IS DELIBERATELY STRICTER THAN "OUTSIDE SOVEREIGN_ROOT",
+    AND THE REASON IS A MEASURED ONE. HQ's D5 says to refuse a watch that
+    "targets a watch outside SOVEREIGN_ROOT". Implemented literally, that lets
+    `../../hq/seats/registry` through — it resolves to
+    `<root>/hq/seats/registry.json`, INSIDE the root, which is Anthony's SEAT
+    REGISTRY, and mode='cancel' writes. A containment check whose boundary
+    encloses the thing being protected is not a containment check. So the rule
+    here is what "a watch id" actually means: one path segment of
+    [A-Za-z0-9._-], no separators, never `.` or `..`, and the resolved path
+    must still land in the watches directory. That is a widening of the
+    instruction's letter in the direction of its intent, and it is named here
+    and in the delivery report rather than done quietly.
+    """
+    if tool != "post_fix_verify" or not isinstance(arguments, dict):
+        return None
+
+    mode = arguments.get("mode") or "verify"
+    if isinstance(mode, str) and mode in _WATCH_MODES:
+        watch_id = arguments.get("watch_id")
+        if watch_id is not None and watch_id != "":
+            watches = sovereign_root() / "post_fix" / "watches"
+            bad = not isinstance(watch_id, str) or not _WATCH_ID_RE.match(watch_id)
+            if not bad:
+                try:
+                    target = (watches / f"{watch_id}.json").resolve()
+                    bad = target.parent != watches.resolve()
+                except (OSError, RuntimeError, ValueError):
+                    bad = True
+            if bad:
+                return (
+                    "probe_path_escape",
+                    (
+                        f"post_fix_verify(mode={mode!r}) names {watch_id!r}, which "
+                        "is not a watch id. A watch id is ONE path segment — the "
+                        "stack interpolates it into "
+                        f"{watches}/<watch_id>.json — so anything carrying a "
+                        "separator or a `..` is addressing a file outside the "
+                        "watch store, and seat identity does not reach there. "
+                        "Note this refuses traversals that stay INSIDE the "
+                        "sovereign root too: `../../hq/seats/registry` would "
+                        "land on Anthony's seat registry."
+                    ),
+                )
+
+    probes = arguments.get("probes")
+    if not isinstance(probes, list):
+        return None
+    for probe in probes:
+        if not isinstance(probe, dict):
+            return (
+                "probe_unclassifiable",
+                (
+                    "post_fix_verify was given a probe this bridge cannot read, "
+                    "so it cannot classify what the probe would do. A probe that "
+                    "cannot be classified is refused to seat identity."
+                ),
+            )
+        kind = probe.get("type")
+        if kind == "command":
+            return (
+                "probe_command",
+                (
+                    "post_fix_verify probes of type 'command' run commands, and "
+                    "a command runs as this bridge does — it can enact policy, "
+                    "rewrite the seat registry, or delete files. Governance is "
+                    "Anthony's, so a seat may not reach it through a probe "
+                    "wrapper either. This refusal does not depend on whether "
+                    "POST_FIX_ALLOW_COMMAND is set on the host: a boundary that "
+                    "holds only while another component is configured a certain "
+                    "way is not a boundary."
+                ),
+            )
+        if kind == "http":
+            method = probe.get("method") or "GET"
+            if not isinstance(method, str) or method.upper() not in _PROBE_SAFE_HTTP_METHODS:
+                return (
+                    "probe_http_method",
+                    (
+                        f"post_fix_verify http probes are limited to "
+                        f"{sorted(_PROBE_SAFE_HTTP_METHODS)} for seat identity; "
+                        f"{method!r} is a write wearing a health check's name."
+                    ),
+                )
+            continue
+        if kind == "file_hash":
+            path = probe.get("path")
+            if not isinstance(path, str) or not _inside_sovereign_root(path):
+                return (
+                    "probe_path_escape",
+                    (
+                        "post_fix_verify file_hash probes are limited to paths "
+                        f"inside {sovereign_root()} for seat identity. Hashing an "
+                        "arbitrary path is a read primitive over the whole "
+                        "filesystem, and the protected drawer lives on this disk."
+                    ),
+                )
+            continue
+        return (
+            "probe_unclassifiable",
+            (
+                f"post_fix_verify probe type {kind!r} is not one this bridge "
+                "knows how to classify, so it cannot be classified as safe. "
+                "Seat identity refuses it until it is classified deliberately."
+            ),
+        )
+    return None
 
 
 class SeatDenied(Exception):
@@ -714,6 +1403,12 @@ def resolve_seat(peer: Any, seat_id: str | None, headers: Any) -> dict[str, Any]
         # The kernel-attested pid this identity was bound to. Carried so the
         # audit line can name the actual process, not just the string it sent.
         "peer_pid": peer.get("pid"),
+        # ...and the two provenance pids that used to die here (F2 / D6).
+        # Neither decides anything; both are how a log reader tells an
+        # inherited seat from a declared one, and a descriptor handoff from an
+        # ordinary request.
+        "seat_pid": peer.get("seat_pid"),
+        "accept_pid": peer.get("accept_pid"),
         # The scope a seat gets, reused verbatim from the session-token model.
         "scope": list(SEAT_SCOPES),
     }
@@ -751,29 +1446,36 @@ def _unexpected_headers(headers: Any) -> list[str]:
     return sorted(names - SEAT_ALLOWED_HEADERS)
 
 
-def seat_tool_allowed(tool: str) -> tuple[bool, str]:
+def seat_tool_allowed(tool: str, surface: Surface) -> tuple[bool, str]:
     """Default-deny tool check for the seat path. Returns (allowed, reason).
 
     `reason` is 'ok' or the audit-line word for WHY it was refused.
 
     THE ORDER IS THE POLICY, and it is read top-down:
 
-      1. not published   -> denied `unpublished`   (default-deny survives)
-      2. governance      -> denied `governance`    (Anthony's, always)
-      3. retired         -> denied `retired_unused_30d`
+      1. governance      -> denied `governance`    (Anthony's, always)
+      2. retired         -> denied `retired`       (only when the stack said so)
+      3. not published   -> denied `unpublished`   (default-deny survives)
       4. otherwise       -> ALLOWED. All studio seats are trusted.
 
-    Governance is checked BEFORE retirement so a governance tool that also
-    happens to be unused is refused for the reason that will still be true
-    tomorrow — a denial reason that changes when a usage census changes is not
-    a policy statement.
+    ⚠ GOVERNANCE IS CHECKED FIRST, AND THAT ORDER IS DELIBERATE. It moved: the
+    previous release checked publication first, which meant `designate_protected`
+    and `retire` — governance names the stack does not publish — were refused as
+    `unpublished`, a word that reads as "this tool does not exist" about tools
+    that very much do and are reserved. The reason a caller gets should be the
+    one that stays true after the next release of the stack.
+
+    `surface` is REQUIRED and has no default. A default would have to be either
+    the empty set (every tool `unpublished`, which is a lie about the world) or
+    a remembered enumeration (the copy this release just deleted). Callers get
+    it from `published_surface()`, which raises rather than inventing one.
     """
-    if tool not in SEAT_TOOL_SURFACE:
-        return False, "unpublished"
     if tool in SEAT_NEVER_TOOLS:
         return False, "governance"
-    if tool in SEAT_RETIRED_TOOLS:
-        return False, "retired_unused_30d"
+    if tool in surface.retired:
+        return False, "retired"
+    if tool not in surface.published:
+        return False, "unpublished"
     return True, "ok"
 
 
@@ -784,17 +1486,16 @@ _DENY_DETAIL = {
         "denied to seat identity. All studio seats are trusted; governance is "
         "still Anthony's alone, and being trusted is not being him."
     ),
-    "retired_unused_30d": (
-        "had zero observed calls in the 30-day tool census (2026-08-06..09-05) "
-        "and is not served to seats. If it is in fact live, that is a stale "
-        "census entry rather than a judgement about the seat — say so and it "
-        "moves back."
+    "retired": (
+        "was retired by the stack itself and is no longer published, so it is "
+        "not served to seats. This is the STACK's decision, read from its own "
+        "registry at request time — not a census this bridge remembers. Call "
+        "my_toolkit for what replaced it."
     ),
     "unpublished": (
-        "is not in the stack's published tool surface as this bridge release "
-        "recorded it, so it is master-only by default-deny. A tool the stack "
-        "added since is denied until it is added deliberately — a new name is "
-        "never trusted by silence."
+        "is not in the stack's published tool surface, read from the stack at "
+        "request time, so it is master-only by default-deny. A name the stack "
+        "does not publish is never trusted by silence."
     ),
 }
 
@@ -803,22 +1504,24 @@ def deny_detail(tool: str, reason: str) -> str:
     return f"Tool {tool!r} {_DENY_DETAIL.get(reason, 'is denied to seat identity.')}"
 
 
-def seat_allowed_tools() -> list[str]:
-    """The seat surface: the published surface minus governance minus retired.
+def seat_allowed_tools(surface: Surface) -> list[str]:
+    """The seat surface: what the stack publishes, minus governance.
 
-    Enumerated over SEAT_TOOL_SURFACE, NOT over st.TOOL_SCOPES. Iterating the
-    scope map was correct while the surface WAS the scope map; after Anthony's
-    ruling it would have reported 21 names for a 100-name surface — an
-    enumeration that silently describes a different policy than the one in
-    force, which is the shape this house calls a lossy index.
+    Enumerated over the LIVE published set, never over st.TOOL_SCOPES.
+    Iterating the scope map was correct while the surface WAS the scope map;
+    after Anthony's ruling it would have reported 21 names for a ~50-name
+    policy — an enumeration that silently describes a different policy than the
+    one in force, which is the shape this house calls a lossy index.
     """
-    return sorted(t for t in SEAT_TOOL_SURFACE if seat_tool_allowed(t)[0])
+    return sorted(t for t in surface.published if seat_tool_allowed(t, surface)[0])
 
 
-def seat_denied_tools() -> list[tuple[str, str]]:
+def seat_denied_tools(surface: Surface) -> list[tuple[str, str]]:
     """(tool, reason) for every published tool the seat path refuses."""
     return sorted(
-        (t, seat_tool_allowed(t)[1]) for t in SEAT_TOOL_SURFACE if not seat_tool_allowed(t)[0]
+        (t, seat_tool_allowed(t, surface)[1])
+        for t in surface.published
+        if not seat_tool_allowed(t, surface)[0]
     )
 
 
@@ -828,7 +1531,14 @@ def sign_arguments(tool: str, arguments: dict[str, Any], seat_id: str) -> dict[s
     OVERRIDE, not setdefault: a seat cannot claim another identity. If the body
     says source_instance='HQ' and the header says 'grok-build-studio', the
     header wins, because the header is the thing the bridge actually verified.
+
+    ⚠ ONE FIELD, NOT TWO. An earlier draft of D1 also stamped `actor_seat` for
+    signal_ack here. That is gone: the closer identity travels in-process
+    (`dispatch_context`), never as an argument — see SEAT_ACTOR_TOOLS above for
+    why an argument could not carry it honestly.
     """
-    if tool in SEAT_SIGNABLE_TOOLS and isinstance(arguments, dict):
+    if not isinstance(arguments, dict):
+        return arguments
+    if tool in SEAT_SIGNABLE_TOOLS:
         arguments["source_instance"] = seat_id
     return arguments

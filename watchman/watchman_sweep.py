@@ -125,8 +125,15 @@ def resolve_root(cli_root=None):
 
 def load_bridge_token():
     """Same resolution order as bridge_config.py, kept dependency-free so the
-    watchman runs from any checkout without sys.path games."""
-    token_file = Path.home() / ".config" / "sovereign-bridge.env"
+    watchman runs from any checkout without sys.path games.
+
+    SOVEREIGN_BRIDGE_ENV_FILE is honoured for the same reason bridge.py honours
+    it (Codex review 2026-09-06, F6): the watchman suite must not read Anthony's
+    real credential file to prove a sweep works."""
+    token_file = Path(
+        os.environ.get("SOVEREIGN_BRIDGE_ENV_FILE")
+        or (Path.home() / ".config" / "sovereign-bridge.env")
+    )
     if token_file.exists():
         try:
             for line in token_file.read_text().splitlines():

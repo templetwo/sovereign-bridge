@@ -131,7 +131,23 @@ VERSION = _resolve_version(_STACK_REPO_ROOT, _METADATA_VERSION)
 # Door That Asks, Phase 2: ARRIVAL_DECIDE_SECRET / NTFY_TOPIC / NTFY_SERVER /
 # ARRIVAL_GATE_ENABLED / PUBLIC_BASE_URL are exported into the process env so
 # arrival_gate.py reads one source of truth).
-TOKEN_FILE = Path(os.path.expanduser("~/.config/sovereign-bridge.env"))
+#
+# ⚠ THE PATH IS A SEAM, AND THE SEAM IS THE POINT (Codex review 2026-09-06, F6).
+# This read happens at IMPORT, which means it happens at pytest COLLECTION,
+# before any fixture can run: the review measured one intercepted read of
+# Anthony's real credential file during the mandated suite run and was right to
+# refuse the phrase "isolated test environment". A fixture cannot close that —
+# only an override the import itself honours can, which is what
+# SOVEREIGN_BRIDGE_ENV_FILE is. tests/conftest.py sets it to a synthetic file
+# at module scope, so the suite never opens the real one at all.
+#
+# It is NOT a production knob and must not become one: unset (the deployed
+# case) this resolves to exactly the path launchd has always used.
+BRIDGE_ENV_FILE_VAR = "SOVEREIGN_BRIDGE_ENV_FILE"
+TOKEN_FILE = Path(
+    os.environ.get(BRIDGE_ENV_FILE_VAR)
+    or os.path.expanduser("~/.config/sovereign-bridge.env")
+)
 BEARER_TOKEN = None
 _GATE_ENV_KEYS = (
     "ARRIVAL_DECIDE_SECRET",
@@ -360,12 +376,20 @@ def check_auth_or_seat(
         # half. The pid is whatever the kernel just verified, so it is present
         # for every denial that got past the transport check and absent (as
         # '-') for the ones that did not.
+        #
+        # ALL THREE PIDS (F2 / D6). `seat_mismatch` is exactly the case where
+        # accept_pid != peer_pid is the explanation, so a denial line that
+        # carried only the sender left the reader unable to see the descriptor
+        # handoff that produced it.
+        peer_d = peer if isinstance(peer, dict) else {}
         si.audit(
             seat_header,
             None,
             "denied",
             denied.reason,
-            peer.get("pid") if isinstance(peer, dict) else None,
+            peer_pid=peer_d.get("pid"),
+            seat_pid=peer_d.get("seat_pid"),
+            accept_pid=peer_d.get("accept_pid"),
         )
         raise HTTPException(status_code=401, detail=denied.detail) from None
 
@@ -1244,8 +1268,8 @@ def _signals_unmeasured(exc: Exception, route: str | None = None) -> dict:
     return {
         "source": route or SIGNALS_SOURCE,
         "error": (
-            f"signal_ledger_unavailable; signals_summary failed: {type(exc).__name__}"
-            if route == "stack tool signals_summary"
+            f"signal_ledger_unavailable; stack heartbeat failed: {type(exc).__name__}: {exc}"
+            if route == SIGNALS_TOOL_ROUTE
             else f"unreadable:{type(exc).__name__}"
         ),
         "ingestion": "error",
@@ -1261,51 +1285,57 @@ def _signals_unmeasured(exc: Exception, route: str | None = None) -> dict:
     }
 
 
+SIGNALS_TOOL_ROUTE = "stack tool heartbeat"
+
+
 async def _signals_via_tool() -> dict:
-    """THE FALLBACK: ask the stack for the summary when we cannot import it.
+    """THE FALLBACK: ask the stack's own heartbeat when we cannot import.
 
     ⚠ THIS CLOSES A WINDOW THAT IS OPEN RIGHT NOW, not a hypothetical one. The
     import above is resolved ONCE, at module scope. Deploy the stack's
-    signal_ledger, restart sovereign-sse so `signals_summary` answers upstream,
-    and do NOT restart the bridge — the heartbeat would report
-    `signal_ledger_unavailable` indefinitely while the tool that knows the
-    answer is running one process over. That is this house's most expensive
-    shape (SOP #12): a reader that exists and is not wired to the thing it
-    reads. The bridge already carries its own credential for this call, so no
-    new secret and no new grant is involved.
+    signal_ledger, restart sovereign-sse so the stack answers upstream, and do
+    NOT restart the bridge — the heartbeat would report
+    `signal_ledger_unavailable` indefinitely while the process that knows the
+    answer is running one over. That is this house's most expensive shape
+    (SOP #12): a reader that exists and is not wired to the thing it reads. The
+    bridge already carries its own credential for this call, so no new secret
+    and no new grant is involved.
 
-    IT IS BOUNDED, because /api/heartbeat is UNAUTHENTICATED and this is a
-    network round-trip: same timeout the tool-inventory fetch uses, and a
-    timeout renders as an error state rather than a zero, like every other
-    failure on this field.
+    ⚠ IT ASKS FOR THE FIELD, IT DOES NOT REBUILD IT (Codex review 2026-09-06,
+    F3; HQ decision D7). The first version called `signals_summary` and
+    transcribed seven keys out of its answer. That silently DROPPED
+    `source_status`, `sources_degraded` and `corrupt_rows`, and — worse —
+    reported `by_source.watchman = 1` for a source the local route correctly
+    reported as `null` because it could not be read. Two routes for one field
+    that disagree about whether a number is KNOWN is exactly the fail-open the
+    field exists to prevent: the degraded route was the reassuring one.
+
+    So the fallback now calls the stack's `heartbeat` tool, which as of
+    release/2026-09-06 carries `unacked_signals` from the SAME
+    `signal_ledger.heartbeat_field` the local import would have called, and
+    passes that object through VERBATIM. No key list, no flattening, no
+    selection. A key the stack adds tomorrow arrives tomorrow; a null it
+    computed stays null. The only thing added is `source`, so a reader can tell
+    which route answered.
     """
     result = await asyncio.wait_for(
-        call_mcp_tool("signals_summary", {}), timeout=HEARTBEAT_TOOL_TIMEOUT
+        call_mcp_tool("heartbeat", {}), timeout=HEARTBEAT_TOOL_TIMEOUT
     )
     if not isinstance(result, dict) or not result.get("ok"):
-        raise RuntimeError(str((result or {}).get("error") or "signals_summary failed"))
+        raise RuntimeError(str((result or {}).get("error") or "heartbeat failed"))
     payload = result.get("result")
-    if not isinstance(payload, dict) or not payload.get("ok"):
-        raise RuntimeError(str((payload or {}).get("error") or "signals_summary returned no data"))
-    # handle_signal_tool returns `{"ok", "ingestion", **summarize(root)}`, whose
-    # by_source values are per-source DICTS, not the flat open-counts
-    # heartbeat_field renders. Flattened here so the heartbeat field has ONE
-    # shape whichever path produced it — a consumer must not have to ask which
-    # route answered before it can read `by_source`.
-    by_source = payload.get("by_source")
-    if isinstance(by_source, dict):
-        by_source = {
-            k: (v.get("open") if isinstance(v, dict) else v) for k, v in by_source.items()
-        }
-    return {
-        "error": None,
-        "ingestion": payload.get("ingestion"),
-        "scanned_at": payload.get("scanned_at"),
-        "total": payload.get("total"),
-        "stale_24h": payload.get("stale_24h"),
-        "stale_7d": payload.get("stale_7d"),
-        "by_source": by_source,
-    }
+    if not isinstance(payload, dict):
+        raise RuntimeError("the stack heartbeat returned no object")
+    field = payload.get("unacked_signals")
+    if not isinstance(field, dict):
+        # The stack answered and its heartbeat does not carry the field: that
+        # is a DEPLOY-ORDER fact (a stack older than release/2026-09-06), and
+        # it must read as an error, never as a quiet zero.
+        raise RuntimeError(
+            "the stack heartbeat carries no unacked_signals field; this bridge "
+            "is running against a stack older than release/2026-09-06"
+        )
+    return dict(field)
 
 
 async def _measure_signals() -> dict:
@@ -1323,9 +1353,9 @@ async def _measure_signals() -> dict:
     if SIGNALS_SOURCE == "unavailable":
         try:
             field = await _signals_via_tool()
-            return {"source": "stack tool signals_summary", **field}
+            return {"source": SIGNALS_TOOL_ROUTE, **field}
         except Exception as exc:
-            return _signals_unmeasured(exc, route="stack tool signals_summary")
+            return _signals_unmeasured(exc, route=SIGNALS_TOOL_ROUTE)
     try:
         field = _signal_heartbeat_field()
     except Exception as exc:
@@ -1567,18 +1597,78 @@ async def call_tool_endpoint(
     # Seat identity (Anthony 2026-09-05: seats he put on the Studio need no
     # token; every write signs itself). Scope is the read+write session surface
     # reused exactly, narrowed by governance and by whether the write CAN sign.
+    seat_id = None
+    _audit_pids: dict[str, Any] = {}
     if isinstance(ctx, dict) and ctx.get("kind") == "seat":
         seat_id = ctx["seat_id"]
-        allowed, reason = si.seat_tool_allowed(req.tool)
+        _audit_pids = {
+            "peer_pid": ctx.get("peer_pid"),
+            "seat_pid": ctx.get("seat_pid"),
+            "accept_pid": ctx.get("accept_pid"),
+        }
+        # ONE SOURCE for the surface (D2): what the stack publishes RIGHT NOW,
+        # minus governance. Neither route answering is a 503, never a silent
+        # allow-all and never a silent deny-all dressed as policy.
+        try:
+            surface = await si.published_surface(fetch=_list_tools_raw)
+        except si.SeatSurfaceUnavailable as exc:
+            si.audit(seat_id, req.tool, "denied", "surface_unavailable", **_audit_pids)
+            raise HTTPException(status_code=503, detail=str(exc))
+        allowed, reason = si.seat_tool_allowed(req.tool, surface)
         if not allowed:
-            si.audit(seat_id, req.tool, "denied", reason, ctx.get("peer_pid"))
+            si.audit(seat_id, req.tool, "denied", reason, **_audit_pids)
             raise ScopeHTTPException(
                 status_code=403,
                 detail=si.deny_detail(req.tool, reason),
             )
+        # PROTECTED MATERIAL (D4, review F1). Anthony reserves his children and
+        # protected family material to himself.
+        #
+        # ⚠ THE INDEX IS LOADED ONCE, HERE, BEFORE THE CALL, AND SERVES BOTH THE
+        # PRE-CHECK AND THE POST-FILTER. Two reads would open a window between
+        # them; and loading it only at filter time meant a WRITE was dispatched
+        # before an unreadable index could refuse it — the write landed and the
+        # caller was told 403, which is the worst of both answers.
+        #
+        # An unreadable index shuts the WHOLE seat path, exactly as an
+        # unreadable registry already does. That symmetry is the argument: when
+        # a guard cannot be evaluated, the door is shut, not narrowed.
+        try:
+            protected_index = si.load_protected_index()
+        except si.ProtectedIndexUnreadable as exc:
+            si.audit(seat_id, req.tool, "denied", "protected_index_unreadable", **_audit_pids)
+            raise ScopeHTTPException(
+                status_code=403,
+                detail=(
+                    "The protected designation index could not be read "
+                    f"({exc}), so no response can be certified free of protected "
+                    "material and no seat call is served. Anthony's protected "
+                    "family material is reserved to him; a guard that cannot "
+                    "tell which records those are refuses rather than guesses."
+                ),
+            )
+        refusal = si.protected_call_refusal(req.tool, req.arguments, protected_index)
+        if refusal is not None:
+            si.audit(seat_id, req.tool, "denied", refusal[0], **_audit_pids)
+            raise ScopeHTTPException(status_code=403, detail=refusal[1])
+        # THE CLOSER IDENTITY (D1 as amended). It is NOT an argument: a client
+        # that names the actor is refused, and a stack with no in-process
+        # channel to carry the verified seat cannot serve the tool at all.
+        for check in (
+            si.actor_argument_refusal(req.tool, req.arguments),
+            si.actor_channel_refusal(req.tool),
+        ):
+            if check is not None:
+                si.audit(seat_id, req.tool, "denied", check[0], **_audit_pids)
+                raise ScopeHTTPException(status_code=403, detail=check[1])
+        # POST-FIX PROBES (D5): classify by ARGUMENTS, not by the tool name.
+        probe_refusal = si.probe_call_refusal(req.tool, req.arguments)
+        if probe_refusal is not None:
+            si.audit(seat_id, req.tool, "denied", probe_refusal[0], **_audit_pids)
+            raise ScopeHTTPException(status_code=403, detail=probe_refusal[1])
         # OVERRIDE, never setdefault: a seat cannot claim another identity.
         req.arguments = si.sign_arguments(req.tool, req.arguments, seat_id)
-        si.audit(seat_id, req.tool, "allowed", "ok", ctx.get("peer_pid"))
+        si.audit(seat_id, req.tool, "allowed", "ok", **_audit_pids)
 
     # Scoped session token (The Door That Asks, Phase 1): default-deny per
     # tool, hard-deny on the never list, and stamp chronicle writes with the
@@ -1648,9 +1738,58 @@ async def call_tool_endpoint(
             replay["duration_ms"] = round((time.time() - start) * 1000)
             return replay
 
-    result = await call_mcp_tool(req.tool, req.arguments)
+    # ⚠ THE VERIFIED SEAT TRAVELS IN-PROCESS AROUND THE DISPATCH, NOT ON THE
+    # WIRE (D1 as amended, 2026-09-06). `sovereign_stack.dispatch_context`
+    # holds a contextvar the stack reads when it needs to name the caller —
+    # signal_ack's closer today. A contextvar cannot be set by anything that
+    # arrives over HTTP, which is what makes the stack's refusal of a
+    # caller-supplied actor enforceable instead of conventional.
+    #
+    # Set for EVERY seat call, not only the tools that read it: a channel that
+    # is armed selectively is a channel whose absence means two different
+    # things, and the next tool to need an identity should find one there.
+    # RESET IN A FINALLY, because this coroutine's context is reused and a
+    # leaked seat would attribute the NEXT caller's write to the last one.
+    _ctx_module = si.dispatch_context_module() if seat_id is not None else None
+    _ctx_token = _ctx_module.set_caller_seat(seat_id) if _ctx_module is not None else None
+    try:
+        result = await call_mcp_tool(req.tool, req.arguments)
+    finally:
+        if _ctx_module is not None:
+            _ctx_module.reset_caller_seat(_ctx_token)
     if not result.get("ok") and "failure_class" not in result:
         result["failure_class"] = "stack"  # (#7)
+
+    # PROTECTED POST-FILTER (D4, review F1). Every seat response is walked and
+    # every designated entry dropped, whatever tool produced it and whatever
+    # shape it came back in.
+    #
+    # ⚠ BEFORE _idem_put, NOT AFTER. Caching the unfiltered result and
+    # filtering the return value would put protected content in the
+    # idempotency store, where the next replay would serve it straight back
+    # around the guard. The filter runs on the object that is both returned AND
+    # cached.
+    if seat_id is not None:
+        try:
+            filtered, withheld = si.filter_protected(result.get("result"), protected_index)
+        except si.ProtectedIndexUnreadable as exc:
+            # Reached only by the response-size guard: a payload too large to
+            # walk cannot be certified, so it is withheld whole rather than
+            # returned with an unchecked tail.
+            si.audit(seat_id, req.tool, "denied", "protected_filter_incomplete", **_audit_pids)
+            raise ScopeHTTPException(
+                status_code=403,
+                detail=(
+                    f"The response to {req.tool!r} cannot be certified free of "
+                    f"protected material ({exc}), so it is withheld whole."
+                ),
+            )
+        result["result"] = filtered
+        # STATED EVEN WHEN ZERO. "the filter ran and removed nothing" and "the
+        # filter did not run" are different facts and a reader must be able to
+        # tell them apart — an absent field would collapse them (SOP #2).
+        result["withheld_protected"] = withheld
+
     result["duration_ms"] = round((time.time() - start) * 1000)
 
     if idem_key and result.get("ok"):
