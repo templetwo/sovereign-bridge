@@ -58,6 +58,13 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import bridge  # noqa: E402
 import seat_identity as si  # noqa: E402
+# The pinned surface lives in suite_support so every suite decides against the
+# same one; see its module docstring for why it is not resolved live.
+from suite_support import (  # noqa: E402
+    PINNED_PUBLISHED,
+    PINNED_RETIRED,
+    release_stack_surface,
+)
 import seat_socket as ss  # noqa: E402
 import session_tokens as st  # noqa: E402
 
@@ -137,6 +144,55 @@ def calls(monkeypatch):
 
     monkeypatch.setattr(bridge, "call_mcp_tool", fake)
     return seen
+
+
+@pytest.fixture
+def caller_channel(monkeypatch, calls):
+    """A stand-in for `sovereign_stack.dispatch_context`, plus a tap on it.
+
+    ⚠ A STUB, BECAUSE THE REAL MODULE DOES NOT EXIST YET. The stack round adds
+    it; this bridge release must be provable before and after that lands, and a
+    test that could only run against a deployed stack is a test nobody runs.
+    The stub implements the exact contract the bridge uses —
+    `set_caller_seat(seat) -> token` and `reset_caller_seat(token)` over a real
+    `contextvars.ContextVar` — so what is exercised is the bridge's use of the
+    channel, which is the half this repo owns.
+
+    Records three things, each answering a different question:
+      seen    — the seat the STACK would have observed, read inside dispatch.
+      after   — the value in-context immediately after the reset. Read there
+                because reading it from the test thread afterwards returns None
+                whether or not the reset ran: a test that cannot fail.
+      balance — set/reset pairing. Non-zero is a leak even if `after` is clean.
+    """
+    import contextvars
+
+    var = contextvars.ContextVar("caller_seat_test", default=None)
+    state = {"seen": [], "after": [], "balance": 0}
+
+    class _Stub:
+        @staticmethod
+        def set_caller_seat(seat):
+            state["balance"] += 1
+            return var.set(seat)
+
+        @staticmethod
+        def reset_caller_seat(token):
+            state["balance"] -= 1
+            if token is not None:
+                var.reset(token)
+            state["after"].append(var.get())
+
+    monkeypatch.setattr(si, "dispatch_context_module", lambda: _Stub)
+
+    inner = bridge.call_mcp_tool
+
+    async def recording(tool, args):
+        state["seen"].append(var.get())
+        return await inner(tool, args)
+
+    monkeypatch.setattr(bridge, "call_mcp_tool", recording)
+    return state
 
 
 def client(env_seat=SEAT, verified=None):
@@ -393,35 +449,48 @@ def test_no_seat_header_is_the_old_401(registry, calls):
 # ── Scope ───────────────────────────────────────────────────────────────────
 
 
-def test_governance_tool_is_denied_to_a_seat(registry, calls):
+def test_governance_tool_is_denied_to_a_seat(registry, calls, surface):
     """Denied AS GOVERNANCE, by name — not incidentally.
 
-    None of these is in TOOL_SCOPES, so default-deny already refuses them today
-    and this test passed with SEAT_NEVER_TOOLS deleted. That is the belt-and-
-    suspenders working, and it is also how a suspenders-only design would go
-    unnoticed: the day someone maps a governance tool into read/write, the
-    default-deny stops covering it and only the explicit list holds. So assert
-    on the reason the code gives, which changes to 'unmapped' the moment the
-    explicit denial goes away.
+    Assert on the REASON the code gives, not just the 403. Several rules refuse
+    a tool, and a test that only reads the status code passes when the tool
+    stops being published for an unrelated reason — which would mean the
+    governance list had quietly stopped being load-bearing without anything
+    going red.
     """
     for tool in ("set_policy", "open_protected_record", "resolve_thread", "govern"):
         r = call(client(), tool, seat_hdr())
         assert r.status_code == 403, f"{tool} reached the stack"
         assert r.json()["failure_class"] == "scope"
-        assert si.seat_tool_allowed(tool) == (False, "governance"), tool
+        assert si.seat_tool_allowed(tool, surface) == (False, "governance"), tool
     assert not calls
 
 
-def test_a_governance_tool_is_denied_however_it_is_classified_elsewhere(monkeypatch):
+def test_governance_is_checked_before_publication(registry, calls, surface):
+    """⚠ THE ORDER CHANGED IN THIS RELEASE, AND THE CHANGE IS THE TEST.
+
+    `open_protected_record`, `resolve_thread`, `govern` and `retire_hypothesis`
+    are governance names the stack RETIRED on 2026-09-06, so they are no longer
+    published. Under the previous order (publication first) each would now be
+    refused `unpublished` — a word that reads as "this tool does not exist"
+    about tools that very much do and are RESERVED. The reason a caller reads
+    must be the one still true after the next stack release.
+    """
+    for tool in ("open_protected_record", "resolve_thread", "govern", "retire_hypothesis"):
+        assert tool not in surface.published, f"{tool} is published; premise gone"
+        assert si.seat_tool_allowed(tool, surface) == (False, "governance"), tool
+
+
+def test_a_governance_tool_is_denied_however_it_is_classified_elsewhere(monkeypatch, surface):
     """The scenario the explicit list exists for: someone reclassifies a
     governance tool somewhere else in the codebase. SEAT_NEVER_TOOLS must still
     hold, because it is the only list that is ABOUT governance."""
     monkeypatch.setitem(st.TOOL_SCOPES, "set_policy", "write")
-    assert si.seat_tool_allowed("set_policy") == (False, "governance")
-    assert "set_policy" not in si.seat_allowed_tools()
+    assert si.seat_tool_allowed("set_policy", surface) == (False, "governance")
+    assert "set_policy" not in si.seat_allowed_tools(surface)
 
 
-def test_session_lifecycle_tools_stay_as_they_were(registry, calls):
+def test_session_lifecycle_tools_stay_as_they_were(registry, calls, surface):
     """ANTHONY'S RULING, the clause that is a NON-change: "close_session /
     spiral_inherit stay as they were."
 
@@ -431,59 +500,57 @@ def test_session_lifecycle_tools_stay_as_they_were(registry, calls):
     implementing the widening around it.
     """
     for tool in ("close_session", "spiral_inherit"):
-        assert si.seat_tool_allowed(tool) == (False, "governance"), tool
+        assert si.seat_tool_allowed(tool, surface) == (False, "governance"), tool
         assert call(client(), tool, seat_hdr()).status_code == 403
     assert not calls
 
 
-def test_the_ruling_widened_the_surface_to_the_published_tools(registry, calls):
+def test_the_ruling_widened_the_surface_to_the_published_tools(registry, calls, surface):
     """ANTHONY'S RULING, 2026-09-06: "all studio seats are trusted."
 
-    THE SHAPE: allowed = published surface − governance − retired. Asserted as
-    the equation, not as a hand-copied list, so a future edit to any one of the
-    three constants moves the surface and this test follows it.
-
-    The counts are pinned separately below; here the point is that the surface
-    is no longer st.TOOL_SCOPES. Before the ruling a seat reached 21 of 100
-    published tools and could not call the boot door it is TOLD to call.
+    THE SHAPE, now with ONE subtraction: allowed = published - governance.
+    Asserted as the equation, not as a hand-copied list, so a change to either
+    input moves the surface and this test follows it.
     """
-    allowed = set(si.seat_allowed_tools())
-    expected = si.SEAT_TOOL_SURFACE - si.SEAT_NEVER_TOOLS - si.SEAT_RETIRED_TOOLS
-    assert allowed == expected
-    old_surface = {t for t, s in st.TOOL_SCOPES.items() if s in ("read", "write")}
+    allowed = set(si.seat_allowed_tools(surface))
+    assert allowed == surface.published - si.SEAT_NEVER_TOOLS
+    old_surface = {t for t, sc in st.TOOL_SCOPES.items() if sc in ("read", "write")}
     assert len(allowed) > 2 * len(old_surface), "the ruling widened the surface"
 
 
-def test_the_widening_also_NARROWS_in_exactly_two_places(registry, calls):
-    """⚠ AN HONEST CONSEQUENCE, PINNED SO IT CANNOT BE DISCOVERED BY SURPRISE.
+def test_a_seat_is_never_narrower_than_a_session_grant(registry, calls, surface):
+    """⚠ THIS TEST USED TO ASSERT THE OPPOSITE, AND THAT IS THE POINT.
 
-    Anthony's ruling is a widening — 19 tools to 48 — but subtracting the
-    RETIRED set takes away two tools a read+write SESSION grant can still call
-    today: `ask_scribe` (read) and `reflection_ack` (write). So a seated Studio
-    terminal, which the ruling calls TRUSTED, reaches two fewer tools than an
-    outside visitor holding a scoped token. That is backwards on its face.
+    The previous release pinned an honest defect under the name
+    `test_the_widening_also_NARROWS_in_exactly_two_places`: subtracting a
+    census-derived RETIRED set took `ask_scribe` and `reflection_ack` away from
+    seats while a scoped session grant could still call them, so a seated
+    Studio terminal - the thing Anthony called TRUSTED - reached two fewer
+    tools than an outside visitor. Backwards on its face, and left visible
+    rather than fixed by someone's judgement, because the census was not the
+    stack's decision to make.
 
-    IT IS IMPLEMENTED THAT WAY ON PURPOSE, and the reason is jurisdiction, not
-    conviction. The stack has no RETIRED set, so this release derives one from
-    the 30-day census's Total-0 rows as instructed. The census's OWN §4 marks
-    `reflection_ack` with ★ — "keep these reachable" — so there is a live
-    argument that both belong back in the surface.
-
-    Two ways to make this test go green, and the difference matters: if the
-    stack lands a real RETIRED set that omits them, they return and the count
-    below moves. If Anthony rules that a seat is never narrower than a session
-    grant, add that subtraction to seat_tool_allowed. Neither is HQ's to decide
-    quietly (pol_20260831), so it is measured, named, and left where he can see
-    it rather than fixed by someone's judgement at 2am.
+    Deleting the census closed it in the only honest direction: those two names
+    are now denied because THE STACK retired them, and a session grant calling
+    them gets a retired-tool error from the stack. The invariant that survives,
+    and the one HQ decision D2 names: on any tool the stack actually PUBLISHES,
+    a seat is never narrower than a read+write session grant.
     """
-    session_grant = {t for t, s in st.TOOL_SCOPES.items() if s in ("read", "write")}
-    lost = session_grant - set(si.seat_allowed_tools())
-    assert lost == {"ask_scribe", "reflection_ack"}
-    for tool in sorted(lost):
-        assert si.seat_tool_allowed(tool) == (False, "retired_unused_30d"), tool
+    session_grant = {t for t, sc in st.TOOL_SCOPES.items() if sc in ("read", "write")}
+    published_grant = session_grant & surface.published
+    assert published_grant, "the premise is gone: the grant map publishes nothing"
+    lost = published_grant - set(si.seat_allowed_tools(surface))
+    assert lost == set(), (
+        "a seated Studio terminal reaches fewer PUBLISHED tools than a scoped "
+        f"outside visitor: {sorted(lost)}"
+    )
+    # ...and the two names the old defect was about are gone from the grant's
+    # reach for the stack's own reason, not this bridge's.
+    assert {"ask_scribe", "reflection_ack"} <= session_grant
+    assert {"ask_scribe", "reflection_ack"} <= surface.retired
 
 
-def test_tools_the_old_scope_map_never_carried_are_now_reachable(registry, calls):
+def test_tools_the_old_scope_map_never_carried_are_now_reachable(registry, calls, surface):
     """The ruling in its concrete form. Each of these was master-only by
     default-deny an hour ago; each is an ordinary act for a seated terminal.
 
@@ -500,60 +567,213 @@ def test_tools_the_old_scope_map_never_carried_are_now_reachable(registry, calls
         "the_ground",
         "signals_summary",
     ):
-        assert si.seat_tool_allowed(tool) == (True, "ok"), tool
+        assert si.seat_tool_allowed(tool, surface) == (True, "ok"), tool
         assert call(client(), tool, seat_hdr()).status_code == 200, tool
     assert len(calls) == 8
 
 
-def test_resolve_thread_by_id_is_a_seats_ordinary_act(registry, calls):
+def test_signal_ack_is_a_watch_seats_ordinary_act(registry, calls, surface, caller_channel):
+    """HQ DECISION D1, 2026-09-06 - a REVERSAL of the previous release, pinned.
+
+    `signal_ack` shipped DENIED as governance, on the stack's own `govern`
+    intent label, flagged at Anthony's gate rather than decided quietly. HQ
+    ruled the other way: acknowledging a signal is the watch seat's operational
+    act, and Anthony's governance list is laws, policies, seat permissions,
+    ring placement and deletes. Classifying it govern left the designated watch
+    seat with no way to close anything it was seated to watch.
+    """
+    assert "signal_ack" not in si.SEAT_NEVER_TOOLS
+    assert si.seat_tool_allowed("signal_ack", surface) == (True, "ok")
+    r = call(client(), "signal_ack", seat_hdr(), signal_id="sig-1", state="acknowledged")
+    assert r.status_code == 200, r.text
+    assert calls[0][0] == "signal_ack"
+
+
+def test_the_verified_seat_travels_in_process_not_as_an_argument(
+    registry, calls, surface, caller_channel
+):
+    """D1 AS AMENDED, 2026-09-06 — and the amendment is the security property.
+
+    The first implementation injected `actor_seat` into signal_ack's arguments
+    and the stack trusted it "because the bridge overwrites it". An ARGUMENT is
+    a channel every caller can write to, so that trust rested on the bridge
+    being the only writer — not a property the stack can check. The identity
+    now travels through `sovereign_stack.dispatch_context`, a contextvar
+    nothing on the wire can reach, and the stack refuses the argument outright.
+
+    Asserted BOTH ways: the seat is visible in the context at dispatch time,
+    and no closer-shaped argument is on the call.
+    """
+    call(client(), "signal_ack", seat_hdr(), signal_id="sig-1", state="acted", reason="fixed")
+    assert caller_channel["seen"] == [SEAT], "the stack could not see the calling seat"
+    assert calls[0][1] == {"signal_id": "sig-1", "state": "acted", "reason": "fixed"}
+
+
+def test_the_context_is_reset_after_the_call(registry, calls, surface, caller_channel):
+    """⚠ A LEAKED CONTEXTVAR ATTRIBUTES THE NEXT CALLER'S WRITE TO THE LAST ONE.
+
+    `after` is read INSIDE the request's own context, immediately after the
+    reset — the only place the question can actually be asked. Reading the var
+    from the test's thread afterwards would return None whether the reset
+    happened or not, which is a test that cannot fail.
+    """
+    call(client(), "signal_ack", seat_hdr(), signal_id="sig-1", state="acknowledged")
+    assert caller_channel["seen"] == [SEAT]
+    assert caller_channel["after"] == [None], "the seat outlived its request"
+    assert caller_channel["balance"] == 0, "set and reset are not paired"
+
+
+def test_the_context_is_reset_even_when_the_stack_raises(
+    registry, surface, caller_channel, monkeypatch
+):
+    """The `finally` earns its keep here. An upstream that raises is exactly
+    where a leak is most likely and least noticed."""
+
+    async def boom(tool, args):
+        raise RuntimeError("upstream exploded")
+
+    monkeypatch.setattr(bridge, "call_mcp_tool", boom)
+    with pytest.raises(RuntimeError):
+        call(client(), "signal_ack", seat_hdr(), signal_id="sig-1", state="acknowledged")
+    assert caller_channel["after"] == [None], "the seat leaked past a failed call"
+    assert caller_channel["balance"] == 0
+
+
+def test_a_client_supplied_actor_is_refused_not_overwritten(
+    registry, calls, surface, caller_channel
+):
+    """Five names, each an attempt to name the closer. Refused, not silently
+    replaced: overwriting leaves the caller believing it named the actor, and
+    the difference only surfaces later when the record says someone else."""
+    for name in si.SEAT_ACTOR_FORBIDDEN_ARGS:
+        r = call(
+            client(), "signal_ack", seat_hdr(),
+            signal_id="sig-1", state="acknowledged", **{name: "hq-claude-studio"},
+        )
+        assert r.status_code == 403, f"{name!r} was accepted"
+        assert name in r.json()["detail"], name
+    assert not calls, "a call carrying a forged actor reached the stack"
+
+
+def test_signal_ack_is_refused_when_the_stack_has_no_caller_channel(
+    registry, calls, surface, monkeypatch
+):
+    """FAIL CLOSED AGAINST AN OLDER STACK, rather than falling back.
+
+    Without `dispatch_context` the closer would be stamped from the server's
+    shared spiral session — the SERVER, not the seat — so the record would name
+    the wrong actor while looking correct. Refusing is the honest answer, and
+    the reason names the deploy order rather than blaming the caller.
+    """
+    monkeypatch.setattr(si, "dispatch_context_module", lambda: None)
+    r = call(client(), "signal_ack", seat_hdr(), signal_id="sig-1", state="acknowledged")
+    assert r.status_code == 403
+    assert "dispatch_context" in r.json()["detail"]
+    assert "Deploy the stack release first" in r.json()["detail"]
+    assert not calls
+    # ...and it is signal_ack ONLY. An absent channel must not take the rest of
+    # the seat surface down with it.
+    assert call(client(), "recall_insights", seat_hdr()).status_code == 200
+
+
+def test_a_bearer_call_carries_no_seat_and_no_actor(
+    registry, calls, surface, caller_channel
+):
+    """THE GUARD D1 SAYS TO KEEP. A request with an Authorization header is
+    decided by the bearer path and never reaches resolve_seat, so nothing is
+    set: the context stays empty, no argument is injected, and the stack falls
+    back to its own identity resolution. Adding X-Sovereign-Seat to a bearer
+    call must not buy a verified-looking actor."""
+    r = call(
+        client(),
+        "signal_ack",
+        {**seat_hdr(), "Authorization": f"Bearer {MASTER}"},
+        signal_id="sig-1",
+        state="acknowledged",
+    )
+    assert r.status_code == 200, r.text
+    assert "actor_seat" not in calls[0][1]
+    assert caller_channel["seen"] == [None], "a bearer call named a seat to the stack"
+
+
+def test_resolve_thread_by_id_is_a_seats_ordinary_act(registry, calls, surface):
     """The ruling names this one explicitly: keep it ALLOWED. Closing a thread
-    by its id is authorship. Bare `resolve_thread` — which resolves by MATCH,
-    across threads a seat may not own — stays governance."""
-    assert si.seat_tool_allowed("resolve_thread_by_id") == (True, "ok")
-    assert si.seat_tool_allowed("resolve_thread") == (False, "governance")
+    by its id is authorship. Bare `resolve_thread` - which resolves by MATCH,
+    across threads a seat may not own - stays governance."""
+    assert si.seat_tool_allowed("resolve_thread_by_id", surface) == (True, "ok")
+    assert si.seat_tool_allowed("resolve_thread", surface) == (False, "governance")
     assert call(client(), "resolve_thread_by_id", seat_hdr()).status_code == 200
 
 
-def test_a_tool_the_stack_no_longer_serves_is_denied_as_retired(registry, calls):
-    """"minus anything the stack retires." The reason word says what was
-    actually measured — 30-day disuse — rather than claiming the tool is gone,
-    because the census this falls back to measures use, not retirement."""
-    allowed, reason = si.seat_tool_allowed("synthesize_now")
-    assert (allowed, reason) == (False, "retired_unused_30d")
+def test_a_tool_the_stack_retired_is_denied_as_retired(registry, calls, surface):
+    """"minus anything the stack retires" - and it is now the STACK saying so.
+
+    The reason word changed from `retired_unused_30d` to `retired` because what
+    is being reported changed: this bridge no longer measures 30-day disuse and
+    calls it retirement. It reads `RETIRED_TOOLS` off the stack's own registry.
+    """
+    allowed, reason = si.seat_tool_allowed("synthesize_now", surface)
+    assert (allowed, reason) == (False, "retired")
     r = call(client(), "synthesize_now", seat_hdr())
     assert r.status_code == 403
-    assert "census" in r.json()["detail"]
+    assert "retired by the stack itself" in r.json()["detail"]
     assert not calls
 
 
-def test_governance_beats_retirement_when_a_tool_is_both(registry, calls):
-    """Six names are in both sets. The reason given must be the one that will
-    still be true after the next census: governance."""
-    both = si.SEAT_NEVER_TOOLS & si.SEAT_RETIRED_TOOLS
-    assert both, "the overlap is the premise of this test"
-    for tool in sorted(both & si.SEAT_TOOL_SURFACE):
-        assert si.seat_tool_allowed(tool) == (False, "governance"), tool
-
-
-def test_a_tool_the_stack_adds_later_is_denied_until_it_is_added_here(registry, calls):
+def test_a_tool_the_stack_adds_later_is_denied_until_it_publishes_it(registry, calls, surface):
     """DEFAULT-DENY SURVIVED THE WIDENING, and this is the proof. The base set
-    is an ENUMERATION of what the stack publishes, not "whatever the caller
-    names", so a name this release never heard of is refused."""
-    assert si.seat_tool_allowed("some_tool_invented_next_week") == (False, "unpublished")
+    is what the stack PUBLISHES, so a name nothing publishes is refused."""
+    assert si.seat_tool_allowed("some_tool_invented_next_week", surface) == (
+        False,
+        "unpublished",
+    )
     r = call(client(), "some_tool_invented_next_week", seat_hdr())
     assert r.status_code == 403
     assert not calls
 
 
-def test_the_published_surface_matches_the_stack_release_it_shipped_beside():
-    """The enumeration is a MEASUREMENT with a date on it, so pin its size. A
-    silent drift in this constant would silently change the policy: names lost
-    become `unpublished` denials, names invented become grants."""
-    assert len(si.SEAT_TOOL_SURFACE) == 100
-    assert len(si.seat_allowed_tools()) == 48
-    assert len(si.seat_denied_tools()) == 52
-    reasons = {r for _, r in si.seat_denied_tools()}
-    assert reasons == {"governance", "retired_unused_30d"}
+def test_the_pinned_surface_is_the_stack_release(registry, calls):
+    """⚠ THE ONE TEST THAT CHECKS THE COPY. Everything above decides against
+    PINNED_SURFACE; this asserts PINNED_SURFACE is what the stack release
+    actually publishes, measured from its source in a subprocess.
+
+    HQ decision D10: the test this replaces
+    (`test_the_published_surface_matches_the_stack_release_it_shipped_beside`)
+    asserted three CARDINALITIES - 100 / 48 / 52 - against a constant defined
+    in the same repo. Three numbers agreeing with themselves is not an
+    inventory comparison, and it would have stayed green through any rename
+    that preserved the count.
+
+    Skips rather than fails when the stack source is absent: a bridge checkout
+    without its companion repo is a legitimate state, and a red suite for it
+    teaches people to ignore a red suite.
+    """
+    published, retired, tree = release_stack_surface()
+    assert published == PINNED_PUBLISHED, (
+        f"the pinned published surface has drifted from {tree}: "
+        f"missing {sorted(published - PINNED_PUBLISHED)}, "
+        f"stale {sorted(PINNED_PUBLISHED - published)}"
+    )
+    assert retired == PINNED_RETIRED, (
+        f"the pinned retired set has drifted from {tree}: "
+        f"missing {sorted(retired - PINNED_RETIRED)}, "
+        f"stale {sorted(PINNED_RETIRED - retired)}"
+    )
+
+
+def test_the_seat_reaches_49_of_the_52_published_tools(registry, calls, surface):
+    """HQ decision D10's expected arithmetic, after admitting signal_ack:
+    49 allowed / 3 governance-denied of 52 published.
+
+    The three are named, not counted: a count alone would survive swapping one
+    denial for another.
+    """
+    allowed = si.seat_allowed_tools(surface)
+    denied = si.seat_denied_tools(surface)
+    assert len(surface.published) == 52
+    assert len(allowed) == 49, sorted(set(surface.published) - set(allowed))
+    assert [t for t, _ in denied] == ["close_session", "set_policy", "spiral_inherit"]
+    assert {r for _, r in denied} == {"governance"}
 
 
 # ── Signing ─────────────────────────────────────────────────────────────────
@@ -583,7 +803,7 @@ def test_reads_that_declare_source_instance_are_signed_too(registry, calls):
     assert calls[0][1]["source_instance"] == SEAT
 
 
-def test_unsignable_tools_are_never_injected_into(registry, calls):
+def test_unsignable_tools_are_never_injected_into(registry, calls, surface):
     """Injecting source_instance into a tool that does not declare it is a hard
     ValueError upstream (_reject_unknown_params) or — worse — a SILENT DROP.
 
@@ -594,12 +814,14 @@ def test_unsignable_tools_are_never_injected_into(registry, calls):
     record_insight lived under until 2026-08-28.
     """
     for tool in ("archive_exchange", "record_catch", "thread_touch", "supersede_insight"):
-        assert si.seat_tool_allowed(tool)[0] is True, tool
+        assert si.seat_tool_allowed(tool, surface)[0] is True, tool
         args = si.sign_arguments(tool, {"content": "x", "source": "y"}, SEAT)
         assert "source_instance" not in args, tool
+        # ...and the actor field is just as narrow: signal_ack only.
+        assert "actor_seat" not in args, tool
 
 
-def test_every_signable_tool_declares_source_instance_upstream():
+def test_every_signable_tool_declares_source_instance_upstream(surface):
     """SEAT_SIGNABLE_TOOLS is a claim ABOUT THE STACK'S SCHEMAS, and a wrong
     entry here is a silent drop, not a loud error. So it is checked against the
     stack source rather than trusted — the constant was derived by parsing that
@@ -639,7 +861,7 @@ def test_every_signable_tool_declares_source_instance_upstream():
         f"{sorted(si.SEAT_SIGNABLE_TOOLS - declaring)}"
     )
     # ...and every allowed tool that CAN sign, does.
-    signable_and_allowed = declaring & set(si.seat_allowed_tools())
+    signable_and_allowed = declaring & set(si.seat_allowed_tools(surface))
     assert signable_and_allowed <= si.SEAT_SIGNABLE_TOOLS, (
         "a tool the stack can attribute is going unsigned: "
         f"{sorted(signable_and_allowed - si.SEAT_SIGNABLE_TOOLS)}"
@@ -721,6 +943,80 @@ def test_every_seat_request_emits_one_audit_line(registry, calls, caplog):
     assert "outcome='denied' reason='governance'" in lines[1]
     assert "outcome='denied' reason='unknown_seat'" in lines[2]
     assert MASTER not in "".join(lines)
+
+
+def _audit_lines(caplog, run):
+    with caplog.at_level("INFO", logger="seat-auth"):
+        si.audit_log.propagate = True
+        try:
+            run()
+        finally:
+            si.audit_log.propagate = False
+    return [r.getMessage() for r in caplog.records if r.name == "seat-auth"]
+
+
+def test_the_audit_line_names_all_three_pids(registry, calls, caplog, surface):
+    """HQ DECISION D6, from review F2 — THE README PROMISED THIS AND THE CODE
+    DID NOT KEEP IT.
+
+    README.md said the connection's opener "is recorded only as `accept_pid` in
+    the audit line". It was not. `accept_pid` and `seat_pid` survived in the
+    protocol extension and died at the auth context; the audit line carried the
+    sender's pid alone. A promise in the documentation that the code does not
+    keep is worse than a missing field, because the next reader believes the
+    forensics exist and does not go looking.
+
+    The three answer different questions and only together tell the story:
+      pid        — who SENT this request (decides the call).
+      seat_pid   — whose ENVIRONMENT named the seat. Differs from pid when the
+                   seat was INHERITED rather than declared.
+      accept_pid — who OPENED the connection. Differs from pid exactly when the
+                   descriptor changed hands, which is F2's signature.
+    """
+    verified = peer(SEAT, pid=4242, seat_pid=4200, accept_pid=4100)
+    lines = _audit_lines(
+        caplog, lambda: call(client(verified=verified), READ_TOOL, seat_hdr())
+    )
+    assert len(lines) == 1
+    assert "pid='4242'" in lines[0], "the sender's pid was dropped"
+    assert "seat_pid='4200'" in lines[0], "the environment-owning pid was dropped"
+    assert "accept_pid='4100'" in lines[0], "the connection opener was dropped"
+    assert "outcome='allowed'" in lines[0]
+
+
+def test_a_denial_names_all_three_pids_too(registry, calls, caplog, surface):
+    """⚠ THE DENIAL LINE IS WHERE THESE FIELDS EARN THEIR KEEP, so a forensic
+    field that only appeared on success would be absent from every event worth
+    investigating.
+
+    `seat_mismatch` is precisely the case where accept_pid != pid is the
+    explanation — a descriptor handed to a differently-seated process — and it
+    is the one line a reader will come back to.
+    """
+    verified = peer("codex-astra-studio", pid=5555, seat_pid=5550, accept_pid=5500)
+    lines = _audit_lines(
+        caplog, lambda: call(client(verified=verified), READ_TOOL, seat_hdr(SEAT))
+    )
+    assert len(lines) == 1
+    assert "outcome='denied' reason='seat_mismatch'" in lines[0]
+    assert "pid='5555'" in lines[0]
+    assert "seat_pid='5550'" in lines[0]
+    assert "accept_pid='5500'" in lines[0]
+
+
+def test_absent_pids_render_as_a_dash_not_as_a_guess(registry, calls, caplog, surface):
+    """A TCP denial never resolved a peer, so there is nothing to name. `-` is
+    the honest rendering; a zero or an empty string would read as a measured
+    value of nothing."""
+    lines = _audit_lines(
+        caplog, lambda: tcp_client().post(
+            "/api/call",
+            json={"tool": READ_TOOL, "arguments": {}},
+            headers=seat_hdr(),
+        )
+    )
+    assert len(lines) == 1
+    assert "pid=- seat_pid=- accept_pid=-" in lines[0]
 
 
 def test_a_forged_audit_line_is_impossible(registry, calls, caplog):

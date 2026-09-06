@@ -93,10 +93,23 @@ def test_find_repo_root_walks_up_to_git(tmp_path):
     assert bridge._find_repo_root(deep / "mod.py") == tmp_path
 
 
-def test_find_repo_root_none_when_no_git_anywhere(tmp_path):
-    deep = tmp_path / "a" / "b"
-    deep.mkdir(parents=True)
-    assert bridge._find_repo_root(deep) is None
+def test_find_repo_root_none_when_no_git_anywhere():
+    """⚠ THIS TEST USED tmp_path AND WAS THEREFORE A HARNESS TEST, NOT A CODE TEST.
+
+    The house test command sets TMPDIR to <worktree>/.tmp, which puts pytest's
+    tmp_path INSIDE this git worktree — so `_find_repo_root` correctly walked
+    up, found the worktree's own .git, and the assertion failed. The FUNCTION
+    was right and the premise was wrong: the test assumed an ancestry it never
+    established, and the two failures it produced were then reported around
+    rather than fixed, in two consecutive deliveries.
+
+    A path that does not exist has parents that do not exist either, so no
+    ancestor can carry a .git and the premise holds under ANY TMPDIR. Nothing
+    is created or written; `_find_repo_root` only calls .exists().
+    """
+    absent = Path("/no-such-root-for-tests-a1b2c3") / "a" / "b"
+    assert not absent.exists(), "the premise requires this path to be absent"
+    assert bridge._find_repo_root(absent) is None
 
 
 # --- _git_head_state: real git, not a constant -------------------------------
@@ -155,7 +168,16 @@ def test_git_head_state_clean_despite_untracked_scratch_files(tmp_path):
     assert sha is not None
 
 
-def test_git_head_state_none_for_non_repo(tmp_path):
+def test_git_head_state_none_for_non_repo(tmp_path, monkeypatch):
+    """Same harness trap as above, and the same fix in git's own vocabulary.
+
+    Under the mandated TMPDIR, tmp_path sits inside this worktree, so
+    \ ascends and answers for the WORKTREE — a
+    real sha, from a real repo, that has nothing to do with the directory the
+    test named. GIT_CEILING_DIRECTORIES stops that ascent at tmp_path's parent,
+    which is exactly the condition the test claims to be creating.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
     sha, dirty = _run(bridge._git_head_state(tmp_path))
     assert sha is None
     assert dirty is None

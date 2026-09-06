@@ -816,3 +816,180 @@ def test_RESIDUAL_a_process_can_still_declare_a_seat_it_was_not_given(live, monk
         )
     assert code == 200, f"the residual closed; update the doctrine above: {payload}"
     assert live[0][1].get("source_instance") == OTHER_SEAT
+
+
+# ── FINDING 2 (F2): the residual the fix does NOT close, stated exactly ─────
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# The F2 scenario, run in a process that was BORN seated. Prints one JSON
+# receipt on stdout: the stamp resolved at ASGI entry, the two pids, the raw
+# status line, and what reached the (faked) stack.
+_SPLIT_BODY_SCENARIO = r"""
+import asyncio, json, os, socket, sys
+sys.path.insert(0, sys.argv[1])
+PARENT_SEAT, CHILD_SEAT = sys.argv[2], sys.argv[3]
+import bridge, seat_identity as si, seat_socket as ss
+import uvicorn
+from uvicorn.protocols.http.h11_impl import H11Protocol
+from uvicorn.server import ServerState
+
+dispatched = []
+stamps = []
+
+
+async def fake(tool, args):
+    dispatched.append((tool, args))
+    return {"ok": True, "result": {"synthetic": True}}
+
+
+bridge.call_mcp_tool = fake
+_original = ss.peer_extension
+
+
+# The seat surface is pinned here for the same reason the root conftest pins it
+# for the rest of the suite: this subprocess has no stack tree and no upstream,
+# so an unpinned resolution is a 503 and the test would measure the wrong
+# refusal. What is under test is ATTRIBUTION, not surface resolution.
+async def _pinned_surface(fetch=None):
+    return si.Surface(frozenset({"record_insight"}), frozenset(), "test pin")
+
+
+si.published_surface = _pinned_surface
+
+
+async def main():
+    stamped = asyncio.Event()
+
+    def capture(*a, **k):
+        value = _original(*a, **k)
+        stamps.append(value)
+        stamped.set()
+        return value
+
+    ss.peer_extension = capture
+    config = uvicorn.Config(bridge.app, log_level="critical", proxy_headers=False, ws="none")
+    config.load()
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    cls = ss.make_protocol_class(H11Protocol)
+    transport, _p = await asyncio.get_running_loop().connect_accepted_socket(
+        lambda: cls(config=config, server_state=ServerState(), app_state={}), left
+    )
+    body = json.dumps(
+        {"tool": "record_insight", "arguments": {"content": "child-chosen", "domain": "f"}}
+    ).encode()
+    headers = (
+        "POST /api/call HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
+        "Content-Type: application/json\r\n"
+        "X-Sovereign-Seat: " + PARENT_SEAT + "\r\n"
+        "Content-Length: " + str(len(body)) + "\r\n\r\n"
+    ).encode()
+    child_src = (
+        "import sys,socket\n"
+        "s=socket.socket(fileno=int(sys.argv[1]))\n"
+        "s.sendall(bytes.fromhex(sys.argv[2]))\n"
+        "out=b''\n"
+        "while True:\n"
+        "    p=s.recv(65536)\n"
+        "    if not p: break\n"
+        "    out+=p\n"
+        "sys.stdout.write(out.decode())\n"
+    )
+    try:
+        # THE PARENT sends ONLY the headers, and waits for its own identity to
+        # be stamped before anything else touches the descriptor.
+        right.sendall(headers)
+        await asyncio.wait_for(stamped.wait(), 10)
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-B", "-c", child_src, str(right.fileno()), body.hex(),
+            pass_fds=(right.fileno(),),
+            env={"PATH": "/usr/bin", "SOVEREIGN_SEAT": CHILD_SEAT},
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), 20)
+        assert proc.returncode == 0, err.decode()
+        print(json.dumps({
+            "status_line": out.decode().splitlines()[0],
+            "stamp": stamps[0] if stamps else None,
+            "parent_pid": os.getpid(),
+            "child_pid": proc.pid,
+            "dispatched": list(dispatched[0]) if dispatched else None,
+        }))
+    finally:
+        transport.close()
+        right.close()
+
+
+asyncio.run(main())
+"""
+
+
+def test_a_body_sent_by_a_child_mid_request_is_attributed_to_the_ASGI_ENTRY_PEER(
+    monkeypatch,
+):
+    """⚠ THIS TEST DOCUMENTS A BOUND, NOT A FIX. IT IS SUPPOSED TO PASS.
+
+    Codex review 2026-09-06, F2. The per-request re-resolution closed the
+    scenario where a child sends a WHOLE request on an inherited descriptor —
+    that is now a 401 seat_mismatch, proved above. It did not close, and cannot
+    close, the narrower one: the wrapper resolves the peer when the ASGI
+    application STARTS, which is after the headers and BEFORE the body. A
+    parent can send the headers, let the identity resolve as itself, and hand
+    the descriptor to a differently-seated child that sends the body. The
+    request is dispatched under the PARENT's seat with a body the CHILD chose.
+
+    Astra measured it: parent pid 75471 sent headers, child pid 75480 (whose
+    own environment named Codex) sent the JSON, `record_insight` dispatched
+    with `source_instance=hq-claude-studio`, HTTP 200.
+
+    THE HONEST CLAIM, and the one README.md now makes: identity is the
+    kernel-reported peer AT ASGI ENTRY — not every process that contributed
+    bytes to the stream. "The sender of each request is the process it is
+    attributed to" was too strong and is corrected in prose.
+
+    ⚠ ASSERTED AS THE CURRENT BOUND RATHER THAN MARKED xfail. An xfail passes
+    whether the behaviour holds or changes, so it could not tell anyone if the
+    bound moved. This says exactly what happens today; if the mechanism ever
+    gets stronger this goes RED, and the right response is to change the claim
+    in README.md and here — not to delete the test.
+
+    ⚠ AND IT RUNS IN A SUBPROCESS, for a reason worth knowing before editing:
+    KERN_PROCARGS2 reports a process's EXEC-TIME environment. Setting
+    os.environ[SOVEREIGN_SEAT] inside the running pytest process does NOT make
+    the kernel report that seat, so an in-process version of this test resolves
+    `no_seat_env` and proves nothing. The parent must be BORN seated.
+
+    Closing it for real needs identity resampled per body chunk plus a policy
+    for what to do when it changes mid-stream — an architectural decision at
+    Anthony's gate, not a patch.
+    """
+    with short_root() as root:
+        write_registry(root)
+        proc = subprocess.run(
+            [sys.executable, "-B", "-c", _SPLIT_BODY_SCENARIO, str(REPO_ROOT), SEAT, OTHER_SEAT],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(root),
+                ss.SEAT_ENV_VAR: SEAT,        # the parent is BORN seated
+                "SOVEREIGN_ROOT": str(root),
+                "SOVEREIGN_CHRONICLE": str(root / "chronicle"),
+                "SOVEREIGN_BRIDGE_ENV_FILE": str(root / "synthetic.env"),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+        )
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    receipt = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    assert receipt["status_line"].startswith("HTTP/1.1 200"), receipt
+    # The identity was resolved at ASGI entry, when the PARENT was the peer...
+    assert receipt["stamp"]["ok"] is True
+    assert receipt["stamp"]["seat"] == SEAT
+    assert receipt["stamp"]["pid"] == receipt["parent_pid"]
+    assert receipt["child_pid"] != receipt["parent_pid"], "the handoff did not happen"
+    # ...and the body the CHILD chose was dispatched under it. That is the bound.
+    assert receipt["dispatched"][0] == WRITE_TOOL
+    assert receipt["dispatched"][1]["content"] == "child-chosen"
+    assert receipt["dispatched"][1]["source_instance"] == SEAT

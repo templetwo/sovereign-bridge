@@ -150,49 +150,113 @@ def _upstream(monkeypatch, result):
     return seen
 
 
-def test_the_stack_tool_answers_when_the_module_cannot_be_imported(monkeypatch):
-    """The instructed fallback. `signals_summary` is the stack's own reader of
-    the same ledger, and the bridge already carries its own credential for it —
-    no new secret and no new grant."""
+def test_the_stack_heartbeat_answers_when_the_module_cannot_be_imported(monkeypatch):
+    """THE FALLBACK ROUTE CHANGED TOOL, AND THE CHANGE IS THE FIX (D7 / F3).
+
+    It used to call `signals_summary` and transcribe seven keys out of the
+    answer. It now calls the stack's own `heartbeat`, which as of
+    release/2026-09-06 carries `unacked_signals` from the SAME
+    `signal_ledger.heartbeat_field` the local import would have called, and
+    passes that object through VERBATIM.
+    """
     _unimportable(monkeypatch)
     seen = _upstream(
         monkeypatch,
         {
             "ok": True,
             "result": {
-                "ok": True,
-                "ingestion": "ok",
-                "total": 4,
-                "stale_24h": 2,
-                "stale_7d": 0,
-                "by_source": {"honk": {"open": 3}, "watchman": {"open": 1}},
+                "status": "ok",
+                "tools": 52,
+                "unacked_signals": dict(LIVE),
             },
         },
     )
     field = _hb()["unacked_signals"]
-    assert [t for t, _ in seen] == ["signals_summary"]
-    assert field["total"] == 4
-    assert field["stale_24h"] == 2
+    assert [t for t, _ in seen] == ["heartbeat"]
+    assert field["total"] == 7
+    assert field["stale_24h"] == 3
     assert field["error"] is None
-    assert field["source"] == "stack tool signals_summary"
+    assert field["source"] == "stack tool heartbeat"
 
 
-def test_the_fallbacks_by_source_has_the_same_shape_as_the_imports(monkeypatch):
-    """`handle_signal_tool` returns per-source DICTS where `heartbeat_field`
-    returns flat open counts. Flattened at the bridge so a consumer never has
-    to ask which route answered before it can read the field."""
+def test_the_fallback_passes_the_field_through_verbatim(monkeypatch):
+    """⚠ THE FINDING, INVERTED INTO A TEST (Codex review 2026-09-06, F3).
+
+    The reviewer put the real `signals_summary` handler behind a synthetic
+    transport with `watchman` marked `failed:PermissionError`. The LOCAL route
+    reported `by_source.watchman = null`, kept `source_status`, and named
+    `sources_degraded`. The old fallback reported `by_source.watchman = 1`,
+    dropped both health fields and `corrupt_rows`, and forced `error` to null.
+
+    Two routes for one field that disagree about whether a number is KNOWN is
+    the fail-open this field exists to prevent — and the DEGRADED route was the
+    reassuring one. So the fallback now selects nothing: every key the stack
+    computed arrives, including the ones this bridge has never heard of.
+    """
+    degraded = {
+        "error": "unmeasured_sources:watchman",
+        "ingestion": "degraded",
+        "scanned_at": "2026-09-06T12:00:00Z",
+        "measured": True,
+        "total": 4,
+        "stale_24h": 1,
+        "stale_7d": 0,
+        "by_source": {"honk": 4, "watchman": None},
+        "by_source_detail": {"honk": {"open": 4}, "watchman": {"open": None}},
+        "corrupt_rows": 2,
+        "source_status": {"honk": "ok", "watchman": "failed:PermissionError"},
+        "sources_degraded": ["watchman"],
+        "a_key_this_bridge_has_never_heard_of": "arrives anyway",
+    }
     _unimportable(monkeypatch)
-    _upstream(
-        monkeypatch,
-        {
-            "ok": True,
-            "result": {"ok": True, "total": 1, "by_source": {"honk": {"open": 1, "stale_7d": 0}}},
-        },
-    )
-    assert _hb()["unacked_signals"]["by_source"] == {"honk": 1}
+    _upstream(monkeypatch, {"ok": True, "result": {"unacked_signals": degraded}})
+    field = _hb()["unacked_signals"]
+    for key, value in degraded.items():
+        assert field[key] == value, f"the fallback altered {key!r}"
+    assert field["source"] == "stack tool heartbeat"
 
 
-def test_a_failing_stack_tool_is_an_error_state_naming_both_routes(monkeypatch):
+def test_a_degraded_source_is_null_on_BOTH_routes(monkeypatch):
+    """The reviewer's exact comparison, asserted as an equality rather than
+    twice by eye: a source the ledger could not read is `null` whichever route
+    answered. A count of 1 for an unreadable source is the lie."""
+    degraded = {
+        "error": "unmeasured_sources:watchman",
+        "ingestion": "degraded",
+        "scanned_at": "2026-09-06T12:00:00Z",
+        "total": 4,
+        "stale_24h": 1,
+        "stale_7d": 0,
+        "by_source": {"honk": 4, "watchman": None},
+        "source_status": {"honk": "ok", "watchman": "failed:PermissionError"},
+        "sources_degraded": ["watchman"],
+    }
+    _importable(monkeypatch, lambda root=None: dict(degraded))
+    local = _hb()["unacked_signals"]
+
+    _unimportable(monkeypatch)
+    _upstream(monkeypatch, {"ok": True, "result": {"unacked_signals": dict(degraded)}})
+    remote = _hb()["unacked_signals"]
+
+    assert local["by_source"]["watchman"] is None
+    assert remote["by_source"]["watchman"] is None
+    assert {k: v for k, v in local.items() if k != "source"} == {
+        k: v for k, v in remote.items() if k != "source"
+    }
+
+
+def test_a_stack_too_old_to_carry_the_field_is_an_error_not_a_zero(monkeypatch):
+    """A stack that ANSWERS but has no `unacked_signals` on its heartbeat is a
+    stack older than release/2026-09-06 — a deploy-ordering fact. It must read
+    as an error, because the one thing it is definitely not is 'no signals'."""
+    _unimportable(monkeypatch)
+    _upstream(monkeypatch, {"ok": True, "result": {"status": "ok", "tools": 98}})
+    field = _hb()["unacked_signals"]
+    assert field["total"] is None
+    assert "older than release/2026-09-06" in field["error"]
+
+
+def test_a_failing_stack_heartbeat_is_an_error_state_naming_both_routes(monkeypatch):
     """When neither route works the caller deserves to know that BOTH failed,
     and which was which: an unimportable module is a deploy-ordering fact, an
     upstream tool failure is a live-service fact. Still never a zero."""
@@ -201,7 +265,7 @@ def test_a_failing_stack_tool_is_an_error_state_naming_both_routes(monkeypatch):
     field = _hb()["unacked_signals"]
     assert field["total"] is None
     assert "signal_ledger_unavailable" in field["error"]
-    assert "signals_summary failed" in field["error"]
+    assert "stack heartbeat failed" in field["error"]
 
 
 def test_the_local_import_is_preferred_and_a_local_error_is_not_laundered(monkeypatch):
@@ -229,12 +293,12 @@ def test_a_slow_stack_tool_is_bounded(monkeypatch):
 
     async def slow(tool, args):
         await asyncio.sleep(5)
-        return {"ok": True, "result": {"ok": True, "total": 0}}
+        return {"ok": True, "result": {"unacked_signals": dict(LIVE)}}
 
     monkeypatch.setattr(bridge, "call_mcp_tool", slow)
     field = _hb()["unacked_signals"]
     assert field["total"] is None
-    assert "signals_summary failed" in field["error"]
+    assert "stack heartbeat failed" in field["error"]
 
 
 def test_a_never_scanned_ledger_is_not_a_healthy_zero(monkeypatch):
