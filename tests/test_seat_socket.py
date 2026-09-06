@@ -212,10 +212,8 @@ class _FakeTransport:
         return self._sock if name == "socket" else None
 
 
-def test_the_protocol_stamps_the_verified_peer_into_the_scope():
-    """The seam this whole design rests on: after connection_made, `self.app`
-    is a wrapper that injects the extension, so every request on the connection
-    carries it."""
+def _stamp_for(sock) -> dict:
+    """Drive a stub protocol over `sock` and return the stamped extension."""
     captured = {}
 
     async def inner(scope, receive, send):
@@ -223,21 +221,278 @@ def test_the_protocol_stamps_the_verified_peer_into_the_scope():
 
     cls = ss.make_protocol_class(_StubProtocol)
     proto = cls(app=inner)
-    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    proto.connection_made(_FakeTransport(sock))
+    asyncio.run(proto.app({"type": "http"}, None, None))
+    return captured["scope"]["extensions"][ss.SEAT_PEER_EXT]
+
+
+# The peer of a socketpair created here is THIS process, so a test that reads
+# its own identity is a test of whoever happened to run it. This script holds
+# one end of a passed descriptor open with a KNOWN exec-time environment, so
+# the answer is a property of the fixture instead.
+#
+# ⚠ IT SENDS A BYTE FIRST, AND THAT IS NOT DECORATION. Measured on macOS
+# 2026-09-06: LOCAL_PEERPID names the process that last SENT on the socket, and
+# until something is sent it still names whoever created the pair. Holding the
+# descriptor is not enough — a child that merely inherits an idle socket is
+# invisible to the kernel's answer. This matches the real bridge exactly, where
+# identity is only ever asked for because a request arrived, i.e. because the
+# peer sent; but a fixture that skipped the send would silently measure the
+# test process and pass for the wrong reason.
+_HOLD_FD = (
+    "import socket,sys;s=socket.socket(fileno=int(sys.argv[1]));"
+    "s.sendall(b'x');sys.stdin.read(1)"
+)
+
+
+@contextmanager
+def peer_with_env(env: dict):
+    """A live socket whose peer is a fresh python process with `env` at exec.
+
+    python (not a system binary) so macOS will show us its environment — see
+    seat_of_process. The child sends one byte (see above), then holds the
+    descriptor until stdin closes.
+    """
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    proc = subprocess.Popen(
+        [sys.executable, "-B", "-c", _HOLD_FD, str(theirs.fileno())],
+        pass_fds=(theirs.fileno(),),
+        env=env,
+        stdin=subprocess.PIPE,
+    )
+    theirs.close()
     try:
-        proto.connection_made(_FakeTransport(a))
+        ours.recv(4)  # the handshake that makes the child the kernel's answer
+        yield ours, proc
+    finally:
+        if proc.stdin:
+            proc.stdin.close()
+        proc.wait(timeout=5)
+        ours.close()
+
+
+def test_the_protocol_stamps_the_verified_peer_into_the_scope():
+    """The seam this whole design rests on: after connection_made, `self.app`
+    is a wrapper that injects the extension, so every request on the connection
+    carries it.
+
+    ⚠ THE FIXTURE OWNS THE IDENTITY, NOT THE RUNNER. Codex review 2026-09-06
+    (P3 TEST ENVIRONMENT) failed this test — not because the code was wrong,
+    but because the reviewer's own dispatched process legitimately inherited
+    `SOVEREIGN_SEAT=codex-astra-studio`. The old version resolved the identity
+    of *whatever process pytest happened to be*, then asserted
+    `ok=False / no_seat_env` unconditionally, so it passed for an unseated
+    runner and failed for a seated one. A test whose verdict depends on the
+    developer's shell is measuring the shell.
+
+    Both directions are now asserted against explicit subprocess fixtures, and
+    the seated half is the one that had no coverage at all: an assertion that
+    only ever ran unseated could not have told a stamped failure from a stamped
+    success.
+    """
+    with peer_with_env({"PATH": "/usr/bin"}) as (sock, _proc):
+        unseated = _stamp_for(sock)
+    # Stamping the FAILURE is deliberate: an unstamped scope is
+    # indistinguishable from a TCP request and would deny with the wrong reason.
+    assert unseated["ok"] is False
+    assert unseated["reason"] == "no_seat_env"
+
+    with peer_with_env({"PATH": "/usr/bin", ss.SEAT_ENV_VAR: SEAT}) as (sock, proc):
+        seated = _stamp_for(sock)
+    assert seated["ok"] is True
+    assert seated["seat"] == SEAT
+    assert seated["pid"] == proc.pid
+
+
+def test_the_stamp_does_not_depend_on_the_runners_own_seat():
+    """The falsifier for the fix above: the same fixture must give the same
+    answer whether or not THIS process is seated. Without the subprocess
+    fixture this assertion cannot even be written."""
+    saved = os.environ.get(ss.SEAT_ENV_VAR)
+    os.environ[ss.SEAT_ENV_VAR] = "some-other-seat-entirely"
+    try:
+        with peer_with_env({"PATH": "/usr/bin", ss.SEAT_ENV_VAR: SEAT}) as (sock, _p):
+            assert _stamp_for(sock)["seat"] == SEAT
+        with peer_with_env({"PATH": "/usr/bin"}) as (sock, _p):
+            assert _stamp_for(sock)["reason"] == "no_seat_env"
+    finally:
+        if saved is None:
+            os.environ.pop(ss.SEAT_ENV_VAR, None)
+        else:
+            os.environ[ss.SEAT_ENV_VAR] = saved
+
+
+# ── FINDING 1: the retained connection identity ─────────────────────────────
+
+
+def test_the_kernel_names_the_new_sender_after_a_descriptor_handoff():
+    """The measured fact the per-request fix rests on, asserted rather than
+    quoted. macOS LOCAL_PEERPID re-read AFTER a child transmits reports the
+    CHILD, not the process that created the socket. If this ever stopped being
+    true, re-resolution would silently stop being a fix and everything below
+    would keep passing for the wrong reason."""
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    send_then_hold = (
+        "import socket,sys;s=socket.socket(fileno=int(sys.argv[1]));"
+        "s.sendall(b'x');sys.stdin.read(1)"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-B", "-c", send_then_hold, str(theirs.fileno())],
+        pass_fds=(theirs.fileno(),),
+        env={ss.SEAT_ENV_VAR: OTHER_SEAT},
+        stdin=subprocess.PIPE,
+    )
+    try:
+        at_accept = ss.peer_credentials(ours)[0]
+        ours.recv(4)
+        after_child_sent = ss.peer_credentials(ours)[0]
+    finally:
+        if proc.stdin:
+            proc.stdin.close()
+        proc.wait(timeout=5)
+        ours.close()
+        theirs.close()
+
+    assert at_accept == os.getpid()
+    assert after_child_sent == proc.pid
+    assert at_accept != after_child_sent
+
+
+def test_a_descriptor_handoff_is_re_attributed_to_the_process_that_sent():
+    """FINDING 1, the defect itself.
+
+    A seated parent opens the connection; a CHILD with a different exec-time
+    seat then writes on the inherited descriptor. The identity stamped for that
+    request must be the CHILD's, not the parent's. Before this fix the wrapper
+    closed over the accept-time answer, so the child's request was dispatched
+    as the parent's seat with `source_instance` to match.
+    """
+    # THE ORDER IS THE TEST, and it is Astra's scenario exactly: the connection
+    # is accepted while THIS process is the peer, and only then is the
+    # descriptor handed to a differently-seated child that sends the request.
+    # `peer_with_env` cannot express this — it makes the child send before
+    # anything is accepted, so both reads would name the child and the test
+    # would pass without exercising the handoff at all.
+    captured = []
+
+    async def inner(scope, receive, send):
+        captured.append(scope["extensions"][ss.SEAT_PEER_EXT])
+
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    cls = ss.make_protocol_class(_StubProtocol)
+    proto = cls(app=inner)
+    proto.connection_made(_FakeTransport(ours))  # accept time: peer is us
+
+    proc = subprocess.Popen(
+        [sys.executable, "-B", "-c", _HOLD_FD, str(theirs.fileno())],
+        pass_fds=(theirs.fileno(),),
+        env={"PATH": "/usr/bin", ss.SEAT_ENV_VAR: SEAT},
+        stdin=subprocess.PIPE,
+    )
+    theirs.close()
+    try:
+        ours.recv(4)  # the child has now spoken; it is the kernel's answer
         asyncio.run(proto.app({"type": "http"}, None, None))
     finally:
-        a.close()
-        b.close()
+        if proc.stdin:
+            proc.stdin.close()
+        proc.wait(timeout=5)
+        ours.close()
 
-    verified = captured["scope"]["extensions"][ss.SEAT_PEER_EXT]
-    # This process has no SOVEREIGN_SEAT at exec time, so the FAILURE is what
-    # gets stamped — and stamping the failure is deliberate: an unstamped scope
-    # is indistinguishable from a TCP request and would deny with the wrong
-    # reason.
-    assert verified["ok"] is False
-    assert verified["reason"] == "no_seat_env"
+    stamp = captured[0]
+    # The child that SENT the request is the process attributed...
+    assert stamp["ok"] is True
+    assert stamp["pid"] == proc.pid
+    assert stamp["seat"] == SEAT
+    # ...and the process that OPENED the connection is recorded, and decides
+    # nothing. Before the fix it decided everything.
+    assert stamp["accept_pid"] == os.getpid()
+    assert stamp["accept_pid"] != stamp["pid"]
+
+
+def test_each_request_on_one_connection_is_resolved_again():
+    """The property, stated as a property: two requests on ONE connection ask
+    the kernel twice. A cached answer would make the second call free, and free
+    is exactly what made the handoff work."""
+    asked = []
+    real = ss.resolve_peer
+
+    def counting(sock):
+        asked.append(sock)
+        return real(sock)
+
+    with peer_with_env({"PATH": "/usr/bin", ss.SEAT_ENV_VAR: SEAT}) as (sock, _p):
+        captured = []
+
+        async def inner(scope, receive, send):
+            captured.append(scope["extensions"][ss.SEAT_PEER_EXT])
+
+        cls = ss.make_protocol_class(_StubProtocol)
+        proto = cls(app=inner)
+        proto.connection_made(_FakeTransport(sock))
+        original, ss.resolve_peer = ss.resolve_peer, counting
+        try:
+            asyncio.run(proto.app({"type": "http"}, None, None))
+            asyncio.run(proto.app({"type": "http"}, None, None))
+        finally:
+            ss.resolve_peer = original
+
+    assert len(asked) == 2, "identity must be resolved per request, not per connection"
+    assert [c["seat"] for c in captured] == [SEAT, SEAT]
+
+
+def test_a_peer_that_dies_mid_connection_denies_rather_than_reusing_its_seat():
+    """Re-resolution failure is a DENIAL, never a fall back to the identity the
+    connection used to have. The fall-back is the bug."""
+    with peer_with_env({"PATH": "/usr/bin", ss.SEAT_ENV_VAR: SEAT}) as (sock, proc):
+        assert _stamp_for(sock)["seat"] == SEAT
+        if proc.stdin:
+            proc.stdin.close()
+        proc.wait(timeout=5)
+        after = _stamp_for(sock)
+    assert after["ok"] is False
+    assert after["reason"] in {"no_peer_creds", "no_peer_env", "no_seat_env"}
+    assert "seat" not in after
+
+
+def test_the_walk_stops_at_the_immediate_peers_own_environment():
+    """FINDING 1(b). When the immediate peer HAS a readable environment, that
+    environment is authoritative and the walk never reaches the parent — even
+    though this test process is itself seated as something else."""
+    saved = os.environ.get(ss.SEAT_ENV_VAR)
+    os.environ[ss.SEAT_ENV_VAR] = OTHER_SEAT
+    try:
+        with peer_with_env({"PATH": "/usr/bin", ss.SEAT_ENV_VAR: SEAT}) as (sock, proc):
+            seat, seat_pid = ss.seat_of_process(ss.peer_credentials(sock)[0])
+    finally:
+        if saved is None:
+            os.environ.pop(ss.SEAT_ENV_VAR, None)
+        else:
+            os.environ[ss.SEAT_ENV_VAR] = saved
+    assert (seat, seat_pid) == (SEAT, proc.pid)
+
+
+def test_a_child_declaring_a_seat_its_environment_does_not_name_is_denied():
+    """FINDING 1(c). A mismatch between the declared header and the nearest
+    readable ancestor's seat is a DENY.
+
+    "All studio seats are trusted" widened the TOOL surface; it did not turn a
+    mismatch into a warning. A mismatch is a bug — a script signing as the
+    wrong seat, or an impersonation attempt — and either way the write must not
+    land under a name the process cannot back up.
+    """
+    with peer_with_env({"PATH": "/usr/bin", ss.SEAT_ENV_VAR: SEAT}) as (sock, _p):
+        stamp = _stamp_for(sock)
+    with pytest.raises(si.SeatDenied) as mismatch:
+        si.resolve_seat(stamp, OTHER_SEAT, {})
+    assert mismatch.value.reason == "seat_mismatch"
+
+    # The falsifier: the SAME stamp, declaring truthfully, gets past the
+    # mismatch gate and stops on the next condition instead. Without this the
+    # test above would pass against a resolve_seat that denied everything.
+    with pytest.raises(si.SeatDenied) as truthful:
+        si.resolve_seat(stamp, SEAT, {})
+    assert truthful.value.reason != "seat_mismatch"
 
 
 def test_a_stamped_failure_denies_with_its_own_reason():

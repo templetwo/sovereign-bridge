@@ -28,12 +28,34 @@ to audit than one whose identity is only ever inferred.
     X-Sovereign-Seat ← the caller's declaration; must EQUAL the env value
 
 WHAT THIS DEFENDS, AND THE LINE IT DOES NOT CROSS. It kills IMPERSONATION BY
-HEADER: a caller can no longer name a seat its own environment does not name,
-so accidental mis-signing fails closed and a script with the wrong header stops
-writing as the wrong seat. It does NOT stop DELIBERATE impersonation — any
-process running as this user can spawn a child with whatever SOVEREIGN_SEAT it
-likes and the walk will find it. tests/test_seat_socket.py asserts that residual
-explicitly rather than leaving it as an unexamined assumption.
+HEADER: a caller whose own environment is READABLE can no longer name a seat
+that environment does not name, so accidental mis-signing fails closed and a
+script with the wrong header stops writing as the wrong seat.
+
+THAT CLAIM CARRIES THREE QUALIFIERS, all of them narrowings the second review
+(2026-09-06) required, and none of them optional when this feature is described
+to anyone:
+
+  1. READABLE ENVIRONMENT ONLY. macOS hides a system binary's environment, so
+     a `curl` or `/bin/sleep` child resolves to the nearest ancestor the kernel
+     will show us — its seated terminal. A child that hides its environment and
+     declares its PARENT's seat is allowed, even if its own SOVEREIGN_SEAT said
+     something else. That is environment inheritance, which is what a seated
+     terminal means; it is NOT proof of the immediate caller's own identity,
+     and it must never be described as such. Measured, not assumed — see
+     `seat_of_process`.
+  2. DESCRIPTOR INHERITANCE AND TRANSFER, AND PERSISTENT CONNECTIONS. A
+     connection is not an identity either. A process can fork, or pass its
+     connected descriptor over SCM_RIGHTS, and a later request on that same
+     socket comes from a different process. Identity is therefore resolved PER
+     REQUEST (`_wrap_app`), so the sender of each request is the process the
+     request is attributed to — the connection's opener is recorded as
+     `accept_pid` for the audit line and decides nothing. Before 2026-09-06
+     the accept-time answer was reused and the handoff wrote as the parent.
+  3. DELIBERATE IMPERSONATION IS NOT STOPPED. Any process running as this user
+     can spawn a child with whatever SOVEREIGN_SEAT it likes and the walk will
+     find it. tests/test_seat_socket.py asserts that residual explicitly rather
+     than leaving it as an unexamined assumption.
 
 That residual cannot be closed here. Under Anthony's no-token rule the only
 thing separating a real seat from a self-declared one would be a credential the
@@ -313,10 +335,29 @@ def seat_of_process(pid: int) -> tuple[str, int]:
     THE RULE, and its two edges:
 
       * Stop at the FIRST process whose environment is readable, and treat that
-        process as authoritative. Continuing past a readable-but-unseated
-        process would defeat `env -u SOVEREIGN_SEAT`, re-granting a seat that
-        was deliberately stripped.
+        process as authoritative — the IMMEDIATE PEER whenever the immediate
+        peer has one. Continuing past a readable-but-unseated process would
+        defeat `env -u SOVEREIGN_SEAT`, re-granting a seat that was
+        deliberately stripped.
       * An unreadable environment is not evidence of anything, so walk past it.
+
+    ⚠ WHAT "READABLE" MEANS HERE, MEASURED RATHER THAN ASSUMED (2026-09-06,
+    review 2 fixture `review2_process_probes.log`, reproduced in this suite).
+    KERN_PROCARGS2 does not fail for a hidden environment — it SUCCEEDS and
+    returns zero environment strings. So an empty dict is macOS saying "I will
+    not show you this process", not "this process has no environment":
+
+        /bin/sleep           env={'SOVEREIGN_SEAT': A}  -> {}          (hidden)
+        python -c 'sleep'    env={}                     -> non-empty   (readable)
+        python -c 'sleep'    env={'PATH': ...}          -> non-empty   (readable)
+
+    A process launched with a literally empty environment still comes back
+    non-empty, because the block carries kernel launch metadata. That is why
+    `{}` is treated as UNREADABLE and walked past, and why treating it as
+    authoritative would deny every real `curl` seat call — curl is a system
+    binary and hides its environment exactly like `/bin/sleep`. The cost of
+    this edge is stated in full below and is not hidden behind the word
+    "readable".
 
     WHAT THIS IS AND IS NOT. It is ATTRIBUTION INTEGRITY against MISTAKE and
     against header-only forgery — not a privilege boundary between local
@@ -366,11 +407,18 @@ def seat_of_process(pid: int) -> tuple[str, int]:
 def resolve_peer(sock: socket.socket) -> dict[str, Any]:
     """The verified identity of the process on the other end, or PeerUnavailable.
 
-    Resolved ONCE per connection, at accept time, before a single request byte
-    is read — which is the whole TOCTOU mitigation. A pid could in principle be
-    recycled between the kernel's answer and this read; doing it at accept
-    narrows that to the accept itself, and the uid check means the recycled pid
-    would have to belong to the same user anyway.
+    Called ONCE PER REQUEST (see `_wrap_app`), not once per connection. The
+    earlier once-per-connection version is the P2 the second review broke; its
+    docstring called that "the whole TOCTOU mitigation", and it was the
+    opposite — caching the answer across a descriptor handoff is precisely the
+    time-of-check/time-of-use gap it claimed to close.
+
+    RESIDUAL, NAMED: a pid can in principle be recycled between the kernel's
+    answer here and the environment read below. The uid check means the
+    recycled pid would have to belong to the same user, which under Anthony's
+    same-user, no-token design is every process that could already read the
+    master token. PID-reuse races were NOT exercised by review 2 and are not
+    claimed closed here.
     """
     pid, uid = peer_credentials(sock)
     if uid != os.getuid():
@@ -389,24 +437,65 @@ def resolve_peer(sock: socket.socket) -> dict[str, Any]:
 # ── The listener ────────────────────────────────────────────────────────────
 
 
-def _wrap_app(app, peer: dict[str, Any] | None, failure: PeerUnavailable | None):
+def peer_extension(sock: socket.socket, accept_pid: int | None = None) -> dict[str, Any]:
+    """The scope-extension value for one request: a fresh resolution, or the
+    failure that stopped it. Never raises — a failure is a stamped denial, not
+    an exception the ASGI stack has to invent a response for."""
+    try:
+        peer = resolve_peer(sock)
+    except PeerUnavailable as exc:
+        return {
+            "ok": False,
+            "reason": exc.reason,
+            "detail": exc.detail,
+            "accept_pid": accept_pid,
+        }
+    return {"ok": True, **peer, "accept_pid": accept_pid}
+
+
+def _wrap_app(app, sock: socket.socket, accept_pid: int | None = None):
     """An ASGI app that stamps the verified peer onto every http scope.
 
-    A connection whose peer could NOT be resolved still gets a wrapper — one
-    that stamps the FAILURE. That is deliberate: the alternative is an
-    unstamped scope, which is indistinguishable from a TCP request and would be
-    denied with the wrong reason. The caller deserves to be told that the
-    socket was right and the process was wrong.
+    ⚠ RESOLVED PER REQUEST, NOT PER CONNECTION. THIS IS THE FIX.
+
+    Codex review 2026-09-06 (P2 RETAINED IDENTITY) proved the previous shape
+    wrong with a real HTTP request over a real `SeatPeerH11Protocol`: a seated
+    HQ parent created the socket, the kernel named it at accept time, and the
+    parent then handed the client descriptor to a CHILD whose own exec-time
+    SOVEREIGN_SEAT was `codex-astra-studio`. The child sent
+    `X-Sovereign-Seat: hq-claude-studio`, got HTTP 200, and dispatched
+    `record_insight` with `source_instance=hq-claude-studio`. Accept-time pid
+    79420; actual sender 79421. The wrapper closed over the ANSWER, so every
+    later request on that connection inherited an identity resolved for a
+    process that was no longer the one talking.
+
+    The kernel is not the problem, and re-measuring proves it: LOCAL_PEERPID
+    re-read AFTER the child transmits reports the CHILD. Verified independently
+    on this machine 2026-09-06 (accept 3789 -> after-send 3792, the child's
+    pid), and asserted in this suite by
+    `test_the_kernel_names_the_new_sender_after_a_descriptor_handoff`. So the
+    wrapper closes over the SOCKET and asks again for every request; a
+    descriptor handed to another process is re-attributed to that process, and
+    the header check at seat_identity.py then denies the mismatch.
+
+    A connection whose peer could NOT be resolved still gets a stamp — the
+    FAILURE. That is deliberate: the alternative is an unstamped scope, which
+    is indistinguishable from a TCP request and would be denied with the wrong
+    reason. The caller deserves to be told that the socket was right and the
+    process was wrong. Re-resolution failure MID-connection is likewise a
+    stamped failure and therefore a denial; there is no fall back to the
+    identity the connection used to have, because that fall-back IS the bug.
+
+    `accept_pid` is carried alongside for provenance only. It never decides
+    anything — it exists so the audit line can show that the process which
+    OPENED the connection is not the process that sent the request, which is
+    the signature of a descriptor handoff and worth seeing in a log.
     """
 
     async def wrapped(scope, receive, send):
         if scope.get("type") == "http":
             extensions = dict(scope.get("extensions") or {})
-            extensions[SEAT_PEER_EXT] = (
-                {"ok": True, **peer}
-                if peer is not None
-                else {"ok": False, "reason": failure.reason, "detail": failure.detail}
-            )
+            extensions[SEAT_PEER_EXT] = peer_extension(sock, accept_pid)
             scope = {**scope, "extensions": extensions}
         await app(scope, receive, send)
 
@@ -424,13 +513,17 @@ def make_protocol_class(base):
         def connection_made(self, transport):  # type: ignore[override]
             super().connection_made(transport)
             sock = transport.get_extra_info("socket")
+            # Accept-time resolution is PROVENANCE, not authorization. The
+            # authorization answer is recomputed per request inside the
+            # wrapper; this only records who opened the connection so a
+            # handoff is legible in the audit trail.
             try:
-                peer, failure = resolve_peer(sock), None
-            except PeerUnavailable as exc:
-                peer, failure = None, exc
+                accept_pid: int | None = peer_credentials(sock)[0]
+            except PeerUnavailable:
+                accept_pid = None
             # uvicorn reads self.app per request, so this covers every request
             # on this connection, keep-alive included.
-            self.app = _wrap_app(self.app, peer, failure)
+            self.app = _wrap_app(self.app, sock, accept_pid)
 
     SeatPeerProtocol.__name__ = f"SeatPeer{getattr(base, '__name__', 'Protocol')}"
     return SeatPeerProtocol

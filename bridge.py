@@ -352,7 +352,21 @@ def check_auth_or_seat(
     try:
         return si.resolve_seat(peer, seat_header, request.headers)
     except si.SeatDenied as denied:
-        si.audit(seat_header, None, "denied", denied.reason)
+        # The pid goes on the DENIAL line too. Codex review 2026-09-06 asked
+        # for this and it is not cosmetic: a `seat_mismatch` is the one event
+        # that says a process declared a seat its environment does not name,
+        # and a mismatch is a BUG worth chasing — but without the pid the log
+        # records only the string the caller sent, which is the untrustworthy
+        # half. The pid is whatever the kernel just verified, so it is present
+        # for every denial that got past the transport check and absent (as
+        # '-') for the ones that did not.
+        si.audit(
+            seat_header,
+            None,
+            "denied",
+            denied.reason,
+            peer.get("pid") if isinstance(peer, dict) else None,
+        )
         raise HTTPException(status_code=401, detail=denied.detail) from None
 
 
