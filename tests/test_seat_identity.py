@@ -560,7 +560,11 @@ def test_every_seat_request_emits_one_audit_line(registry, calls, caplog):
     lines = [r.getMessage() for r in caplog.records if r.name == "seat-auth"]
     assert len(lines) == 3
     # Fields are repr()'d now — see test_a_forged_audit_line_is_impossible.
-    assert f"seat='{SEAT}' tool='{READ_TOOL}' outcome='allowed' reason='ok'" in lines[0]
+    # The pid is on the line because attribution is the asset: the seat STRING
+    # is what was already untrustworthy, the pid is what the kernel vouched for.
+    assert f"seat='{SEAT}' pid=" in lines[0]
+    assert f"tool='{READ_TOOL}' outcome='allowed' reason='ok'" in lines[0]
+    assert f"pid='{os.getpid()}'" in lines[0], "the vouched pid was dropped"
     assert "outcome='denied' reason='governance'" in lines[1]
     assert "outcome='denied' reason='unknown_seat'" in lines[2]
     assert MASTER not in "".join(lines)

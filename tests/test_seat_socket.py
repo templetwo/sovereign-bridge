@@ -165,7 +165,7 @@ def test_prepare_socket_path_refuses_to_unlink_a_non_socket(tmp_path):
     """A regular file at the socket path is somebody's data or somebody's
     mistake. Deleting it to make room would be a bridge that destroys files on
     startup, so it raises instead and the seat path simply stays shut."""
-    target = tmp_path / "hq" / "seats" / "bridge.sock"
+    target = tmp_path / "hq" / "seats" / "sock" / "bridge.sock"
     target.parent.mkdir(parents=True)
     target.write_text("not a socket")
     with pytest.raises(OSError):
@@ -179,7 +179,7 @@ def test_prepare_socket_path_clears_a_stale_socket_and_locks_the_dir():
     raised "AF_UNIX path too long" — the module docstring says so and the test
     did it anyway."""
     with short_root() as root:
-        target = root / "hq" / "seats" / "bridge.sock"
+        target = root / "hq" / "seats" / "sock" / "bridge.sock"
         target.parent.mkdir(parents=True)
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.bind(str(target))
@@ -314,7 +314,7 @@ def _serve_and_curl(app, sock_path: Path, seat_env: str | None, header: str, bod
 
 
 @pytest.fixture
-def live(monkeypatch):
+def live(monkeypatch, tmp_path):
     """bridge.app with a stubbed stack and a tmp SOVEREIGN_ROOT. Records every
     (tool, arguments) that would have reached the stack."""
     seen: list[tuple[str, dict]] = []
@@ -325,6 +325,11 @@ def live(monkeypatch):
 
     monkeypatch.setattr(bridge, "call_mcp_tool", fake)
     monkeypatch.setattr(bridge, "BEARER_TOKEN", "test-master-token-0123456789abcdef-0123456789abcdef")
+    # No test here sends idempotency_key today, so nothing writes the live
+    # cache — but this house has shipped exactly that bug twice (a6f42cf,
+    # 28592c7: a suite asserting against Anthony's live production store).
+    # Isolate EVERY write path a test can reach, not just the ones it uses.
+    monkeypatch.setattr(bridge, "_IDEM_PATH", tmp_path / "idem.json")
     return seen
 
 
@@ -337,7 +342,7 @@ def test_end_to_end_a_seated_process_writes_and_signs(live, monkeypatch):
         write_registry(root)
         code, payload = _serve_and_curl(
             bridge.app,
-            root / "hq" / "seats" / "bridge.sock",
+            root / "hq" / "seats" / "sock" / "bridge.sock",
             seat_env=SEAT,
             header=SEAT,
             body={"tool": WRITE_TOOL, "arguments": {"content": "c", "domain": "d"}},
@@ -363,7 +368,7 @@ def test_end_to_end_the_impersonation_from_the_review_is_refused(live, monkeypat
         write_registry(root)
         code, payload = _serve_and_curl(
             bridge.app,
-            root / "hq" / "seats" / "bridge.sock",
+            root / "hq" / "seats" / "sock" / "bridge.sock",
             seat_env=SEAT,
             header=OTHER_SEAT,
             body={"tool": READ_TOOL, "arguments": {}},
@@ -387,7 +392,7 @@ def test_end_to_end_an_unseated_process_is_refused(live, monkeypatch):
         write_registry(root)
         code, payload = _serve_and_curl(
             bridge.app,
-            root / "hq" / "seats" / "bridge.sock",
+            root / "hq" / "seats" / "sock" / "bridge.sock",
             seat_env=None,
             header=SEAT,
             body={"tool": READ_TOOL, "arguments": {}},
@@ -406,7 +411,7 @@ def test_end_to_end_a_large_body_still_works(live, monkeypatch):
         write_registry(root)
         code, payload = _serve_and_curl(
             bridge.app,
-            root / "hq" / "seats" / "bridge.sock",
+            root / "hq" / "seats" / "sock" / "bridge.sock",
             seat_env=SEAT,
             header=SEAT,
             body={"tool": WRITE_TOOL, "arguments": {"content": "x" * 40_000, "domain": "d"}},
@@ -429,7 +434,7 @@ def test_the_bound_socket_is_owner_only(monkeypatch):
 
     with short_root() as root:
         monkeypatch.setenv("SOVEREIGN_ROOT", str(root))
-        mode = asyncio.run(scenario(root / "hq" / "seats" / "bridge.sock"))
+        mode = asyncio.run(scenario(root / "hq" / "seats" / "sock" / "bridge.sock"))
     assert mode == 0o600, f"seat socket mode is {oct(mode)}"
 
 
@@ -449,7 +454,7 @@ def test_no_registry_means_no_socket_is_bound(monkeypatch):
         monkeypatch.setenv("SOVEREIGN_ROOT", str(root))
         assert not si.registry_path().exists()
         assert asyncio.run(scenario()) is None
-        assert not (root / "hq" / "seats" / "bridge.sock").exists()
+        assert not (root / "hq" / "seats" / "sock" / "bridge.sock").exists()
 
 
 def test_with_a_registry_the_listener_binds_where_the_root_says(monkeypatch):
@@ -465,7 +470,7 @@ def test_with_a_registry_the_listener_binds_where_the_root_says(monkeypatch):
     with short_root() as root:
         monkeypatch.setenv("SOVEREIGN_ROOT", str(root))
         write_registry(root)
-        assert bridge.seat_socket_path() == root / "hq" / "seats" / "bridge.sock"
+        assert bridge.seat_socket_path() == root / "hq" / "seats" / "sock" / "bridge.sock"
         asyncio.run(scenario())
 
 
@@ -511,3 +516,48 @@ def test_the_walk_skips_a_hidden_environment_and_finds_the_launcher(monkeypatch)
     monkeypatch.setattr(ss, "process_info", lambda pid: chain[pid])
     monkeypatch.setattr(ss, "process_environ", lambda pid: envs[pid])
     assert ss.seat_of_process(10) == (SEAT, 30)
+
+
+def test_RESIDUAL_a_process_can_still_declare_a_seat_it_was_not_given(live, monkeypatch):
+    """⚠ THIS TEST ASSERTS A HOLE, ON PURPOSE. READ IT BEFORE QUOTING THE FIX.
+
+    The P1 fix kills IMPERSONATION BY HEADER: a caller can no longer name a
+    seat its own environment does not name. It does NOT and cannot kill
+    DELIBERATE impersonation, because any process running as this user can
+    spawn a child with whatever SOVEREIGN_SEAT it likes and let the walk find
+    it. That is what this test does, and it must return 200 — the launcher here
+    is structurally identical to a legitimate seat, and nothing in the kernel
+    distinguishes them.
+
+    WHY IT CANNOT BE CLOSED HERE: under Anthony's no-token rule the only thing
+    that could separate a real seat from a self-declared one is a credential
+    the operator issues, which is the rule's whole point to avoid. The
+    remaining lever is per-seat UIDs, and that is an ops change at his gate,
+    not a code change at ours.
+
+    WHAT IS THEREFORE TRUE, and the only claim any doc should make: header-only
+    impersonation is dead, and accidental mis-signing fails closed — a script
+    with the wrong header no longer writes as the wrong seat. Anything running
+    as this user could already read the master token out of
+    ~/.config/sovereign-bridge.env, so this residual grants nothing it did not
+    already have.
+
+    IF THIS TEST EVER FAILS, the mechanism got stronger and the docs above it
+    are now understated. Do not delete it — change the claim.
+    """
+    with short_root() as root:
+        monkeypatch.setenv("SOVEREIGN_ROOT", str(root))
+        write_registry(root)
+        code, payload = _serve_and_curl(
+            bridge.app,
+            root / "hq" / "seats" / "sock" / "bridge.sock",
+            seat_env=OTHER_SEAT,   # a seat this launcher simply asserts about itself
+            header=OTHER_SEAT,
+            # A WRITE, deliberately, so the residual is shown at its sharpest:
+            # the chronicle entry lands SIGNED as a seat this process was never
+            # given. (READ_TOOL would prove less — recall_insights is not in
+            # SEAT_SIGNABLE_TOOLS, so nothing is stamped on it at all.)
+            body={"tool": WRITE_TOOL, "arguments": {"content": "c", "domain": "d"}},
+        )
+    assert code == 200, f"the residual closed; update the doctrine above: {payload}"
+    assert live[0][1].get("source_instance") == OTHER_SEAT

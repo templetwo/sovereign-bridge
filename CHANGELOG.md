@@ -69,18 +69,34 @@ with a test that fails when its guard is deleted.
   one line per request. Every interpolated field is now `repr()`-escaped and
   length-bounded, with truncation marked.
 
+**P1 is NARROWED, NOT CLOSED, and the docs say so.** Header-only impersonation
+is dead and accidental mis-signing fails closed. A process that deliberately
+constructs its own ancestry — spawning a child with any `SOVEREIGN_SEAT` it
+likes — is still indistinguishable from a seat, and
+`tests/test_seat_socket.py::test_RESIDUAL_*` asserts that outcome (200) so the
+gap is a measured fact rather than an assumption. It cannot be closed under the
+no-token rule; the remaining lever is per-seat UIDs, which is Anthony's call.
+It grants nothing new: anything running as this user can already read the
+master token.
+
 **Deploy notes.** The listener binds only when
 `~/.sovereign/hq/seats/registry.json` exists, reusing the registry as the single
-deploy switch; on a machine without it nothing is bound. Seat launchers need one
-change: add `--unix-socket <root>/hq/seats/bridge.sock` to their curl and drop
-the `127.0.0.1:8100` origin. Coupled to uvicorn internals (`H11Protocol`,
-per-request `self.app`), pinned against 0.40 and failing closed if that changes.
+deploy switch; on a machine without it nothing is bound. The socket lives in its
+own directory (`hq/seats/sock/`) because the bridge chmods its parent to 0700
+and `hq/seats/` is Anthony's — it holds the launchers and is 755 today. Seat
+call sites need `--unix-socket <root>/hq/seats/sock/bridge.sock` instead of the
+`127.0.0.1:8100` origin; **none of the four launcher scripts under
+`~/.sovereign/hq/seats/` contains the curl** (`seat-codex`/`dispatch-codex`
+export `SOVEREIGN_SEAT` and exec the agent), so HQ must locate where each seat
+actually constructs its bridge call. Coupled to uvicorn internals
+(`H11Protocol`, per-request `self.app`), pinned against 0.40 and failing closed
+if that changes.
 
 **Known limitation:** macOS hides the environment of system binaries, so the
 peer's seat is read from the nearest ancestor whose environment is readable
 (stopping at the first readable one). See `seat_socket.seat_of_process`.
 
-Suite: 333 passing (was 298).
+Suite: 334 passing (was 298).
 
 ---
 

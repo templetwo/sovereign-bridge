@@ -785,7 +785,14 @@ def seat_socket_path() -> Path:
     so SOVEREIGN_ROOT redirection moves it — a module-level constant here would
     make the tests' tmp redirection a no-op and bind the LIVE path instead,
     which is the trap seat_identity.sovereign_root() already documents."""
-    return si.sovereign_root() / "hq" / "seats" / "bridge.sock"
+    #
+    # ⚠ ITS OWN DIRECTORY, not hq/seats/ itself. prepare_socket_path chmods the
+    # PARENT to 0700, and hq/seats/ is Anthony's — it holds the seat launchers
+    # (seat-codex, dispatch-grok, ...) and is 755 today. A bridge that silently
+    # narrows a directory it does not own is an unannounced permission change
+    # to someone else's files. One level down, the bridge owns the directory
+    # outright and the chmod is honest.
+    return si.sovereign_root() / "hq" / "seats" / "sock" / "bridge.sock"
 
 
 async def _start_seat_socket(app: FastAPI):
@@ -1381,14 +1388,14 @@ async def call_tool_endpoint(
         seat_id = ctx["seat_id"]
         allowed, reason = si.seat_tool_allowed(req.tool)
         if not allowed:
-            si.audit(seat_id, req.tool, "denied", reason)
+            si.audit(seat_id, req.tool, "denied", reason, ctx.get("peer_pid"))
             raise ScopeHTTPException(
                 status_code=403,
                 detail=si.deny_detail(req.tool, reason),
             )
         # OVERRIDE, never setdefault: a seat cannot claim another identity.
         req.arguments = si.sign_arguments(req.tool, req.arguments, seat_id)
-        si.audit(seat_id, req.tool, "allowed", "ok")
+        si.audit(seat_id, req.tool, "allowed", "ok", ctx.get("peer_pid"))
 
     # Scoped session token (The Door That Asks, Phase 1): default-deny per
     # tool, hard-deny on the never list, and stamp chronicle writes with the

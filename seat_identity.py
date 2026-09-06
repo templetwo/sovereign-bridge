@@ -108,12 +108,29 @@ def _audit_field(value: Any) -> str:
     return text
 
 
-def audit(seat_id: str | None, tool: str | None, outcome: str, reason: str) -> None:
-    """One line per seat-identity request, always exactly one. Seat ids and tool
-    names only — no bearer, no token, no argument bodies, nothing secret."""
+def audit(
+    seat_id: str | None,
+    tool: str | None,
+    outcome: str,
+    reason: str,
+    peer_pid: int | None = None,
+) -> None:
+    """One line per seat-identity request, always exactly one. Seat ids, tool
+    names and a pid only — no bearer, no token, no argument bodies, nothing
+    secret.
+
+    `peer_pid` IS THE POINT OF THE WHOLE MECHANISM, so it belongs on the line.
+    Attribution is the asset this feature protects; without the pid the log
+    records only the string the caller sent, which is the thing that was
+    already untrustworthy. With it, the record names the process the kernel
+    vouched for — the only field that later distinguishes a seat's real agent
+    process from a one-liner somebody spawned. (It was resolved, returned, and
+    dropped on the floor in the first draft: a field written and unwired.)
+    """
     audit_log.info(
-        "seat=%s tool=%s outcome=%s reason=%s",
+        "seat=%s pid=%s tool=%s outcome=%s reason=%s",
         _audit_field(seat_id),
+        _audit_field(peer_pid) if peer_pid is not None else "-",
         _audit_field(tool),
         _audit_field(outcome),
         _audit_field(reason),
@@ -424,6 +441,11 @@ def resolve_seat(peer: Any, seat_id: str | None, headers: Any) -> dict[str, Any]
     #    module exists for. The header stays — a request that says who it is
     #    and is checked audits far better than one whose identity is only ever
     #    inferred — but it is a declaration, never a credential.
+    #
+    #    WHAT THIS BUYS, EXACTLY: header-only impersonation is dead, and
+    #    accidental mis-signing fails closed. It does NOT stop a process that
+    #    deliberately constructs its own ancestry — see the RESIDUAL test in
+    #    tests/test_seat_socket.py. Do not overstate it.
     if seat_id != peer.get("seat"):
         raise SeatDenied(
             "seat_mismatch",

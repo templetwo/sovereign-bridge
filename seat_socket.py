@@ -27,11 +27,21 @@ to audit than one whose identity is only ever inferred.
                      read that docstring before trusting this one)
     X-Sovereign-Seat ← the caller's declaration; must EQUAL the env value
 
-WHAT THIS DEFENDS, STATED HONESTLY SO NOBODY OVER-READS IT: attribution
-integrity. A seat signs as the seat it was launched under and cannot sign as
-another. It is NOT a privilege boundary between local processes and cannot be
-one — anything running as this user can already read the master token out of
-~/.config/sovereign-bridge.env. The chronicle's attribution is the asset here.
+WHAT THIS DEFENDS, AND THE LINE IT DOES NOT CROSS. It kills IMPERSONATION BY
+HEADER: a caller can no longer name a seat its own environment does not name,
+so accidental mis-signing fails closed and a script with the wrong header stops
+writing as the wrong seat. It does NOT stop DELIBERATE impersonation — any
+process running as this user can spawn a child with whatever SOVEREIGN_SEAT it
+likes and the walk will find it. tests/test_seat_socket.py asserts that residual
+explicitly rather than leaving it as an unexamined assumption.
+
+That residual cannot be closed here. Under Anthony's no-token rule the only
+thing separating a real seat from a self-declared one would be a credential the
+operator issues, which is precisely what the rule forbids; the remaining lever
+is per-seat UIDs, an ops decision at his gate. It grants nothing new either
+way: anything running as this user can already read the master token out of
+~/.config/sovereign-bridge.env. The asset being protected is the chronicle's
+attribution, and P1 is NARROWED, not closed. Say it that way.
 
 A loopback TCP request can no longer take the seat path at all, whatever
 headers it carries: there is no pid behind a TCP connection that the kernel
@@ -308,15 +318,16 @@ def seat_of_process(pid: int) -> tuple[str, int]:
         was deliberately stripped.
       * An unreadable environment is not evidence of anything, so walk past it.
 
-    WHAT THIS IS AND IS NOT. It is ATTRIBUTION INTEGRITY: a seat signs as the
-    seat it was launched under, and cannot sign as another. It is NOT a
-    privilege boundary between local processes, and it never could be — every
-    process running as this user can already read the master bridge token out
-    of ~/.config/sovereign-bridge.env. The honest limitation that follows: a
-    process spawned by a seated terminal, whose own environment is hidden, is
-    treated as that terminal's seat. That is what environment inheritance
-    already means, and it is why `env -u` only works on clients that expose
-    their environment.
+    WHAT THIS IS AND IS NOT. It is ATTRIBUTION INTEGRITY against MISTAKE and
+    against header-only forgery — not a privilege boundary between local
+    processes, and it never could be: every process running as this user can
+    already read the master bridge token out of ~/.config/sovereign-bridge.env,
+    and can spawn a child declaring any seat it likes. Two honest limitations
+    follow. A process spawned by a seated terminal, whose own environment is
+    hidden, is treated as that terminal's seat — that is what environment
+    inheritance already means, and it is why `env -u` only works on clients
+    that expose their environment. And a process that constructs its own
+    ancestry is indistinguishable from a seat; see the RESIDUAL test.
     """
     me = os.getuid()
     seen: set[int] = set()

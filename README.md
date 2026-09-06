@@ -61,11 +61,11 @@ A terminal the operator seated on this machine has the filesystem already. Requi
 to carry a bearer bought no security and cost it the ability to write the record at all.
 The arrival flow above is for everything *outside*; this is for what is already inside.
 
-A seat calls over a **Unix domain socket** — `<sovereign-root>/hq/seats/bridge.sock`,
+A seat calls over a **Unix domain socket** — `<sovereign-root>/hq/seats/sock/bridge.sock`,
 mode 0600 — and sends `X-Sovereign-Seat: <seat-id>` with **no** `Authorization` header:
 
 ```bash
-curl --unix-socket ~/.sovereign/hq/seats/bridge.sock \
+curl --unix-socket ~/.sovereign/hq/seats/sock/bridge.sock \
   -H "X-Sovereign-Seat: $SOVEREIGN_SEAT" -H 'Content-Type: application/json' \
   -d '{"tool":"record_insight","arguments":{"content":"...","domain":"..."}}' \
   http://localhost/api/call
@@ -92,11 +92,17 @@ then read from that process's environment rather than believed from its header. 
 stays as a declaration that must match, because a checked declaration audits better than
 an inference.
 
-**What this defends, plainly:** *attribution integrity* — a seat signs as the seat it was
-launched under and cannot sign as another. It is **not** a privilege boundary between
-local processes and cannot be one, since anything running as this user can already read
-the master token out of `~/.config/sovereign-bridge.env`. The chronicle's attribution is
-the asset.
+**What this defends, and the line it does not cross.** It kills impersonation *by header*:
+a caller can no longer name a seat its own environment does not name, so accidental
+mis-signing fails closed and a script with the wrong header stops writing as the wrong
+seat. It does **not** stop *deliberate* impersonation — any process running as this user
+can spawn a child with whatever `SOVEREIGN_SEAT` it likes. That residual is asserted
+explicitly in `tests/test_seat_socket.py` rather than left as an assumption, and it cannot
+be closed without either a token (which the whole design forbids) or per-seat UIDs (an ops
+decision). It grants nothing new either way: anything running as this user can already
+read the master token out of `~/.config/sovereign-bridge.env`. This is **not** a privilege
+boundary between local processes and cannot be one. The asset is the chronicle's
+attribution.
 
 **One limitation, named.** macOS hides the environment of system binaries: `/usr/bin/curl`
 and `/bin/sleep` expose none, while `/usr/bin/python3` and Homebrew binaries do. So the
