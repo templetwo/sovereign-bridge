@@ -141,8 +141,13 @@ def audit(
     A promise in the documentation that the code does not keep is worse than a
     missing field, because the next reader believes the forensics exist.
 
-      peer_pid   — who SENT this request. The kernel's answer, re-read per
-                   request. This is the identity that decided the call.
+      peer_pid   — the KERNEL-REPORTED PEER AT ASGI ENTRY: the process the
+                   kernel names on this connection at the moment the request
+                   reaches the app, re-read per request. This is the identity
+                   that decided the call. It is NOT "whoever sent the bytes" —
+                   a parent can send the headers and a differently seated child
+                   the body, and this names the parent. See the residual in
+                   `seat_socket.py`.
       seat_pid   — whose ENVIRONMENT named the seat: peer_pid itself, or the
                    nearest ancestor whose environment macOS would show. When
                    these differ, the seat was INHERITED, not declared.
@@ -626,6 +631,12 @@ async def caller_channel(fetch: Any = None) -> tuple[str | None, str]:
     CALLER_CHANNEL_CACHE_SECONDS so a seat's ordinary traffic does not put a
     round trip in front of every call.
 
+    ⚠ THE TTL IS ON `time.monotonic`, NOT THE WALL CLOCK (review N3). An NTP
+    correction or a manual clock change must not be able to extend the life of
+    a cached POSITIVE advertisement — the one direction of this cache that can
+    admit a call. A monotonic clock cannot be set backwards, so the window is
+    the window.
+
     ⚠ THE POINT OF ASKING THE FAR END. The round-2 guard asked whether a module
     imported HERE, in the process that does not dispatch, and would have lifted
     itself on a deploy. This asks the process that actually answers the tool
@@ -639,7 +650,7 @@ async def caller_channel(fetch: Any = None) -> tuple[str | None, str]:
     refusal, never a permission, and the note carries the reason so an operator
     is told which of several different failures happened.
     """
-    now = time.time()
+    now = time.monotonic()
     if now < _caller_channel_cache["expires"]:
         return _caller_channel_cache["advertised"], _caller_channel_cache["note"]
 
@@ -657,8 +668,17 @@ async def caller_channel(fetch: Any = None) -> tuple[str | None, str]:
                 if isinstance(payload, dict)
                 else None
             )
-            if isinstance(value, str) and value.strip():
-                advertised = value.strip()
+            # ⚠ THE VALUE IS KEPT EXACTLY AS RECEIVED (review N3). An earlier
+            # version stripped it before comparing, which admitted
+            # " x-sovereign-seat-sse-header" and "…-header\n" — whitespace
+            # near-matches passing a gate whose whole contract is an EXACT
+            # string. Normalising an identity contract on the reader's side is
+            # how "exact" quietly becomes "close enough", and the reader is
+            # exactly the party with no standing to decide what the writer
+            # meant. Diagnostics use repr(), so the whitespace is visible in
+            # the refusal rather than invisible in the comparison.
+            if isinstance(value, str) and value != "":
+                advertised = value
                 note = (
                     "the stack heartbeat advertises "
                     f"caller_identity_channel={advertised!r}"
@@ -741,8 +761,9 @@ def actor_argument_refusal(tool: str, arguments: Any) -> tuple[str, str] | None:
         "client_supplied_actor",
         (
             f"Tool {tool!r} was called with {present!r}. The closer identity is "
-            "not a field a caller may set: it travels in-process from the seat "
-            "identity this bridge verified against the kernel. A caller-supplied "
+            "not a field a caller may set: it travels on the per-call SSE "
+            "session, as a header this bridge sets from the seat it verified "
+            "against the kernel, and no caller can write it. A caller-supplied "
             "actor is the `owner` string the stack's own review threw out, and "
             "it is refused rather than quietly overwritten — silently replacing "
             "it would leave the caller believing it had named the closer."
@@ -1086,6 +1107,391 @@ def filter_protected(payload: Any, index: ProtectedIndex) -> tuple[Any, int]:
     return walk(payload), dropped
 
 
+# ── TEXT-PRODUCING READS: THE FILTER ABOVE CANNOT SEE THEM ──────────────────
+#
+# Codex review 2026-09-06, N1 (P1). `filter_protected` recognises ENTRY
+# OBJECTS. The stack's `context_retrieve` reads a designated entry, formats the
+# first 150 characters of its content into a SENTENCE, and discards the claim
+# id and every protection marker with it. What comes back over the wire is a
+# string. The walker sees a string, has nothing to match on, and returns it
+# unchanged: HTTP 200, `ok:true`, the designated body in the response, and
+# `withheld_protected: 0`. Astra reproduced it through the real handler and
+# through the actual Stack ASGI `/sse` route.
+#
+# THE LESSON, AND IT IS THE ONE THIS WHOLE ROUND KEEPS RE-LEARNING: a guard
+# that matches on IDENTITY fails the moment something upstream renders the
+# content and throws the identity away. Walking the final JSON structure cannot
+# establish this invariant, because by the time the JSON exists the thing that
+# made it checkable is gone.
+#
+# SO THE BRIDGE CARRIES THE CONTENT ITSELF. For a tool that can render prose,
+# it loads the designated BODIES from the chronicle on disk and removes them
+# from the response text. That is a blunt instrument and it is deliberately
+# blunt: it does not need to understand any tool's formatting, so a tool that
+# renders 150 characters, or 400, or across a line break, is covered by the
+# same rule. What it costs is a chronicle scan per text read (measured: 1589
+# files, 3690 entries, 7.4 MB, 0.10 s) and the risk of over-redaction, which is
+# the safe direction.
+#
+# FAIL CLOSED AT EVERY EDGE. A designated id whose body cannot be located, a
+# body too short to redact without destroying the response, a scan that hits
+# its bound, a payload too large to walk — every one of them REFUSES the call.
+# A text response this bridge cannot certify is never passed through.
+
+# The window that must appear in the response for a body to count as present.
+# Long enough that ordinary prose does not collide by accident, short enough
+# that a 150-character excerpt is caught with room to spare.
+PROTECTED_BODY_GRAM = 40
+# Below this, a "body" is too small to search for without redacting half the
+# language. Such a designation REFUSES text reads rather than being ignored.
+PROTECTED_BODY_MIN_LENGTH = 8
+PROTECTED_BODY_SCAN_MAX_BYTES = 64 * 1024 * 1024
+PROTECTED_BODY_SCAN_MAX_FILES = 20_000
+PROTECTED_BODIES_MAX_BYTES = 4 * 1024 * 1024
+PROTECTED_TEXT_MAX_BYTES = 4 * 1024 * 1024
+WITHHELD_MARK = "[withheld: protected]"
+
+# The fields that carry a record's BODY. Deliberately not "every string in the
+# entry": redacting metadata would strip domain names and timestamps out of
+# ordinary prose, and over-redaction that destroys a response is its own kind
+# of failure. `content` is the field the claim id is derived from and the one
+# `context_retrieve` renders.
+_BODY_FIELDS = (
+    "content",
+    "question",
+    "context",
+    "note",
+    "body",
+    "text",
+    "what_i_learned",
+    "what_surprised_me",
+    "what_to_pick_up",
+)
+
+
+class ProtectedBodiesUnavailable(Exception):
+    """The designated bodies could not be assembled, so no text can be certified."""
+
+
+def _iter_chronicle_files(root: Path):
+    """The shards the stack itself scans: insights/ and _quarantine_*/."""
+    yield from sorted(root.glob("insights/**/*.jsonl"))
+    yield from sorted(root.glob("_quarantine_*/**/*.jsonl"))
+
+
+def load_protected_bodies(index: ProtectedIndex) -> tuple[str, ...]:
+    """Every designated record's body text, read from the chronicle on disk.
+
+    Raises ProtectedBodiesUnavailable when ANY designated id cannot be resolved
+    to a body, when a body is too short to search for, or when the scan hits a
+    bound. An empty designation index yields an empty tuple and costs nothing.
+
+    ⚠ WHY "NOT FOUND" IS A REFUSAL AND NOT AN EMPTY ANSWER. If a designated id
+    does not resolve here, one of two things is true: the record is genuinely
+    gone, or this scan cannot see where it lives. The bridge cannot tell those
+    apart, and the second one is a guard reporting "nothing to withhold" about
+    a record it simply failed to reach — the read-side fail-open in its purest
+    form. So it refuses and says which id.
+    """
+    if not index.claim_ids:
+        return ()
+
+    root = chronicle_root()
+    wanted = set(index.claim_ids)
+    found: dict[str, list[str]] = {}
+    scanned_bytes = 0
+    scanned_files = 0
+
+    for path in _iter_chronicle_files(root):
+        scanned_files += 1
+        if scanned_files > PROTECTED_BODY_SCAN_MAX_FILES:
+            raise ProtectedBodiesUnavailable(
+                f"the chronicle scan passed {PROTECTED_BODY_SCAN_MAX_FILES} files "
+                "without resolving every designated record"
+            )
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise ProtectedBodiesUnavailable(
+                f"a chronicle shard could not be read ({path.name}: {exc})"
+            ) from exc
+        scanned_bytes += len(raw)
+        if scanned_bytes > PROTECTED_BODY_SCAN_MAX_BYTES:
+            raise ProtectedBodiesUnavailable(
+                f"the chronicle scan passed {PROTECTED_BODY_SCAN_MAX_BYTES} bytes "
+                "without resolving every designated record"
+            )
+        if not wanted:
+            break
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                # A shard line the CHRONICLE cannot parse is not a designation
+                # this bridge is losing: claim ids derive from well-formed
+                # entries. Skipping here matches the stack's own reader.
+                continue
+            if not isinstance(entry, dict):
+                continue
+            cid = derive_claim_id(entry)
+            if cid is None or cid not in wanted:
+                continue
+            bodies = [
+                entry[field]
+                for field in _BODY_FIELDS
+                if isinstance(entry.get(field), str) and entry[field]
+            ]
+            found[cid] = bodies
+            wanted.discard(cid)
+        if not wanted:
+            break
+
+    missing = sorted(set(index.claim_ids) - set(found))
+    if missing:
+        raise ProtectedBodiesUnavailable(
+            "no chronicle entry resolves to designated claim "
+            + ", ".join(m[:12] for m in missing)
+            + " — the record cannot be located, so a rendered response cannot be "
+            "certified free of it"
+        )
+
+    out: list[str] = []
+    total = 0
+    for cid in sorted(found):
+        for body in found[cid]:
+            if len(body) < PROTECTED_BODY_MIN_LENGTH:
+                raise ProtectedBodiesUnavailable(
+                    f"designated claim {cid[:12]} has a body of "
+                    f"{len(body)} characters, below the {PROTECTED_BODY_MIN_LENGTH} "
+                    "needed to search for it without redacting ordinary language; "
+                    "text-producing reads cannot be certified against it"
+                )
+            total += len(body)
+            if total > PROTECTED_BODIES_MAX_BYTES:
+                raise ProtectedBodiesUnavailable(
+                    "the designated bodies exceed "
+                    f"{PROTECTED_BODIES_MAX_BYTES} bytes in total"
+                )
+            out.append(body)
+    return tuple(out)
+
+
+def _grams(body: str) -> frozenset[str]:
+    return frozenset(
+        body[i : i + PROTECTED_BODY_GRAM]
+        for i in range(len(body) - PROTECTED_BODY_GRAM + 1)
+    )
+
+
+def _redact_string(text: str, prepared) -> tuple[str, int]:
+    """Replace every designated body, and every long fragment of one. (text, n).
+
+    TWO RULES, because one of them alone leaks:
+      * WHOLE-BODY containment, which catches a short body a formatter printed
+        in full;
+      * ANY %d-character window of a body appearing in the text, which catches
+        an excerpt, a truncation, a body reflowed across a line break, or a
+        body a formatter split with an ellipsis. Astra's `context_retrieve`
+        reproduction is the first case of the second rule.
+
+    Overlapping and adjacent hits merge into ONE replacement, so a paragraph of
+    withheld material is one mark rather than a hundred.
+    """ % PROTECTED_BODY_GRAM
+    if not text or not prepared:
+        return text, 0
+
+    spans: list[tuple[int, int]] = []
+    for body, grams in prepared:
+        start = text.find(body)
+        while start != -1:
+            spans.append((start, start + len(body)))
+            start = text.find(body, start + 1)
+        if grams and len(text) >= PROTECTED_BODY_GRAM:
+            for i in range(len(text) - PROTECTED_BODY_GRAM + 1):
+                if text[i : i + PROTECTED_BODY_GRAM] in grams:
+                    spans.append((i, i + PROTECTED_BODY_GRAM))
+    if not spans:
+        return text, 0
+
+    spans.sort()
+    merged: list[list[int]] = [list(spans[0])]
+    for lo, hi in spans[1:]:
+        if lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+
+    out: list[str] = []
+    cursor = 0
+    for lo, hi in merged:
+        out.append(text[cursor:lo])
+        out.append(WITHHELD_MARK)
+        cursor = hi
+    out.append(text[cursor:])
+    return "".join(out), len(merged)
+
+
+def redact_protected_text(payload: Any, bodies: tuple[str, ...]) -> tuple[Any, int]:
+    """Remove designated bodies from every string in a response. (payload, n).
+
+    Raises ProtectedBodiesUnavailable when the payload cannot be certified:
+    more text than the bound allows, or a node type that is not JSON and so is
+    not something this walker can vouch for. A text response that cannot be
+    certified is never returned.
+    """
+    if not bodies:
+        # Nothing designated. The payload is certified by inspection, not by
+        # having been walked, and returning it unchanged is honest.
+        return payload, 0
+
+    prepared = tuple(
+        (body, _grams(body) if len(body) >= PROTECTED_BODY_GRAM else frozenset())
+        for body in bodies
+    )
+    seen_bytes = 0
+    total = 0
+
+    def walk(node: Any) -> Any:
+        nonlocal seen_bytes, total
+        if isinstance(node, str):
+            seen_bytes += len(node)
+            if seen_bytes > PROTECTED_TEXT_MAX_BYTES:
+                raise ProtectedBodiesUnavailable(
+                    f"the response carries more than {PROTECTED_TEXT_MAX_BYTES} "
+                    "bytes of text, more than can be certified free of protected "
+                    "material"
+                )
+            redacted, n = _redact_string(node, prepared)
+            total += n
+            return redacted
+        if isinstance(node, dict):
+            return {k: walk(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [walk(v) for v in node]
+        if isinstance(node, tuple):
+            return [walk(v) for v in node]
+        if node is None or isinstance(node, (bool, int, float)):
+            return node
+        raise ProtectedBodiesUnavailable(
+            f"the response carries a {type(node).__name__}, which this walker "
+            "cannot read, so the response cannot be certified free of protected "
+            "material"
+        )
+
+    return walk(payload), total
+
+
+# ── WHICH TOOLS RENDER, AND WHICH RETURN ENTRIES ────────────────────────────
+#
+# Review N1 (a): every allowed tool is classified, the table lives here, and a
+# test asserts it covers the published surface EXACTLY and disjointly.
+#
+# THE RULE THAT DECIDES A ROW, stated so the next person adding a tool has one:
+#
+#   TEXT       — the response can carry chronicle content that a formatter has
+#                already turned into prose. Every READ that can surface a
+#                record goes here, including reads that also return structured
+#                entries: a tool can do both, and the class is the WORSE case.
+#   STRUCTURED — the response cannot carry another record's body at all. In
+#                practice that is the WRITES (which echo their own input and a
+#                path) and the STATUS/INVENTORY surfaces (which report on the
+#                machine, not on the chronicle).
+#
+# TEXT IS THE DEFAULT AND THE SAFE SIDE. A TEXT tool gets the structural filter
+# AND the redaction; a STRUCTURED tool gets the filter only. Misclassifying a
+# read as TEXT costs a chronicle scan. Misclassifying it as STRUCTURED is the
+# defect this whole finding is about. When in doubt the row says TEXT.
+#
+# AN UNCLASSIFIED PUBLISHED TOOL IS REFUSED, not defaulted — a tool the stack
+# adds tomorrow must not decide its own containment class by being absent.
+TOOL_CLASS_STRUCTURED = "structured"
+TOOL_CLASS_TEXT = "text"
+
+TOOL_CLASSES: dict[str, str] = {
+    # ── writes: they echo their own input and a path, never another record ──
+    "record_insight": TOOL_CLASS_STRUCTURED,
+    "record_open_thread": TOOL_CLASS_STRUCTURED,
+    "record_learning": TOOL_CLASS_STRUCTURED,
+    "record_catch": TOOL_CLASS_STRUCTURED,
+    "supersede_insight": TOOL_CLASS_STRUCTURED,
+    "handoff": TOOL_CLASS_STRUCTURED,
+    "thread_touch": TOOL_CLASS_STRUCTURED,
+    "resolve_thread_by_id": TOOL_CLASS_STRUCTURED,
+    "spiral_reflect": TOOL_CLASS_STRUCTURED,
+    "close_session": TOOL_CLASS_STRUCTURED,
+    "spiral_inherit": TOOL_CLASS_STRUCTURED,
+    "set_policy": TOOL_CLASS_STRUCTURED,
+    "signal_ack": TOOL_CLASS_STRUCTURED,
+    "nape_ack": TOOL_CLASS_STRUCTURED,
+    # ── status / inventory: about the machine, not about the chronicle ──────
+    "heartbeat": TOOL_CLASS_STRUCTURED,
+    "connectivity_status": TOOL_CLASS_STRUCTURED,
+    "spiral_status": TOOL_CLASS_STRUCTURED,
+    "compass_check": TOOL_CLASS_STRUCTURED,
+    "my_toolkit": TOOL_CLASS_STRUCTURED,
+    "current_policies": TOOL_CLASS_STRUCTURED,
+    "signals_summary": TOOL_CLASS_STRUCTURED,
+    "nape_summary": TOOL_CLASS_STRUCTURED,
+    "get_compaction_stats": TOOL_CLASS_STRUCTURED,
+    "get_growth_summary": TOOL_CLASS_STRUCTURED,
+    "comms_channels": TOOL_CLASS_STRUCTURED,
+    "comms_get_acks": TOOL_CLASS_STRUCTURED,
+    "post_fix_verify": TOOL_CLASS_STRUCTURED,
+    # ── reads: any of these can surface a record, rendered or not ───────────
+    "context_retrieve": TOOL_CLASS_TEXT,      # the reproduction: 150 chars into prose
+    "where_did_i_leave_off": TOOL_CLASS_TEXT,
+    "arrive": TOOL_CLASS_TEXT,
+    "arrive_lineage": TOOL_CLASS_TEXT,
+    "season_review": TOOL_CLASS_TEXT,
+    "get_inheritable_context": TOOL_CLASS_TEXT,
+    "start_here": TOOL_CLASS_TEXT,
+    "reflexive_surface": TOOL_CLASS_TEXT,
+    "recall_insights": TOOL_CLASS_TEXT,
+    "recall_reflections": TOOL_CLASS_TEXT,
+    "get_open_threads": TOOL_CLASS_TEXT,
+    "thread_get_touches": TOOL_CLASS_TEXT,
+    "triage_threads": TOOL_CLASS_TEXT,
+    "the_ground": TOOL_CLASS_TEXT,
+    "self_model": TOOL_CLASS_TEXT,
+    "inspect_claim": TOOL_CLASS_TEXT,
+    "archive_exchange": TOOL_CLASS_TEXT,
+    "check_mistakes": TOOL_CLASS_TEXT,
+    "comms_recall": TOOL_CLASS_TEXT,
+    "prior_for_turn": TOOL_CLASS_TEXT,
+    "get_my_patterns": TOOL_CLASS_TEXT,
+    "get_pending_experiments": TOOL_CLASS_TEXT,
+    "get_unresolved_uncertainties": TOOL_CLASS_TEXT,
+    "get_compaction_context": TOOL_CLASS_TEXT,
+    "handoff_acted_on_records": TOOL_CLASS_TEXT,
+}
+
+
+def tool_class(tool: str) -> str | None:
+    """TOOL_CLASS_TEXT / TOOL_CLASS_STRUCTURED, or None for "not classified"."""
+    return TOOL_CLASSES.get(tool)
+
+
+def unclassified_refusal(tool: str) -> tuple[str, str] | None:
+    """Refuse a seat call for a tool whose containment class nobody has decided."""
+    if tool_class(tool) is not None:
+        return None
+    return (
+        "tool_not_classified",
+        (
+            f"Tool {tool!r} is published but is not classified as structured or "
+            "text-producing, so this bridge cannot tell whether its response "
+            "needs the entry filter alone or also needs designated bodies "
+            "removed from rendered prose. An unclassified tool is refused to "
+            "seats rather than served under a guess — a tool must not choose "
+            "its own containment class by being absent from the table. Add it "
+            "to seat_identity.TOOL_CLASSES."
+        ),
+    )
+
+
 # ── POST-FIX PROBES: CLASSIFY BY ARGUMENTS, NOT BY THE WRAPPER NAME ─────────
 #
 # Codex review 2026-09-06, F5 (P2, conditional). `post_fix_verify` is allowed
@@ -1157,6 +1563,33 @@ def probe_call_refusal(tool: str, arguments: Any) -> tuple[str, str] | None:
         return None
 
     mode = arguments.get("mode") or "verify"
+    # ⚠ RESAMPLE RE-EXECUTES A PROBE SET THIS BRIDGE NEVER SAW (review N2).
+    # Every rule below classifies the probes IN THE REQUEST. `mode='resample'`
+    # carries none: the stack loads `watch['probes']` off disk and runs them,
+    # so a stored `type='command'` probe — the one thing a seat may never run —
+    # executes with the request looking perfectly innocent. Astra reproduced it
+    # end to end: an ordinary synthetic command watch, resampled by a verified
+    # seat, recreated its marker and returned 200/ok:true.
+    #
+    # REFUSED, NOT INSPECTED. Reading the watch file here and classifying it
+    # would put a second, drifting copy of the stack's probe semantics in the
+    # bridge and a TOCTOU window between the read and the stack's own read.
+    # The bridge cannot classify what it does not receive, so it declines to
+    # pretend it can. `status` and `cancel` stay: they read and stop a watch,
+    # they do not run it.
+    if isinstance(mode, str) and mode == "resample":
+        return (
+            "probe_resample_unclassifiable",
+            (
+                "post_fix_verify(mode='resample') re-runs the probes STORED in "
+                "the watch, and this request carries none — so nothing here can "
+                "be classified, and a stored command probe would execute under "
+                "a seat that may not run one. Refused for seats. `mode='status'` "
+                "reads the watch and `mode='cancel'` stops it; both are "
+                "available. To re-verify, submit the probes in the call, where "
+                "they can be judged."
+            ),
+        )
     if isinstance(mode, str) and mode in _WATCH_MODES:
         watch_id = arguments.get("watch_id")
         if watch_id is not None and watch_id != "":

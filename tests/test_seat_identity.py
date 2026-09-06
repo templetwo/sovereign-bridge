@@ -754,6 +754,64 @@ def test_the_advertisement_is_admitted_when_the_stack_carries_it(
     assert calls.seats == [SEAT]
 
 
+def test_a_whitespace_near_match_is_not_the_channel(
+    registry, calls, surface, stack_channel
+):
+    """⚠ REVIEW N3. `caller_channel()` used to `.strip()` the advertised value
+    before comparing, so `" x-sovereign-seat-sse-header"` and
+    `"x-sovereign-seat-sse-header\n"` both ADMITTED signal_ack and sent the
+    verified seat header — whitespace near-matches passing a gate whose entire
+    contract is an exact string.
+
+    Normalising an identity contract on the reader's side is how "exact"
+    quietly becomes "close enough", and the reader is precisely the party with
+    no standing to decide what the writer meant. The value is kept exactly as
+    received; only the DIAGNOSTIC uses repr(), so the whitespace is visible in
+    the refusal instead of invisible in the comparison.
+    """
+    for near in (
+        " " + si.CALLER_CHANNEL_NAME,
+        si.CALLER_CHANNEL_NAME + "\n",
+        si.CALLER_CHANNEL_NAME + " ",
+        "\t" + si.CALLER_CHANNEL_NAME + "\r\n",
+    ):
+        si.reset_caller_channel_cache()
+        stack_channel["payload"] = {"caller_identity_channel": near}
+        r = call(
+            client(), "signal_ack", seat_hdr(), signal_id="sig-1", state="acknowledged"
+        )
+        assert r.status_code == 403, repr(near)
+        # the whitespace must be VISIBLE in the reason, not silently eaten
+        assert repr(near) in r.json()["detail"], repr(near)
+    assert not calls
+
+
+def test_the_channel_ttl_cannot_be_extended_by_moving_the_wall_clock(
+    registry, calls, surface, stack_channel, monkeypatch
+):
+    """⚠ REVIEW N3. The window is on `time.monotonic`, which cannot be set.
+
+    The dangerous direction is a cached POSITIVE advertisement outliving the
+    server that made it: that is the one state of this cache that ADMITS a
+    call. If the TTL rode the wall clock, an NTP correction backwards would
+    extend it silently. Driving `time.time` backwards by an hour here must not
+    change when the guard re-asks; driving `time.monotonic` forward must.
+    """
+    call(client(), "signal_ack", seat_hdr(), signal_id="s", state="acknowledged")
+    assert len(stack_channel["asked"]) == 1
+
+    monkeypatch.setattr(time, "time", lambda: 0.0)  # wall clock yanked to 1970
+    call(client(), "signal_ack", seat_hdr(), signal_id="s", state="acknowledged")
+    assert len(stack_channel["asked"]) == 1, "the wall clock moved the window"
+
+    base = time.monotonic()
+    monkeypatch.setattr(
+        time, "monotonic", lambda: base + si.CALLER_CHANNEL_CACHE_SECONDS + 1
+    )
+    call(client(), "signal_ack", seat_hdr(), signal_id="s", state="acknowledged")
+    assert len(stack_channel["asked"]) == 2, "the monotonic window did not expire"
+
+
 def test_the_advertisement_is_read_once_per_window_not_once_per_call(
     registry, calls, surface, stack_channel
 ):
@@ -845,6 +903,105 @@ def test_the_mirrored_seat_pattern_still_matches_the_stacks_own():
         "the bridge's mirrored seat-name pattern has drifted from the stack's: "
         f"stack={found.group(1)!r} bridge={si.SEAT_HEADER_VALUE_RE.pattern!r}"
     )
+
+
+class _Resp:
+    """The minimum of an httpx response the refusal reader touches."""
+
+    def __init__(self, status, payload=None, text=""):
+        self.status_code = status
+        self._payload = payload
+        self.text = text
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json body")
+        return self._payload
+
+
+def test_a_stack_refusal_at_connect_is_named_not_wrapped_in_taskgroup_text(
+    sse_headers, monkeypatch
+):
+    """⚠ REVIEW N4. The SDK opens the transport inside an anyio TaskGroup, so a
+    400 from the stack's `/sse` door reaches this bridge as "unhandled errors
+    in a TaskGroup (1 sub-exception)". The operator is told nothing about seat
+    names and goes looking for a network fault that is not there.
+
+    A generic message over a cause the bridge knows exactly is a small
+    fail-open of its own — not success reported over failure, but "something
+    upstream" reported over "your seat name is refused".
+    """
+    detail = (
+        "X-Sovereign-Seat 'guardian' is refused: it collides with a reserved "
+        "ledger label (a scanner-written closer or a source producer)"
+    )
+
+    class _Refused(Exception):
+        def __init__(self):
+            super().__init__("400 Bad Request")
+            self.response = _Resp(400, {"detail": detail})
+
+    def boom(url, headers=None):
+        raise ExceptionGroup("unhandled errors in a TaskGroup (1 sub-exception)", [_Refused()])
+
+    monkeypatch.setattr(bridge, "sse_client", boom)
+    out = _run(bridge.call_mcp_tool("recall_insights", {}, seat="guardian"))
+    assert out["ok"] is False
+    assert out["failure_class"] == "stack_refused_seat_name"
+    assert out["upstream_status"] == 400
+    assert detail in out["error"]
+    assert "renamed in the registry" in out["error"]
+    assert "TaskGroup" not in out["error"]
+
+
+def test_a_refusal_that_is_not_about_the_seat_keeps_its_own_class(
+    sse_headers, monkeypatch
+):
+    """Precision cuts both ways: a 4xx that says nothing about a seat must not
+    be reported as a seat-name problem. It is still named as a refusal at
+    connect rather than as an egress fault, because that is what it is."""
+
+    class _Refused(Exception):
+        def __init__(self):
+            super().__init__("401 Unauthorized")
+            self.response = _Resp(401, {"detail": "credential rejected"})
+
+    def boom(url, headers=None):
+        raise ExceptionGroup("unhandled errors in a TaskGroup (1 sub-exception)", [_Refused()])
+
+    monkeypatch.setattr(bridge, "sse_client", boom)
+    out = _run(bridge.call_mcp_tool("recall_insights", {}))
+    assert out["failure_class"] == "stack_refused_session"
+    assert out["upstream_status"] == 401
+    assert "credential rejected" in out["error"]
+
+
+def test_a_genuine_network_failure_is_still_egress(sse_headers, monkeypatch):
+    """The N4 reader must not swallow the ordinary case. A connection refused
+    is an egress fault and stays one — a new specific class that quietly
+    reclassifies every failure would be worse than the generic text it
+    replaced."""
+
+    def boom(url, headers=None):
+        raise ConnectionRefusedError("[Errno 61] Connection refused")
+
+    monkeypatch.setattr(bridge, "sse_client", boom)
+    out = _run(bridge.call_mcp_tool("recall_insights", {}))
+    assert out["failure_class"] == "egress"
+    assert "upstream_status" not in out
+
+
+def test_the_refusal_reader_does_not_spin_on_a_cyclic_exception_chain():
+    """`_leaf_exceptions` follows __cause__ and __context__, which a badly
+    chained exception can make cyclic. Bounded by identity, so a diagnostic
+    helper cannot hang the request it is trying to explain."""
+    a = RuntimeError("a")
+    b = RuntimeError("b")
+    a.__cause__ = b
+    b.__cause__ = a
+    leaves = list(bridge._leaf_exceptions(a))
+    assert {str(x) for x in leaves} == {"a", "b"}
+    assert bridge._connect_refusal(a) is None
 
 
 def test_a_bearer_call_carries_no_seat_and_no_actor(

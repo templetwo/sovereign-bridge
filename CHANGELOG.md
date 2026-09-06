@@ -29,6 +29,64 @@ turned them into decisions D1–D10. Each is closed below with a test that fails
   auth path and does not grow a null one here.
   *`tests/test_seat_protected.py`, 21 tests.*
 
+### Round 4 — the review's four closures
+
+- **N1, P1 — A FILTER THAT MATCHES ON IDENTITY CANNOT SEE A TOOL THAT RENDERS.** The
+  structural walker recognises entry objects. `context_retrieve` reads a designated entry,
+  formats its first 150 characters into a sentence, and discards the claim id with it — so
+  the walker saw a string, matched nothing, and returned the designated body at HTTP 200
+  with `withheld_protected: 0`. Reproduced by the reviewer through the real handler and the
+  actual Stack ASGI `/sse` route. Every allowed tool now carries a containment class in
+  `seat_identity.TOOL_CLASSES` (STRUCTURED: writes and status surfaces, which cannot carry
+  another record's body; TEXT: every read that can surface one, rendered or not — the class
+  is the WORSE case, so a TEXT tool gets the entry filter AND the redaction). A TEXT call
+  loads the designated bodies from the chronicle before dispatch and removes them from the
+  response, whole or in any run of 40+ characters, marking `[withheld: protected]` and
+  counting each site. Unresolvable body, too-short body, scan or payload past its bound,
+  unreadable node — each refuses. A published tool in no class is refused rather than
+  defaulted. Residual stated: runs shorter than 40 characters are not matched.
+  *`tests/test_seat_protected.py::test_context_retrieve_no_longer_hands_a_seat_the_rendered_body`,
+  `::test_a_body_split_across_a_formatting_boundary_is_still_caught`,
+  `::test_a_designated_body_that_cannot_be_located_refuses_the_text_read`,
+  `::test_a_text_response_the_walker_cannot_read_is_refused`,
+  `::test_the_classification_covers_the_published_surface_exactly`,
+  `::test_a_published_tool_nobody_classified_is_refused`, and six more.*
+
+- **N2, P2 — RESAMPLE RE-RUNS PROBES THE REQUEST NEVER CARRIED.** Every probe rule
+  classified the probes IN the call; `mode='resample'` has none, and the stack loads
+  `watch['probes']` off disk and runs them, so a stored `command` probe executed under a
+  seat that may never run one (reproduced end to end). Refused for seats, not inspected:
+  reading the watch here would put a drifting copy of the stack's probe semantics in the
+  bridge plus a TOCTOU window. `status` and `cancel` stay.
+  *`tests/test_seat_probes.py::test_a_seat_resample_is_refused_because_the_probes_are_not_in_the_request`,
+  `::test_the_resample_refusal_does_not_depend_on_the_watch_id_being_odd`.*
+
+- **N3, P2 — THE EXACT-STRING GATE WAS STRIPPING BEFORE IT COMPARED.** `" …-header"` and
+  `"…-header\n"` both admitted `signal_ack`. Normalising an identity contract on the
+  reader's side is how "exact" becomes "close enough", and the reader is the party with no
+  standing to decide what the writer meant. The value is kept as received and only repr'd in
+  diagnostics; the TTL moved to `time.monotonic` so a wall-clock change cannot extend a
+  cached positive.
+  *`tests/test_seat_identity.py::test_a_whitespace_near_match_is_not_the_channel`,
+  `::test_the_channel_ttl_cannot_be_extended_by_moving_the_wall_clock`.*
+
+- **N4, P3 — A REFUSAL AT THE DOOR READ AS "SOMETHING WENT WRONG UPSTREAM".** The SDK opens
+  the transport inside an anyio TaskGroup, so the stack's 400 for a seat name it will not
+  accept reached the caller as "unhandled errors in a TaskGroup (1 sub-exception)". Now
+  surfaced as `failure_class: stack_refused_seat_name` (or `stack_refused_session`) carrying
+  the stack's own detail and `upstream_status`. Ordinary network faults stay `egress`.
+  *`tests/test_seat_identity.py::test_a_stack_refusal_at_connect_is_named_not_wrapped_in_taskgroup_text`,
+  `::test_a_refusal_that_is_not_about_the_seat_keeps_its_own_class`,
+  `::test_a_genuine_network_failure_is_still_egress`,
+  `::test_the_refusal_reader_does_not_spin_on_a_cyclic_exception_chain`.*
+
+- **Wording (P3).** `peer_pid` is the *kernel-reported peer at ASGI entry* in
+  `seat_identity.py` and `README.md`, not "who sent this request" — the residual is exactly
+  that those can differ. The actor-refusal detail no longer says the identity travels
+  in-process; it travels on the per-call SSE session. README gains the deploy-order note:
+  after any stack ROLLBACK, restart the bridge so a cached positive advertisement cannot
+  outlive the server that made it.
+
 - **D1, ROUND 3 — THE CALLER IDENTITY RIDES THE TRANSPORT, AND THE GUARD ASKS THE FAR END.**
   Round 2 carried the seat in an in-process `contextvars.ContextVar` and refused `signal_ack`
   when `sovereign_stack.dispatch_context` was absent. Measured, that could not work and the

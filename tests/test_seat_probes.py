@@ -202,19 +202,58 @@ def test_an_unknown_probe_type_is_refused(seated, calls):
 # ── The lifecycle modes ─────────────────────────────────────────────────────
 
 
-def test_the_lifecycle_modes_are_allowed(seated, calls):
-    """status / resample / cancel replace the retired watch_* trio. "Opening a
-    watch you cannot then inspect or cancel is not a lifecycle" — they are
-    ordinary, and D5 restricts them ONLY by where they point."""
+def test_the_lifecycle_modes_that_do_not_RUN_a_watch_are_allowed(seated, calls):
+    """status and cancel replace the retired watch_* trio. "Opening a watch you
+    cannot then inspect or cancel is not a lifecycle" — they READ and STOP a
+    watch, they do not run it, and D5 restricts them only by where they point.
+    `resample` is the one that executes, and it is refused: see below."""
     for args in (
         {"mode": "status"},
         {"mode": "status", "watch_id": "wf-123"},
-        {"mode": "resample", "watch_id": "wf-123"},
         {"mode": "cancel", "watch_id": "wf-123", "reason": "done"},
     ):
         r = call(**args)
         assert r.status_code == 200, r.text
-    assert len(calls) == 4
+    assert len(calls) == 3
+
+
+def test_a_seat_resample_is_refused_because_the_probes_are_not_in_the_request(
+    seated, calls
+):
+    """⚠ REVIEW N2, REPRODUCED END TO END BY ASTRA: an ordinary synthetic
+    COMMAND watch, resampled by a verified seat, recreated its marker and
+    returned 200/ok:true.
+
+    Every other rule in `probe_call_refusal` classifies the probes IN THE
+    REQUEST. `mode='resample'` carries none — the stack loads `watch['probes']`
+    off disk and runs them — so a stored `type='command'` probe, the one thing
+    a seat may never run, executes while the request looks innocent.
+
+    REFUSED, NOT INSPECTED. Reading the watch file here would put a second,
+    drifting copy of the stack's probe semantics in the bridge and a TOCTOU
+    window between our read and the stack's. The bridge declines to classify
+    what it never received.
+    """
+    r = call(mode="resample", watch_id="pfw_20260906_abcd")
+    assert r.status_code == 403
+    detail = r.json()["detail"]
+    assert "re-runs the probes STORED in the watch" in detail
+    assert "'status'" in detail and "'cancel'" in detail
+    assert not calls, "a resample reached the stack"
+
+
+def test_the_resample_refusal_does_not_depend_on_the_watch_id_being_odd(
+    seated, calls
+):
+    """A perfectly well-formed, stack-generated watch id is refused just the
+    same. The objection is not the address, it is that the OPERATION cannot be
+    classified from what the caller sent — so a valid id must not read as a
+    valid request."""
+    for watch_id in ("pfw_20260906_120000_a1b2", "wf-123", "abc"):
+        r = call(mode="resample", watch_id=watch_id)
+        assert r.status_code == 403, watch_id
+        assert "probes STORED" in r.json()["detail"]
+    assert not calls
 
 
 def test_a_watch_id_that_is_not_a_watch_id_is_refused(seated, calls):

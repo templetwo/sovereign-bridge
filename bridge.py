@@ -539,7 +539,12 @@ def _idem_put(key: str, principal: str, tool: str, result: dict) -> None:
 
 
 def _certify_seat_result(
-    result: dict, seat_id: str, tool: str, protected_index, audit_pids: dict
+    result: dict,
+    seat_id: str,
+    tool: str,
+    protected_index,
+    audit_pids: dict,
+    protected_bodies: tuple = (),
 ) -> dict:
     """Drop every designated entry from a seat-bound response (D4, review F1).
 
@@ -565,6 +570,32 @@ def _certify_seat_result(
                 f"protected material ({exc}), so it is withheld whole."
             ),
         )
+    # SECOND PASS FOR TEXT-PRODUCING READS (review N1). The filter above sees
+    # ENTRY OBJECTS; `context_retrieve` renders an entry's first 150 characters
+    # into a sentence and throws the claim id away, so there is nothing left
+    # for the filter to recognise. This removes the designated BODIES from the
+    # rendered text — a blunt instrument, and blunt on purpose: it needs to
+    # understand no tool's formatting.
+    #
+    # `protected_bodies` is empty for a STRUCTURED tool and for a machine with
+    # nothing designated; in both cases this is a no-op. When it raises, the
+    # response is withheld WHOLE — a text response this bridge cannot certify
+    # is never passed through.
+    if protected_bodies:
+        try:
+            filtered, redacted = si.redact_protected_text(filtered, protected_bodies)
+        except si.ProtectedBodiesUnavailable as exc:
+            si.audit(seat_id, tool, "denied", "protected_text_uncertifiable", **audit_pids)
+            raise ScopeHTTPException(
+                status_code=403,
+                detail=(
+                    f"The response to {tool!r} renders chronicle content as text "
+                    f"and cannot be certified free of protected material ({exc}), "
+                    "so it is withheld whole."
+                ),
+            )
+        withheld += redacted
+
     # REPLACE a result the envelope already carries; never INVENT one. An error
     # envelope has no "result" key, and stamping a null one there would change
     # the shape of every seat-path failure relative to every other path.
@@ -575,6 +606,71 @@ def _certify_seat_result(
     # them apart — an absent field would collapse them (SOP #2).
     result["withheld_protected"] = withheld
     return result
+
+
+# ── WHEN THE STACK REFUSES THE SESSION AT CONNECT (review N4) ──────────────
+# The stack's `/sse` door 400s a session whose `X-Sovereign-Seat` it will not
+# accept — a reserved ledger label, or a name outside its pattern. That refusal
+# is correct and it is also the most confusing failure this bridge can produce,
+# because the MCP SDK opens the transport inside an anyio TaskGroup: the 400
+# arrives wrapped, `str(exc)` is "unhandled errors in a TaskGroup (1
+# sub-exception)", and the operator is told nothing about seat names at all.
+#
+# A generic message over a specific cause is a small fail-open of its own: it
+# does not report success, but it reports "something went wrong upstream" for a
+# condition the bridge knows exactly and could name.
+_SEAT_REFUSAL_MARK = "x-sovereign-seat"
+
+
+def _leaf_exceptions(exc: BaseException, _seen: set[int] | None = None):
+    """Flatten an exception group, and follow __cause__/__context__.
+
+    Bounded by identity so a cyclic chain cannot spin, and yields the leaves
+    only — a group carries no message of its own worth reading.
+    """
+    seen = _seen if _seen is not None else set()
+    if exc is None or id(exc) in seen:
+        return
+    seen.add(id(exc))
+    inner = getattr(exc, "exceptions", None)
+    if isinstance(inner, (list, tuple)) and inner:
+        for sub in inner:
+            yield from _leaf_exceptions(sub, seen)
+    else:
+        yield exc
+    for chained in (exc.__cause__, exc.__context__):
+        if chained is not None:
+            yield from _leaf_exceptions(chained, seen)
+
+
+def _connect_refusal(exc: BaseException) -> tuple[int, str] | None:
+    """(status, detail) when the stack refused the session, else None.
+
+    Reads the response body for the stack's own words rather than paraphrasing
+    them: the stack already writes a precise reason and the bridge's job is to
+    carry it, not to guess at it a second time.
+    """
+    for leaf in _leaf_exceptions(exc):
+        response = getattr(leaf, "response", None)
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int) and 400 <= status < 500:
+            detail = ""
+            try:
+                body = response.json()
+                if isinstance(body, dict):
+                    detail = str(body.get("detail") or body.get("error") or "")
+            except Exception:  # noqa: BLE001 — a body we cannot parse is not fatal
+                detail = ""
+            if not detail:
+                try:
+                    detail = (response.text or "").strip()
+                except Exception:  # noqa: BLE001 — a streamed body may be gone
+                    detail = ""
+            return status, detail or str(leaf)
+        text = str(leaf)
+        if _SEAT_REFUSAL_MARK in text.lower():
+            return 400, text
+    return None
 
 
 async def call_mcp_tool(tool_name: str, arguments: dict, seat: str | None = None) -> dict:
@@ -607,6 +703,31 @@ async def call_mcp_tool(tool_name: str, arguments: dict, seat: str | None = None
                         return {"ok": True, "result": text}
                 return {"ok": True, "result": None}
     except Exception as e:
+        # THE SPECIFIC CAUSE BEFORE THE GENERIC ONE (review N4). A refusal at
+        # the /sse door is a fact the bridge can name exactly; reporting it as
+        # "egress" or "stack" would send the operator looking for a network
+        # fault that is not there.
+        refusal = _connect_refusal(e)
+        if refusal is not None:
+            status, detail = refusal
+            named_seat = _SEAT_REFUSAL_MARK in detail.lower()
+            return {
+                "ok": False,
+                "error": (
+                    f"the stack refused this session at connect ({status}): {detail}"
+                    + (
+                        " — this bridge sent a seat name the stack will not accept, "
+                        "so no call from this seat can be served until the seat is "
+                        "renamed in the registry."
+                        if named_seat
+                        else ""
+                    )
+                ),
+                "failure_class": (
+                    "stack_refused_seat_name" if named_seat else "stack_refused_session"
+                ),
+                "upstream_status": status,
+            }
         msg = str(e)
         low = msg.lower()
         egress_signals = ("connect", "refused", "unreachable", "name resolution", "dns", "getaddrinfo")
@@ -1748,6 +1869,34 @@ async def call_tool_endpoint(
         if refusal is not None:
             si.audit(seat_id, req.tool, "denied", refusal[0], **_audit_pids)
             raise ScopeHTTPException(status_code=403, detail=refusal[1])
+        # CONTAINMENT CLASS (review N1). A published tool nobody has classified
+        # is refused rather than defaulted: a tool the stack adds tomorrow must
+        # not choose its own containment class by being absent from the table.
+        unclassified = si.unclassified_refusal(req.tool)
+        if unclassified is not None:
+            si.audit(seat_id, req.tool, "denied", unclassified[0], **_audit_pids)
+            raise ScopeHTTPException(status_code=403, detail=unclassified[1])
+        # ⚠ THE BODIES ARE LOADED BEFORE THE CALL, for the same reason the index
+        # is: if they cannot be assembled, the answer is a refusal, and a
+        # refusal issued after dispatch is a call that already happened.
+        protected_bodies: tuple = ()
+        if si.tool_class(req.tool) == si.TOOL_CLASS_TEXT:
+            try:
+                protected_bodies = si.load_protected_bodies(protected_index)
+            except si.ProtectedBodiesUnavailable as exc:
+                si.audit(
+                    seat_id, req.tool, "denied", "protected_bodies_unavailable", **_audit_pids
+                )
+                raise ScopeHTTPException(
+                    status_code=403,
+                    detail=(
+                        f"Tool {req.tool!r} renders chronicle content as text, so "
+                        "its response can only be served once the designated "
+                        "records are known well enough to be removed from it. "
+                        f"They are not: {exc}. Refused rather than served with "
+                        "an unchecked body in the prose."
+                    ),
+                )
         # THE CLOSER IDENTITY (D1 as amended). It is NOT an argument: a client
         # that names the actor is refused, and a stack with no in-process
         # channel to carry the verified seat cannot serve the tool at all.
@@ -1839,7 +1988,8 @@ async def call_tool_endpoint(
             # outlive a designation.
             if seat_id is not None:
                 replay = _certify_seat_result(
-                    replay, seat_id, req.tool, protected_index, _audit_pids
+                    replay, seat_id, req.tool, protected_index, _audit_pids,
+                    protected_bodies,
                 )
             replay["idempotent_replay"] = True
             replay["duration_ms"] = round((time.time() - start) * 1000)
@@ -1874,7 +2024,7 @@ async def call_tool_endpoint(
     # cached.
     if seat_id is not None:
         result = _certify_seat_result(
-            result, seat_id, req.tool, protected_index, _audit_pids
+            result, seat_id, req.tool, protected_index, _audit_pids, protected_bodies
         )
 
     result["duration_ms"] = round((time.time() - start) * 1000)

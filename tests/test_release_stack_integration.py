@@ -107,12 +107,35 @@ def _run(script: str, *, with_release_stack: bool, tmp_path: Path) -> dict:
         # so redirecting HOME is what makes ~/sovereign-stack/src unreachable.
         env["HOME"] = str(tmp_path / "empty-home")
         (tmp_path / "empty-home").mkdir(parents=True, exist_ok=True)
+        # ⚠ AND HOME ALONE IS NOT ENOUGH, WHICH THIS FILE LEARNED THE HARD WAY.
+        # The venv carries an EDITABLE INSTALL of sovereign_stack pointing at
+        # the live checkout, so the package resolves whatever HOME says. This
+        # test passed for as long as the live tree simply had no
+        # `signal_ledger` — an absence, not a control. On 2026-09-06 14:39 HQ
+        # merged the stack release to `main`, the live tree gained the module,
+        # and the "import absent" case silently became the "import present"
+        # case. The test went red, which is the only reason anyone noticed.
+        #
+        # So the absence is now a PROPERTY OF THE TEST. `sys.modules[name] =
+        # None` makes the import raise ImportError for real — the same failure
+        # bridge's guarded import would see on a machine without the module —
+        # and it cannot be undone by anything a deploy does.
+        script = _BLOCK_LEDGER + script
     out = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(script)],
         capture_output=True, text=True, env=env, cwd=str(REPO), timeout=300,
     )
     assert out.returncode == 0, f"subprocess failed:\nSTDOUT:\n{out.stdout}\nSTDERR:\n{out.stderr}"
     return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+# Makes `import sovereign_stack.signal_ledger` fail for real, whatever is
+# installed. Must run BEFORE `import bridge`, because bridge resolves its
+# guarded import once at module scope.
+_BLOCK_LEDGER = """
+import sys
+sys.modules["sovereign_stack.signal_ledger"] = None
+"""
 
 
 # The preamble every subprocess shares: import the stack FIRST (so the release
@@ -180,8 +203,16 @@ def test_the_import_absent_route_is_an_error_not_a_zero(tmp_path):
     Monkeypatching `SIGNALS_SOURCE` proves the routing; it does not prove that
     a bridge which genuinely cannot import the ledger degrades correctly,
     because the import is resolved once at module scope and a patched constant
-    never exercises that. Here nothing is patched: there is no stack on the
-    path, upstream is unreachable, and the field must still refuse to say zero.
+    never exercises that. Here the import genuinely raises: the subprocess
+    blocks `sovereign_stack.signal_ledger` in `sys.modules` before bridge is
+    imported, upstream is unreachable, and the field must still refuse to say
+    zero.
+
+    ⚠ THE ABSENCE IS ARRANGED, NOT INHERITED — see `_BLOCK_LEDGER`. Until
+    2026-09-06 this test relied on the live checkout not having the module,
+    which meant it was measuring the machine rather than the bridge. HQ merged
+    the stack release, the module appeared, and the test flipped to exercising
+    the opposite branch. A control that a deploy can revoke is not a control.
     """
     result = _run(
         _PREAMBLE

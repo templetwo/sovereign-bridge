@@ -117,7 +117,8 @@ described to anyone:**
    `test_a_body_sent_by_a_child_mid_request_is_attributed_to_the_ASGI_ENTRY_PEER`; closing
    it needs identity resampled per body chunk plus a policy for a mid-stream change, which
    is an architectural decision, not a patch.
-   Every seat audit line carries **three** pids: `pid` (who sent it, and decided the call),
+   Every seat audit line carries **three** pids: `pid` (the **kernel-reported peer at ASGI
+   entry** — the identity that decided the call, not "whoever sent the bytes"),
    `seat_pid` (whose environment named the seat — differs when the seat was inherited), and
    `accept_pid` (who opened the connection — differs exactly when the descriptor changed
    hands). They are on the **denial** line too, which is where they matter most. Until
@@ -188,11 +189,35 @@ because "the filter ran and removed nothing" and "the filter did not run" are di
 facts. An index that cannot be parsed shuts the whole seat path, exactly as an unreadable
 registry does. The master-token path is untouched.
 
+**And a filter that matches on identity cannot see a tool that RENDERS.** `context_retrieve`
+reads an entry, formats its first 150 characters into a sentence, and discards the claim id
+with it; the structural walker above sees a string, has nothing to match on, and returns the
+designated body at HTTP 200 with `withheld_protected: 0`. So every allowed tool carries a
+containment class in `seat_identity.TOOL_CLASSES` — **STRUCTURED** (writes and status
+surfaces, which cannot carry another record's body) or **TEXT** (every read that can surface
+a record, rendered or not). A TEXT call loads the designated *bodies* from the chronicle on
+disk before dispatch and removes them from the response, whole or in any run of 40
+characters or more, leaving `[withheld: protected]` and counting each site in
+`withheld_protected`. A published tool that is in no class is **refused**: a tool the stack
+adds tomorrow must not pick its own containment class by being absent.
+
+Every edge fails closed. A designated id that cannot be resolved to a body, a body too short
+to search for without redacting ordinary language, a scan or a response past its bound, a
+payload carrying a node the walker cannot read — each refuses the call. **A text response
+this bridge cannot certify is never passed through.** The residual, stated: a run *shorter*
+than 40 characters is not matched, because 20 characters of English collide with English; no
+known formatter emits a body in pieces that small, and short bodies are matched whole.
+
 **`post_fix_verify` is classified by its arguments, not by its name.** For seats: no
 `command` probes (regardless of `POST_FIX_ALLOW_COMMAND` on the host — a boundary that holds
 only while another component is configured a certain way is not a boundary), `http` probes
 limited to GET/HEAD, `file_hash` probes confined to the sovereign root, an unknown probe type
-refused, and a `watch_id` must be one plain path segment.
+refused, and a `watch_id` must be one plain path segment. **`mode='resample'` is refused
+outright**: it re-runs the probes *stored* in the watch, and the request carries none, so a
+stored `command` probe would execute under a seat that may never run one. The bridge refuses
+rather than reading the watch file and classifying it — that would put a drifting second copy
+of the stack's probe semantics here, and a window between our read and the stack's.
+`status` and `cancel` remain: they read and stop a watch, they do not run it.
 
 **The closer identity travels on the transport, never as an argument.** `signal_ack`
 stamps who closed a signal. The bridge merges `X-Sovereign-Seat: <kernel-verified seat>`
@@ -244,6 +269,25 @@ registry means every seat request is refused. Creating the file turns the path o
 deleting it, or flipping `enabled` to `false`, revokes immediately (it is read fresh on
 every request). See `examples/seats-registry.json`. Every seat request writes one audit
 line — seat, tool, outcome, reason — to the bridge's log.
+
+**Deploy order, and the one direction the channel cache is not safe in.** The caller-channel
+advertisement is cached for 60 s. Rolling *forward* is safe: a cached negative only delays
+`signal_ack` by up to a minute and can never fabricate an identity. Rolling the **stack
+back** to a server that ignores the seat header is the unsafe direction — a cached *positive*
+would keep admitting `signal_ack` until it expires, against a server that is no longer
+reading the header. **After any stack rollback, restart the bridge** (or call
+`seat_identity.reset_caller_channel_cache()`) so an advertisement cannot outlive the server
+that made it. Start the stack first on the way up.
+
+**Seat names have an upstream shape.** The stack refuses a `/sse` session whose
+`X-Sovereign-Seat` is outside `^[a-z0-9][a-z0-9-]{2,63}$` *or* collides with a reserved
+ledger label (`bridge`, `chronicle`, `daemon`, `drain`, `guardian`, `metabolize`, `nape`,
+`nape-ack`, `watchman`, …, computed from the ledger's own constants). The bridge mirrors the
+shape rule and withholds a malformed name rather than losing the whole session over it; it
+does **not** mirror the reserved set, because that set is derived upstream on every call and
+a copy here would drift. A collision is therefore a naming constraint on the registry — and
+when it happens the failure is now named (`failure_class: stack_refused_seat_name`, carrying
+the stack's own words) rather than arriving as a TaskGroup wrapper.
 
 ## The Door That Asks — consent-gated arrival
 
