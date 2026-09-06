@@ -1,5 +1,117 @@
 # Changelog — Sovereign Bridge
 
+## Release 2026-09-06, round 2 — the RC review's fixes
+
+Cross-substrate review of the release candidate at `e728255` (gpt-6-astra, Codex seat 3/3)
+returned **reject**: the round-1 fixes were demonstrated, and six findings remained. HQ
+turned them into decisions D1–D10. Each is closed below with a test that fails on
+`e728255` and passes here.
+
+- **F1, P1 — PROTECTED MATERIAL REACHED A SEAT THROUGH ALLOWED READS.** The gate refused
+  `open_protected_record` by name; `inspect_claim`, `recall_insights` and
+  `archive_exchange` returned a designated record's body or its archived stakes through the
+  real route, HTTP 200. The drawer is a *designation*, not a door. On the seat path the
+  bridge now reads `<chronicle>/protected.jsonl` fresh per request and refuses the
+  id-addressed tools for any designated claim or stakes-archive id **including a prefix of
+  one** (both resolve prefixes upstream, so exact-match would have been walked past), and
+  post-filters every seat response, reporting `withheld_protected: <n>` even when zero. The
+  filter ORs three signals — the stack's own marker, a declared claim_id, a locally derived
+  one — because each is absent in a different world and a filter resting on the derivation
+  alone would match nothing, silently, the day the upstream preimage changed. An unreadable
+  index shuts the whole seat path, as an unreadable registry already does. The filter runs
+  BEFORE the idempotency store is written, or a replay would serve the withheld record back
+  around the guard. Master path unchanged.
+  *`tests/test_seat_protected.py`, 19 tests.*
+
+- **F2, P2 — THE DESCRIPTOR RESIDUAL, STATED EXACTLY RATHER THAN CLOSED.** Identity is the
+  kernel-reported peer **at ASGI entry**, which is after the headers and before the body: a
+  parent that sends only headers can hand the descriptor to a differently-seated child that
+  sends the body, and the request dispatches under the parent's seat. Not claimed closed.
+  `README.md` and `seat_socket.py` now say the bound in those words (the old "the sender of
+  each request is the process it is attributed to" was too strong), and a PASSING test
+  documents it — not an xfail, which would pass whether the behaviour held or changed.
+  The README's claim that `accept_pid` was "recorded in the audit line" was false; it and
+  `seat_pid` survived in the protocol extension and died at the auth context. Both now
+  reach the line, on grants **and denials** — `seat_mismatch` is where they matter most.
+  *`tests/test_seat_socket.py::test_a_body_sent_by_a_child_mid_request_is_attributed_to_the_ASGI_ENTRY_PEER`,
+  `tests/test_seat_identity.py::test_the_audit_line_names_all_three_pids` and
+  `::test_a_denial_names_all_three_pids_too`.*
+
+- **F3, P2 — THE HEARTBEAT FALLBACK REBUILT THE FIELD AND LOST ITS HEALTH.** The fallback
+  called `signals_summary` and transcribed seven keys, dropping `source_status`,
+  `sources_degraded` and `corrupt_rows` — and reporting `by_source.watchman = 1` for a
+  source the local route correctly reported as `null` because it could not be read. Two
+  routes for one field that disagree about whether a number is KNOWN, with the degraded
+  route as the reassuring one. It now calls the stack's own `heartbeat`, which carries
+  `unacked_signals` from the same `signal_ledger.heartbeat_field`, and passes that object
+  through **verbatim**. A stack too old to carry the field is an error, never a zero.
+  *`tests/test_heartbeat_signals.py`, 5 tests rewritten/added.*
+
+- **F4, P1 — THE PINNED PAIR, MEASURED RATHER THAN ASSUMED.** A valid scan marker over a
+  schema-corrupt ledger row was measured returning `total: 0` alongside its error. The
+  bridge propagates that faithfully and cannot fix it from its side, so the pairing is now
+  a test that imports the stack RELEASE worktree in a subprocess and asserts null counts
+  with a non-null error. **It passes against the stack release round 3**, which closed it.
+  *`tests/test_release_stack_integration.py`.*
+
+- **F5, P2 — `post_fix_verify` IS CLASSIFIED BY ITS ARGUMENTS.** The gate checked only the
+  tool name, and with `POST_FIX_ALLOW_COMMAND=1` on the host the reviewer rewrote a fixture
+  seat registry through a `command` probe. For seats: no `command` probes regardless of the
+  host flag, `http` limited to GET/HEAD, `file_hash` confined to the sovereign root, an
+  unknown probe type refused, and `watch_id` must be one plain path segment. **That last
+  rule is stricter than the instruction on purpose:** "outside SOVEREIGN_ROOT" would admit
+  `../../hq/seats/registry`, which lands *inside* the root on Anthony's seat registry, and
+  `mode='cancel'` writes.
+  *`tests/test_seat_probes.py`, 10 tests.*
+
+- **F6, P2 — THE SUITE WAS NOT ISOLATED FROM LIVE CREDENTIALS OR UPSTREAM.** Importing
+  `bridge` read `~/.config/sovereign-bridge.env`, and heartbeat paths attempted connections
+  to 127.0.0.1:3434, while the tests passed. That read happens at COLLECTION, before any
+  fixture, so a fixture could not close it: `SOVEREIGN_BRIDGE_ENV_FILE` is now a seam the
+  import itself honours and the root `conftest.py` points it at a synthetic file at module
+  scope. The upstream block is on `bridge.sse_client` — the transport — not on
+  `call_mcp_tool`, whose real degradation path several tests exist to exercise.
+  **And one more found by doing it:** writing the protected suite put a synthetic entry in
+  Anthony's live `~/.sovereign/bridge/idempotency.json`, because `_IDEM_PATH` is a
+  module-level constant only some tests redirected. The entry was removed; every live-store
+  path is now redirected for every test. Proof: `tests/isolation_audit.py` runs the whole
+  suite under an audit hook — **431 passed, 0 credential reads, 0 TCP connect attempts.**
+
+### The two decisions that changed shape
+
+- **ONE SOURCE FOR THE SEAT SURFACE (D2).** The hand-copied 100-name `SEAT_TOOL_SURFACE`
+  and the 48-name census-derived `SEAT_RETIRED_TOOLS` are **deleted**. The surface is
+  resolved at request time as *what the stack publishes* minus governance — from the
+  stack's registry when importable, otherwise one `list_tools` fetch per cache window on
+  the bridge's own credential, and a 503 when neither answers. That fixes the "narrows in
+  exactly two places" defect the previous release pinned (`ask_scribe`, `reflection_ack`)
+  in the only honest direction: they are denied because the STACK retired them. Against the
+  2026-09-06 stack release: **49 allowed, 3 governance-denied, of 52 published.** The
+  import is retried each window, so a stack deploy is visible without a bridge restart.
+  *`tests/test_seat_surface.py`, 12 tests; `test_the_pinned_surface_is_the_stack_release`
+  replaces a test that compared three cardinalities against a constant in the same repo.*
+
+- **`signal_ack` IS ADMITTED, AND ITS CLOSER TRAVELS IN-PROCESS (D1, as amended).**
+  Acknowledging a signal is the watch seat's operational act; classifying it governance left
+  the designated watch seat with no closure path. The first implementation of the identity
+  half injected `actor_seat` as an ARGUMENT, and that was the defect: an argument is a
+  channel every caller can write to, so the stack's trust rested on the bridge being the
+  only writer — not a property the stack can check. The verified seat now travels through
+  `sovereign_stack.dispatch_context` (a contextvar nothing on the wire can reach), set
+  around the dispatch and reset in a `finally`. A client supplying `actor`, `actor_seat`,
+  `closed_by`, `owner` or `source_seat` is refused rather than overwritten, and a stack
+  without that module cannot serve `signal_ack` to a seat at all.
+
+### Also
+
+- `tests/test_runtime_receipt.py` — two tests failed under the house-mandated
+  `TMPDIR=<worktree>/.tmp` for two consecutive deliveries and were reported around rather
+  than fixed. They assumed an ancestry they never established (tmp_path inside a git
+  worktree). Fixed at the premise: a path that does not exist for `_find_repo_root`,
+  `GIT_CEILING_DIRECTORIES` for `_git_head_state`.
+
+---
+
 ## Release 2026-09-06 — the second review's fixes, Anthony's trust ruling, and the signal ledger on the door
 
 Cross-substrate review 2 (gpt-6-astra, Codex seat 3/3) read

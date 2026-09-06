@@ -478,6 +478,30 @@ def _wrap_app(app, sock: socket.socket, accept_pid: int | None = None):
     descriptor handed to another process is re-attributed to that process, and
     the header check at seat_identity.py then denies the mismatch.
 
+    ⚠ WHAT "PER REQUEST" MEANS, EXACTLY, AND WHAT IT DOES NOT CLOSE.
+
+    THE IDENTITY IS THE KERNEL-REPORTED PEER AT ASGI ENTRY — not every process
+    that contributed bytes to the stream. This resolution happens when the ASGI
+    application starts, which is after the request line and headers and BEFORE
+    the body. Codex review 2026-09-06 (F2) measured the residual that leaves: a
+    parent sent the headers, was correctly resolved as itself, and handed the
+    descriptor to a differently-seated child which sent the JSON body. HTTP
+    200, dispatched under the PARENT's seat, with a body the CHILD chose
+    (parent pid 75471, child pid 75480).
+
+    An earlier version of this docstring, and of README.md, said "the sender of
+    each request is the process it is attributed to." That was too strong and
+    is corrected here rather than qualified: one identity is sampled per
+    request, at entry, and a stream with two writers has one attributed author.
+    The bound is asserted by
+    `test_a_body_sent_by_a_child_mid_request_is_attributed_to_the_ASGI_ENTRY_PEER`
+    — a passing test that documents what happens, not an xfail, because an
+    xfail would pass whether the behaviour held or changed.
+
+    Closing it would need identity resampled per body chunk plus a policy for
+    what to do when it changes mid-stream. That is an architectural decision at
+    Anthony's gate, not a patch, and it is not claimed here.
+
     A connection whose peer could NOT be resolved still gets a stamp — the
     FAILURE. That is deliberate: the alternative is an unstamped scope, which
     is indistinguishable from a TCP request and would be denied with the wrong
@@ -489,7 +513,9 @@ def _wrap_app(app, sock: socket.socket, accept_pid: int | None = None):
     `accept_pid` is carried alongside for provenance only. It never decides
     anything — it exists so the audit line can show that the process which
     OPENED the connection is not the process that sent the request, which is
-    the signature of a descriptor handoff and worth seeing in a log.
+    the signature of a descriptor handoff and worth seeing in a log. Both it
+    and `seat_pid` now actually REACH that line (D6): they used to survive here
+    and die at the auth context while README.md claimed they were recorded.
     """
 
     async def wrapped(scope, receive, send):

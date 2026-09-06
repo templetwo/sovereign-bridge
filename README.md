@@ -102,12 +102,27 @@ described to anyone:**
 1. **Readable environment only.** See the limitation below. A child that hides its own
    environment is attributed to its nearest readable ancestor, which is inheritance, not
    proof of the immediate caller's identity.
-2. **A connection is not an identity either.** A process can fork, or pass its connected
-   descriptor over `SCM_RIGHTS`, and a later request on the same socket comes from a
-   different process. The review demonstrated exactly that against the first version and
-   got a 200 under the parent's seat. Identity is therefore resolved **per request**, not
-   per connection: the sender of each request is the process it is attributed to, and the
-   connection's opener is recorded only as `accept_pid` in the audit line.
+2. **A connection is not an identity either, and neither is a request — quite.** A process
+   can fork, or pass its connected descriptor over `SCM_RIGHTS`, and a later request on the
+   same socket comes from a different process. The review demonstrated exactly that against
+   the first version and got a 200 under the parent's seat. Identity is therefore resolved
+   **per request**, not per connection, and that scenario is now a 401.
+   **The exact claim, corrected 2026-09-06: identity is the kernel-reported peer at ASGI
+   entry — not every process that contributed bytes to the stream.** Entry is after the
+   headers and before the body, so a parent that sends only the headers can hand the
+   descriptor to a differently-seated child which sends the body, and the request is
+   dispatched under the parent's seat (measured: parent pid 75471, child pid 75480, HTTP
+   200). The previous wording here — "the sender of each request is the process it is
+   attributed to" — was too strong. The bound is asserted by a passing test,
+   `test_a_body_sent_by_a_child_mid_request_is_attributed_to_the_ASGI_ENTRY_PEER`; closing
+   it needs identity resampled per body chunk plus a policy for a mid-stream change, which
+   is an architectural decision, not a patch.
+   Every seat audit line carries **three** pids: `pid` (who sent it, and decided the call),
+   `seat_pid` (whose environment named the seat — differs when the seat was inherited), and
+   `accept_pid` (who opened the connection — differs exactly when the descriptor changed
+   hands). They are on the **denial** line too, which is where they matter most. Until
+   2026-09-06 this README claimed `accept_pid` was recorded and it was not; it survived in
+   the protocol extension and died at the auth context.
 3. **Deliberate impersonation is not stopped.** Any process running as this user can spawn
    a child with whatever `SOVEREIGN_SEAT` it likes. That residual is asserted explicitly in
    `tests/test_seat_socket.py` rather than left as an assumption, and it cannot be closed
@@ -128,22 +143,63 @@ terminal's seat. That is what environment inheritance already means, and it is w
 
 **Scope — widened 2026-09-06 by Anthony's ruling, *"all studio seats are trusted."***
 A seat is not a scoped visitor; it is a terminal the operator started on his own machine.
-The surface is now
+The surface is
 
-    the stack's published tool surface  −  governance  −  what the stack retires
+    what the stack PUBLISHES right now  −  governance
 
-which is **48 of 100** published tools, up from the 19 a `read`+`write` session grant
-reaches. `where_did_i_leave_off` — the boot door every arriving seat is *told* to call, and
-which no seat but the master could reach — is among the tools this opens.
+which against the 2026-09-06 stack release is **49 of the 52 published tools**, up from the
+19 a `read`+`write` session grant reaches. `where_did_i_leave_off` — the boot door every
+arriving seat is *told* to call, and which no seat but the master could reach — is among the
+tools this opens.
+
+**One source, resolved at request time.** The published list is read from the stack's own
+registry (`RETIRED_TOOLS` + `list_tools`) when that module is importable, and otherwise
+fetched once per cache window through the bridge's own credential. This release deleted the
+two constants that used to stand in for it: a hand-copied 100-name surface and a 48-name
+"retired" set derived from a 30-day usage census, because the stack had no retirement of its
+own. It has one now, and a census measures disuse, not retirement. **If neither route
+answers, a seat request is a 503, never an allow-all and never a deny-all dressed as
+policy** — an authorization decision needs the published set, and the two defaults available
+without it are both lies. **Consequence worth stating: run this bridge against a stack that
+has retired nothing and a seat reaches everything that stack publishes minus governance.
+The seat surface is the stack's surface minus Anthony's, which is one more reason the stack
+deploys first.**
 
 **Governance is still Anthony's, and being trusted is not being him:** `set_policy`,
 `govern`, the protected drawer (`designate_protected`, `open_`/`decline_`/
 `list_protected_thresholds`), `resolve_thread` (by match), `retire_hypothesis`,
 `mint_token`, `revoke_token`, `audit_decoupling`, and the session-lifecycle pair
 `close_session` / `spiral_inherit`, which mutate global spiral state and stay as they were.
-`resolve_thread_by_id` is **allowed** — closing a thread by its id is a seat's ordinary act.
-Default-deny survives the widening: the base set is an enumeration of what the stack
-publishes, so a tool added upstream later is denied `unpublished` until it is added here.
+`resolve_thread_by_id` is **allowed** — closing a thread by its id is a seat's ordinary act,
+and so is `signal_ack`: acknowledging a signal is what a watch seat exists to do, and
+denying it left the designated watch seat with no closure path at all. Default-deny survives
+the widening: a name the stack does not publish is denied `unpublished`, never trusted by
+silence.
+
+**Protected material never reaches a seat.** Blocking `open_protected_record` by name was
+not the boundary it looked like — the drawer is a *designation*, not a door, and the review
+pulled a designated record's body and its archived stakes back through `inspect_claim`,
+`recall_insights` and `archive_exchange`. On the seat path the bridge now reads
+`<chronicle>/protected.jsonl` fresh per request and (a) refuses `inspect_claim` /
+`archive_exchange` for any designated claim or stakes-archive id, **including a prefix of
+one**, since both resolve prefixes upstream; (b) drops designated entries from every seat
+response and states the subtraction as `withheld_protected: <n>` — reported even when zero,
+because "the filter ran and removed nothing" and "the filter did not run" are different
+facts. An index that cannot be parsed shuts the whole seat path, exactly as an unreadable
+registry does. The master-token path is untouched.
+
+**`post_fix_verify` is classified by its arguments, not by its name.** For seats: no
+`command` probes (regardless of `POST_FIX_ALLOW_COMMAND` on the host — a boundary that holds
+only while another component is configured a certain way is not a boundary), `http` probes
+limited to GET/HEAD, `file_hash` probes confined to the sovereign root, an unknown probe type
+refused, and a `watch_id` must be one plain path segment.
+
+**The closer identity travels in-process, never as an argument.** `signal_ack` stamps who
+closed a signal; the bridge sets the verified seat on
+`sovereign_stack.dispatch_context` around the dispatch and resets it in a `finally`. A
+client supplying `actor`, `actor_seat`, `closed_by`, `owner` or `source_seat` is refused
+rather than overwritten, and a stack with no such module cannot serve `signal_ack` to a seat
+at all — a field trusted because of *who usually sets it* is not verified, it is assumed.
 
 **Signing:** the bridge *overrides* `source_instance` with the seat id on every call whose
 stack schema **declares** that field (`arrive`, `arrive_lineage`, `handoff`,
@@ -191,7 +247,10 @@ python3 stack_tokens.py list
 | `stack_tokens.py` | token CLI |
 | `sovereign_dashboard.py`, `dashboard/index.html` | activity monitors (terminal, web) |
 | `comms_dispatcher.py`, `comms_listener.sh` | legacy comms plumbing (the bulletin board is retired) |
-| `tests/`, `watchman/tests/` | pytest suites — arrival gate, session tokens, write-path, heartbeat, watchman |
+| `tests/`, `watchman/tests/` | pytest suites — arrival gate, session tokens, write-path, heartbeat, seat identity/socket/surface/protected/probes, watchman |
+| `conftest.py` | suite-wide isolation: synthetic credential file, no upstream transport, no live store, no TCP |
+| `suite_support.py` | the pinned seat surface + the measurement that checks it against the stack source |
+| `tests/isolation_audit.py` | proves the isolation above, by instrumenting a whole suite run |
 | `tests.py` | live-integration script; needs a running bridge |
 | `requirements.txt`, `requirements-dev.txt` | runtime / test dependencies |
 
