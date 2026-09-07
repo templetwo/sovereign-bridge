@@ -1,5 +1,76 @@
 # Changelog — Sovereign Bridge
 
+## 2026-09-07 — the arrival ask is parsed, or refused, never dropped
+
+- **THE SCOPE FIELD NOBODY AGREED ON.** `ArrivalRequest` declared
+  `requested_scope`; `MintRequest`, one screen up in the same file, calls the same
+  concept `scope`; the ntfy push and the confirm page printed the bare word "scope";
+  and `/api/discover` documented the arrival flow without ever naming a body field.
+  Pydantic ignores unknown fields, so `POST /api/arrival/request` with
+  `{"scope": ["read","write"]}` returned **201**, wrote a row holding `["read"]`,
+  pushed a tap that said `scope: read`, and released a read grant — with nothing on
+  any surface saying the ask had been discarded. On 2026-09-06 an outside seat
+  (Hermes desktop, grok-4.6) asked read+write twice, received read twice, and could
+  not tell why. Success reported on a partial, from code working exactly as written.
+- **Both halves are closed.** `scope` is now an accepted ALIAS of `requested_scope`
+  (both spellings sent with different values is a 422 naming both — guessing which
+  one the caller meant would be the same silent edit in a new costume), and unknown
+  fields are REFUSED (`extra="forbid"`) with a 422 whose message names every accepted
+  field. `ARRIVAL_REQUEST_FIELDS` is that list, and the model, the refusal and the
+  discover doc all read it, so a field cannot be added to one and missed by the other
+  two — and `/api/discover` RENDERS that constant rather
+  than holding a second copy, which is the half second-seat review (Grok) found untrue in
+  the first draft: `discover()` had its own four-key literal while the validator accepted
+  five, so the doc that exists to teach the `scope` alias never listed `scope`. The field
+  docs are now the one source and the tuple derives from them. That also converts the TTL half of the same divergence — a caller sending
+  `ttl_hours`, the mint endpoint's spelling — from a silent default into a loud 422.
+- **The reduction still happens; the silence does not.** `clamp_scope` is unchanged
+  (spec §4.1 behaviour: non-grantable entries dropped, empty → read) and lost the word
+  "silently" from its docstring. New `session_tokens.scope_report()` answers all three
+  questions at once — asked / granted / dropped — and the 201 response, the poll
+  response, the ntfy line and the confirm page all render it through ONE
+  `arrival_gate.describe_scope()`: *"requested read+write, would grant read+write"*,
+  *"requested nothing, default read"*, *"requested read+admin, would grant read
+  (dropped, not grantable: admin)"*. Two implementations could disagree about what was
+  asked for, which would put the seat and the human consenting for it on different
+  facts.
+- **A no-scope ask now records `[]`, not `["read"]`.** "Asked for read" and "asked for
+  nothing" are different events; the default still lands (documented behaviour,
+  unchanged) and the response says which happened.
+- **Duplicate suppression was the same fail-open one step over**, and it bites the
+  caller who spells the field correctly: a second ask within 60 s returns the first
+  pending row, discarding the new scope whole. Which ask wins is a behaviour question
+  above this change; being told is not, so the dup response now carries the pending
+  request's scopes and an explicit `ask_not_applied` note when the new ask differs.
+- **TTL clamping is reported to the caller** (`requested_ttl_hours` /
+  `granted_ttl_hours`) and deliberately NOT on the tap surfaces: those read the request
+  row, and the requested TTL is not persisted because `arrival_requests` is created
+  with `CREATE TABLE IF NOT EXISTS` — a new column would never reach an existing store
+  without a migration this change does not make.
+- **AND THE FIX ITSELF SHIPPED A LEAK, CAUGHT IN REVIEW AND MEASURED BOTH WAYS.**
+  FastAPI validates a declared body model BEFORE the handler runs, so `extra="forbid"`
+  answered a caller the gate is meant to be invisible to. With
+  `ARRIVAL_GATE_ENABLED=false`, measured: main returned 404 for an unknown field and
+  **422 naming the field for a wrong TYPE** (a pre-existing leak nobody had named); the
+  first draft of this change returned 422 **plus every accepted field name** for any
+  unknown field — a route-existence oracle on the public unauthenticated endpoint,
+  shipped by the commit that closed the fail-open. `arrival_gate.py`'s own header states
+  the invariant: *all routes 404 when the gate is disabled*. The body is now parsed
+  INSIDE the handler, after `_gate_or_404()`, so the gate decides first and all four
+  probe bodies return 404 — closing the widened leak and main's older one together. The
+  named cost: this route no longer contributes a body schema to the generated OpenAPI
+  doc (nothing in this house reads it; `/api/discover` is the real self-description).
+  Refusals follow the house envelope of the 429 beside them — `failure_class:
+  "malformed"` plus the accepted field list.
+  *`tests/test_arrival_gate.py`, 22 new tests. Measured against `357be83` with only the
+  tip's test file copied in: **17 red, 17 green** (the 12 pre-existing arrival tests, all
+  untouched but for one comment, plus 5 of the new ones that are green on main BY DESIGN —
+  3 measured-caller-body regression guards, and 2 of the 3 gate-off cases, main having
+  held that invariant for an unknown field and a disagreeing pair and broken it for a
+  wrong type). Full suite: **555 passed on the tip vs 533 on main**; `tests/isolation_audit.py`
+  exit 0 on both. This repo has no CI workflow, so those local counts are the whole record.*
+
+
 ## Release 2026-09-06, round 2 — the RC review's fixes
 
 Cross-substrate review of the release candidate at `e728255` (gpt-6-astra, Codex seat 3/3)

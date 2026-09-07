@@ -161,9 +161,42 @@ def clamp_ttl(ttl_hours: int | float | None) -> int:
 
 
 def clamp_scope(requested: list[str] | None) -> list[str]:
-    """Silently reduce to grantable scopes (spec §4.1). Empty → read."""
+    """Reduce to grantable scopes (behaviour per spec §4.1, unchanged). Empty → read.
+
+    The word "silently" was removed on 2026-09-07 and its removal is the whole
+    point of that commit: the reduction still happens exactly as it always did,
+    and the arrival flow now REPORTS it. §4.1 mandated the reduction; the
+    silence was this function's own addition, and a reduction nobody is told
+    about reports success on a partial — the fail-open class this house hunts.
+
+    Callers that must tell a seat what became of its ask use `scope_report()`.
+    """
     granted = [s for s in (requested or []) if s in GRANTABLE_SCOPES]
     return granted or ["read"]
+
+
+def scope_report(requested: list[str] | None) -> dict:
+    """What was asked, what would be granted, and what was dropped.
+
+    `clamp_scope` answers only the last of the three questions a caller has.
+    This answers all three, so the seat and the human deciding for it read the
+    same three facts off one computation.
+
+    `defaulted` is True when the ask was EMPTY. "requested nothing, default
+    read" and "requested read" are different events, and collapsing them is
+    how a seat that asked for write ends up unable to tell why it did not get
+    it — which is the report this endpoint owed an outside seat on 2026-09-06
+    and did not deliver.
+    """
+    asked = list(requested or [])
+    granted = clamp_scope(asked)
+    dropped = [s for s in asked if s not in GRANTABLE_SCOPES]
+    return {
+        "requested_scope": asked,
+        "granted_scope": granted,
+        "dropped_scope": dropped,
+        "defaulted": not asked,
+    }
 
 
 def mint(
