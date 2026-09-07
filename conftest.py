@@ -47,12 +47,31 @@ THE FOUR GUARANTEES, and the honest bound on the last:
      of the internet and false of the filesystem, and the isolation instrument
      (`tests/isolation_audit.py`) reports the two counts SEPARATELY rather than
      summing them into a reassuring zero.
-  5. ZERO READS OF ANTHONY'S LIVE `~/.sovereign` AS A VERDICT. Added 2026-09-06.
-     Guarantee 3 closed the WRITE side and left the read side open, and a read
-     decides tests too: `seat_identity.sovereign_root()` resolves
+  5. `SOVEREIGN_ROOT` IS REDIRECTED TO A TMP DIR FOR EVERY TEST. Added
+     2026-09-06. Guarantee 3 closed the WRITE side and left the read side open,
+     and a read decides tests too: `seat_identity.sovereign_root()` resolves
      `SOVEREIGN_ROOT` fresh per call and falls back to `~/.sovereign`, so any
      test that did not set it consulted the LIVE seat registry. See
      `_no_live_sovereign_root` for the failure that found it.
+
+     ⚠ AND THIS IS NOT "ZERO READS OF THE LIVE STORE" — THE HEADING SAYS WHAT
+     THE FIXTURE DOES, NOT WHAT ONE MIGHT WISH IT DID. An env-var redirect
+     reaches only the code that resolves through `sovereign_root()` /
+     `provenance.default_sovereign_root()`. It does NOT reach:
+       * a test that spells `Path.home() / ".sovereign"` itself —
+         `tests/test_heartbeat_aperture.py` did, which is why it had to be
+         rewritten rather than merely redirected;
+       * `sovereign_stack.gate_census`, which every `GET /api/heartbeat` in
+         this suite calls, and which reaches Anthony's live store through
+         `clients/bridge_core` (measured 2026-09-06: ~696 live opens per
+         heartbeat request, 41,064 across one full run — read-only, no verdict
+         in this suite depends on them today, and the resolution lives in
+         sovereign-stack, not here).
+     Writing "zero reads" here would be the shape guarantees 1-4 exist to
+     prevent: a surface claiming completeness it does not have.
+     `tests/isolation_audit.py` therefore COUNTS opens under the live root and
+     prints the number as its own field rather than asserting an absolute
+     nobody measured.
 """
 
 from __future__ import annotations

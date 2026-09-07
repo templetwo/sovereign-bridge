@@ -305,6 +305,16 @@ turned them into decisions D1–D10. Each is closed below with a test that fails
   fixture that redirects constants, and a read, so nothing was ever corrupted to give it
   away. **Guarantee 5** now points `SOVEREIGN_ROOT` at an empty tmp dir for every test;
   tests that set it themselves still win.
+- **AND THE GUARANTEE IS BOUNDED, NOT ASSERTED.** An env-var redirect reaches only code that
+  resolves through `sovereign_root()`; it cannot reach a test that hardcodes
+  `Path.home() / ".sovereign"` (one did — see below), and it does not reach
+  `sovereign_stack.gate_census`, which every `GET /api/heartbeat` in this suite calls and
+  which reads Anthony's live store through `clients/bridge_core`. **Measured 2026-09-06:
+  ~696 live opens per heartbeat request, 41,064 across one full suite run** — read-only, and
+  no verdict in this suite depends on them today. So `tests/isolation_audit.py` now COUNTS
+  opens under the live root and prints `live_sovereign_open_count` with a path sample, as its
+  own number that does not decide `clean`. A counted, bounded figure beats an absolute nobody
+  measured; the resolution for the gate-census path lives in sovereign-stack, not here.
 - **IT IMMEDIATELY FOUND A SECOND ONE.** `tests/test_heartbeat_aperture.py::TestItReportsTotalsNotJustCaps`
   globbed `~/.sovereign/comms/letters` and compared the count to the heartbeat's — and
   comparing the heartbeat's glob to the test's glob of the same directory is nearly vacuous:
