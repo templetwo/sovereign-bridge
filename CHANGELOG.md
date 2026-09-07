@@ -236,6 +236,35 @@ turned them into decisions D1–D10. Each is closed below with a test that fails
   flakiness.
   *`tests/test_session_scope_retirement.py`, 12 tests; `tests/test_seat_identity.py::test_a_seat_is_never_narrower_than_a_session_grant` amended — its two closing assertions pinned the last residue of this defect and are now inverted.*
 
+- **N4's DIAGNOSTIC COULD NEVER REACH THE DETAIL IT WAS WRITTEN TO CARRY.** Round 4 shipped
+  `_connect_refusal` to prefer the stack's own refusal sentence over httpx's paraphrase, and
+  in production it read nothing: the MCP SSE transport opens the door with
+  `httpx_sse.aconnect_sse` — a STREAMING request — and raises `raise_for_status()` inside
+  that context manager, so the body is unread at the raise and the response is CLOSED by the
+  time `call_mcp_tool` catches it. Measured on httpx 0.28.1: `.json()` and `.text` raise
+  `ResponseNotRead`, `.read()` and `.aread()` raise `StreamClosed`. `detail` therefore fell
+  back to `str(leaf)` — "Client error '400 Bad Request' for url …" — which names no seat, so
+  `named_seat` was always False and **every seat-name refusal was reported as
+  `stack_refused_session` with a message naming nothing.** The bytes are unrecoverable after
+  the fact, so the fix cannot live in the handler: `bridge._read_error_body`, an httpx
+  response event hook installed by `bridge._mcp_client_factory`, reads the body AT the
+  response, and only for status >= 400 (reading a 2xx would consume the SSE stream the
+  transport is about to iterate and hang the connection). All three `sse_client` call sites
+  take the factory, `_list_tools_raw` included — a test reads the source and counts them,
+  because the heartbeat's inventory fetch is exactly the path a reader forgets. The hook is
+  fail-QUIET, not fail-open: it decides nothing, and on an unreadable body the old fallback
+  still runs.
+  **The existing N4 tests could not have caught this** — they assert against a hand-made
+  response whose `.json()` simply works. Every test in the new file builds its 400 with
+  `stream=httpx.ByteStream(...)`, never `content=`, which is the difference between
+  reproducing the bug and testing a world where it cannot happen.
+  *`tests/test_sse_connect_refusal_body.py`, 10 tests. `conftest.py`'s blocked-SSE stub grew
+  `**kwargs`: pinned to the old two-argument signature it raises `TypeError`, which
+  `call_mcp_tool` classifies `stack` instead of `egress`, so every "the SSE server is down"
+  test would have gone green on a degradation path it never exercised.*
+
+---
+
 ---
 
 ### Also

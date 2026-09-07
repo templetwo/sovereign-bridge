@@ -33,7 +33,7 @@ def _fake_transport(monkeypatch, result):
     exactly as ClientSession does for isError results (it does not raise)."""
 
     @asynccontextmanager
-    async def fake_sse(url, headers=None):
+    async def fake_sse(url, headers=None, **kwargs):
         yield (None, None)
 
     class FakeSession:
@@ -107,7 +107,7 @@ def test_transport_exception_still_fails_closed(monkeypatch):
     transport keeps ok:false with a failure_class."""
 
     @asynccontextmanager
-    async def broken_sse(url, headers=None):
+    async def broken_sse(url, headers=None, **kwargs):
         raise ConnectionError("Connection refused")
         yield  # pragma: no cover
 

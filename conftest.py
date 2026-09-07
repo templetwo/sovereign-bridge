@@ -106,7 +106,15 @@ def _no_live_upstream(monkeypatch):
     if bridge is None:
         return
 
-    def _blocked_sse(url, headers=None):
+    def _blocked_sse(url, headers=None, **kwargs):
+        # ⚠ `**kwargs` IS LOAD-BEARING, NOT TIDINESS. `sse_client` takes
+        # `httpx_client_factory`, `timeout`, `sse_read_timeout` and `auth`, and
+        # the bridge now passes the first of those. A stub pinned to the old
+        # two-argument signature raises TypeError instead of UpstreamBlocked —
+        # which `call_mcp_tool` catches and classifies `stack` rather than
+        # `egress`, so every "the SSE server is down" test would go green on a
+        # degradation path it never exercised, and the block itself would be
+        # reporting the wrong failure while looking like it worked.
         raise UpstreamBlocked(
             f"SSE connection to {url!r} blocked by conftest.py: the suite does "
             "not talk to the live stack. Install a fake transport in the test."

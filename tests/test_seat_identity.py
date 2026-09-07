@@ -213,7 +213,7 @@ def sse_headers(monkeypatch):
     """
     seen = []
 
-    def fake_sse_client(url, headers=None):
+    def fake_sse_client(url, headers=None, **kwargs):
         seen.append({"url": url, "headers": headers})
         raise RuntimeError("recorded, not connected")
 
@@ -949,7 +949,7 @@ def test_a_stack_refusal_at_connect_is_named_not_wrapped_in_taskgroup_text(
             super().__init__("400 Bad Request")
             self.response = _Resp(400, {"detail": detail})
 
-    def boom(url, headers=None):
+    def boom(url, headers=None, **kwargs):
         raise ExceptionGroup("unhandled errors in a TaskGroup (1 sub-exception)", [_Refused()])
 
     monkeypatch.setattr(bridge, "sse_client", boom)
@@ -974,7 +974,7 @@ def test_a_refusal_that_is_not_about_the_seat_keeps_its_own_class(
             super().__init__("401 Unauthorized")
             self.response = _Resp(401, {"detail": "credential rejected"})
 
-    def boom(url, headers=None):
+    def boom(url, headers=None, **kwargs):
         raise ExceptionGroup("unhandled errors in a TaskGroup (1 sub-exception)", [_Refused()])
 
     monkeypatch.setattr(bridge, "sse_client", boom)
@@ -990,7 +990,7 @@ def test_a_genuine_network_failure_is_still_egress(sse_headers, monkeypatch):
     reclassifies every failure would be worse than the generic text it
     replaced."""
 
-    def boom(url, headers=None):
+    def boom(url, headers=None, **kwargs):
         raise ConnectionRefusedError("[Errno 61] Connection refused")
 
     monkeypatch.setattr(bridge, "sse_client", boom)
