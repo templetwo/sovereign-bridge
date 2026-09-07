@@ -332,14 +332,24 @@ turned them into decisions D1–D10. Each is closed below with a test that fails
   drains inside the ~0.6 s window is correctly read as live. Cost, named: a genuinely stale
   file delays a bridge start by ~0.6 s once, on a path about to be replaced anyway.
 - **THE RESIDUAL IS NAMED, NOT PAPERED OVER.** A backlog that stays full for the WHOLE window
-  is still read as dead — measured, 4 consecutive probes over ~600 ms all refused. The retry
+  is still read as dead — `socket_is_live` issues `PROBE_ATTEMPTS` (3) probes spaced
+  `PROBE_RETRY_INTERVAL_SECONDS` (0.3) apart, ~0.6 s in all, and against a permanently
+  saturated listener every one of them refuses (Grok measured 3 refusals over 617.8 ms). The retry
   narrows the race and does not close it: ECONNREFUSED carries nothing that separates the two
   cases, and macOS has no `/proc/net/unix` to ask a second way. Closing it needs different
   evidence (a pidfile the bridge owns, or a `libproc` walk), which is a design change and not
   this lane's to make. `test_RESIDUAL_a_permanently_saturated_backlog_still_reads_dead`
   asserts the CURRENT behaviour on purpose, so whoever closes the hole gets a red test as the
   notification.
-  *`tests/test_seat_socket_live_listener.py`, 23 tests, 20 of them red on `49f270d`. One,
+  *`tests/test_seat_socket_live_listener.py`, 24 tests. **19 red on `49f270d`** — not the 20
+  an earlier draft of this line claimed before the count was taken. ⚠ THE DENOMINATOR IS 23,
+  NOT 24: that measurement was taken when the file held 23 tests, and
+  `test_the_saturation_helper_refuses_an_empty_saturation` was added afterwards and is NOT in
+  it. Stated rather than rounded, because "19 of 24" would be a number nobody measured. The
+  four that pass on both are the two falsifiers (`test_a_stale_socket_file_is_still_replaced`,
+  `test_a_free_path_is_untouched`), `test_the_incident_path_is_named`, and
+  **`test_a_full_backlog_refuses_exactly_like_a_stale_file`** — which passes on `49f270d`
+  because it names no new symbol and asserts a fact about BSD, not about our code. One,
   `test_a_live_socket_is_never_stolen`, names no new symbol and swallows `OSError`, so on
   `49f270d` it runs to completion and fails on BEHAVIOUR — "the live socket's path was
   unlinked" — rather than on the fix being absent. Two more pin what was MEASURED rather

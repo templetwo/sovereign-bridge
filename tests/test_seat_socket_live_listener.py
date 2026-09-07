@@ -343,24 +343,77 @@ def _saturate(path, srv):
     """Fill `srv`'s backlog and return the held client sockets.
 
     Deterministic on this kernel BECAUSE the fixture uses `listen(1)`: the
-    first connect is queued, the second is refused. Asserted, not assumed — if
-    a future kernel queues more, the assertion says so instead of the test
-    quietly measuring nothing.
+    first connect is queued, the second is refused.
+
+    ⚠ AND BOTH HALVES OF THAT ARE ASSERTED HERE, NOT ASSUMED. An earlier
+    version of this helper claimed "asserted, not assumed" and asserted
+    nothing: it broke on the first non-zero `connect_ex` whatever that errno
+    was, and never checked that anything had been queued first. A run where
+    the very first connect failed — a wrong path, a listener that died — would
+    have produced an "empty saturation" and every test built on it would have
+    passed while measuring nothing. Caught by Grok's delta review.
+
+    So: at least one connect MUST have been queued, and the one that failed
+    MUST have failed with ECONNREFUSED — which is the whole premise, since
+    ECONNREFUSED from a live-but-full listener is what makes it
+    indistinguishable from a stale file.
     """
     held = []
+    refusal = None
     for _ in range(8):
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         c.settimeout(0.5)
-        if c.connect_ex(str(path)) == 0:
+        err = c.connect_ex(str(path))
+        if err == 0:
             held.append(c)
         else:
             c.close()
+            refusal = err
             break
     else:  # pragma: no cover — kernel change
         for c in held:
             c.close()
         pytest.skip("backlog never saturated on this kernel; the premise is gone")
+
+    def _fail(msg):  # pragma: no cover — only on a kernel/premise change
+        for c in held:
+            c.close()
+        pytest.fail(msg)
+
+    if not held:
+        _fail(
+            "nothing was ever queued, so this is not a SATURATED listener — "
+            f"the first connect already failed with {refusal} "
+            f"({errno.errorcode.get(refusal, refusal)}). The premise is gone; "
+            "do not read the tests below as measuring a full backlog."
+        )
+    if refusal != errno.ECONNREFUSED:
+        _fail(
+            f"a full backlog returned {refusal} "
+            f"({errno.errorcode.get(refusal, refusal)}), not ECONNREFUSED. The "
+            "ambiguity these tests exist for is gone on this kernel and the "
+            "retry logic should be re-derived, not left asserting BSD."
+        )
     return held
+
+
+def test_the_saturation_helper_refuses_an_empty_saturation(short_sock_path):
+    """THE FALSIFIER FOR `_saturate` ITSELF, and the reason it exists.
+
+    Grok's delta review found the helper claiming "asserted, not assumed" while
+    asserting nothing. A claim about a test helper is still a claim, and this
+    is what makes the new one checkable: point `_saturate` at a path with NO
+    listener and it must refuse loudly rather than hand back an empty `held`
+    that every test downstream would happily build on.
+    """
+    dead_path = short_sock_path()
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(dead_path))
+    srv.listen(1)
+    srv.close()  # a stale file: the first connect will be refused immediately
+    with pytest.raises(BaseException) as exc:
+        _saturate(dead_path, None)
+    assert "not a SATURATED listener" in str(exc.value)
 
 
 @pytest.fixture
@@ -430,9 +483,13 @@ def test_RESIDUAL_a_permanently_saturated_backlog_still_reads_dead(saturated_lis
     """⚠ THE HOLE THAT IS STILL OPEN, NAMED RATHER THAN PAPERED OVER.
 
     A listener whose backlog stays full for the ENTIRE window is still reported
-    dead, and `prepare_socket_path` would replace it. Measured: 4 consecutive
-    probes over ~600ms against a permanently saturated listener all return
-    ECONNREFUSED.
+    dead, and `prepare_socket_path` would replace it. `socket_is_live` issues
+    `PROBE_ATTEMPTS` probes spaced `PROBE_RETRY_INTERVAL_SECONDS` apart — 3
+    over ~0.6s as configured — and against a permanently saturated listener
+    every one of them returns ECONNREFUSED. (An earlier draft of this docstring
+    said "4 consecutive probes", a number taken from the throwaway experiment
+    script that measured the KERNEL before the retry existed, not from the
+    function. The assertion below counts against the constant instead.)
 
     THE RETRY NARROWS THIS RACE; IT DOES NOT CLOSE IT, and this test exists so
     nobody reads the retry as a fix it is not. ECONNREFUSED carries nothing

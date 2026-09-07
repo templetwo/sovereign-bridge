@@ -698,8 +698,11 @@ def prepare_socket_path(path: Path) -> Path:
                 "replacing it would leave that process alive, holding a "
                 "descriptor on a nameless inode, and unreachable to every "
                 "seat. Stop that process first, or point SOVEREIGN_ROOT "
-                "somewhere else. (A socket that cannot be probed counts as "
-                "live: only a refused connection proves nobody is there.)"
+                "somewhere else. (Anything but a refusal counts as live, and "
+                f"ONE refusal is not enough either: a path is called dead only "
+                f"after {PROBE_ATTEMPTS} probes {PROBE_RETRY_INTERVAL_SECONDS}s "
+                "apart ALL refuse, because on BSD a live listener with a full "
+                "backlog refuses exactly like a stale file.)"
             )
         path.unlink()
     return path
