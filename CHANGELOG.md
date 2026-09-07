@@ -265,6 +265,29 @@ turned them into decisions D1–D10. Each is closed below with a test that fails
 
 ---
 
+- **THE BRIDGE ANSWERED 3xx, AND ITS CONTRACT SAYS IT NEVER DOES.** The web seat's
+  field-level contract of the MCP shim (chronicle domain
+  `temple-harness,stack-readiness,mcp-shim-contract,hq-lane,substrate-carries,2026-09-06`)
+  requires that this door never redirect. HQ measured `POST /api/call/` returning **HTTP
+  307** on the live bridge — Starlette's `redirect_slashes`, on by default. `FastAPI(...,
+  redirect_slashes=False)`: the trailing-slash form now answers 404, indistinguishable from
+  any other unknown path.
+  **A CONTRACT FIX, NOT A BEHAVIOUR CHANGE FOR ANY KNOWN CLIENT** — the shim refuses every
+  3xx and never follows one, so it already failed closed against the 307 and nothing that
+  works today stops working. It still matters: a 307 preserves method and body, so a client
+  that DOES follow re-sends its `Authorization` header and the whole call to whatever
+  `Location` names, which makes a redirect from an authenticated tool endpoint a
+  credential-forwarding instruction — and the callers here hold scoped session grants.
+  The flag is app-wide, so its one risk is asserted rather than assumed: a route DEFINED
+  with a trailing slash would stop answering its non-slash form. Only `@app.get("/")` is,
+  the root is unaffected, the app mounts nothing and includes no router, and a test fails if
+  that ever changes.
+  *`tests/test_no_slash_redirects.py`, 18 tests — every request passes
+  `follow_redirects=False`, because TestClient follows by default and would turn a
+  307-then-404 into a bare 404 and pass against the unfixed app.*
+
+---
+
 ---
 
 ### Also

@@ -1206,7 +1206,37 @@ async def lifespan(app: FastAPI):
 
 
 # === App ===
-app = FastAPI(title="Sovereign Bridge", version=VERSION, lifespan=lifespan)
+#
+# ⚠ `redirect_slashes=False` IS A CONTRACT TERM, NOT A PREFERENCE.
+#
+# Starlette redirects a path that misses by exactly one trailing slash to the
+# one that matches: `POST /api/call/` answered **HTTP 307** on the live bridge,
+# measured 2026-09-06. The MCP shim's field-level contract says this door never
+# redirects, and the shim enforces it by refusing every 3xx rather than
+# following one — so it already failed closed and no known client changes
+# behaviour here. What changes is what the bridge SAYS: the slash form now
+# answers 404 (`failure_class: "malformed"`, via the house HTTPException
+# handler) instead of pointing somewhere else.
+#
+# WHY A REDIRECT IS THE WRONG ANSWER FROM AN AUTHENTICATED TOOL ENDPOINT, and
+# it is not pedantry: a 307 preserves the method and body, so a client that
+# follows one re-sends the Authorization header and the whole call to whatever
+# `Location` names. That makes the redirect a credential-forwarding
+# instruction, and this door's callers are seats holding scoped grants. A
+# client that follows is one Location header away from sending a token
+# somewhere nobody audited; a client that does not follow (the shim) gets a
+# 3xx it has no way to interpret. Neither is a service. 404 is.
+#
+# EVERY ROUTE IN THIS FILE IS DEFINED WITHOUT A TRAILING SLASH (checked: only
+# `@app.get("/")` has one, and the root path is unaffected), and the app mounts
+# nothing and includes no router — so this flips exactly one behaviour and
+# strands no path. `tests/test_no_slash_redirects.py` asserts both.
+app = FastAPI(
+    title="Sovereign Bridge",
+    version=VERSION,
+    lifespan=lifespan,
+    redirect_slashes=False,
+)
 
 
 @app.exception_handler(HTTPException)
