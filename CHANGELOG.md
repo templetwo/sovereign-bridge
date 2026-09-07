@@ -288,6 +288,33 @@ turned them into decisions D1–D10. Each is closed below with a test that fails
 
 ---
 
+### Also, out of the lane — the suite decided against Anthony's live state
+
+- **A TEST WENT RED WITH NO COMMIT.** `tests/test_seat_socket.py::test_a_child_declaring_a_seat_its_environment_does_not_name_is_denied`
+  passed on the morning of 2026-09-06 and failed the same afternoon on identical source.
+  Nothing in this repo moved: Anthony added `grok-build-studio` to
+  `~/.sovereign/hq/seats/registry.json` (mtime 15:15) and the test's own FALSIFIER — "the
+  same stamp, declaring truthfully, stops on the NEXT condition instead" — stopped holding,
+  because the next condition is `enabled` and the live registry now says true. Measured on
+  `49f270d`: **466 passed / 1 failed on this machine at this hour**, which is why the lane's
+  467 no longer reproduces.
+  The class is the one SOP #12's closing bullet names after `a6f42cf` and `28592c7`: a suite
+  deciding against production state. This release's own `conftest.py` closed the WRITE half
+  (guarantee 3) and left this half open, because `seat_identity.sovereign_root()` is a
+  FUNCTION reading `SOVEREIGN_ROOT` rather than a module-level constant — invisible to a
+  fixture that redirects constants, and a read, so nothing was ever corrupted to give it
+  away. **Guarantee 5** now points `SOVEREIGN_ROOT` at an empty tmp dir for every test;
+  tests that set it themselves still win.
+- **IT IMMEDIATELY FOUND A SECOND ONE.** `tests/test_heartbeat_aperture.py::TestItReportsTotalsNotJustCaps`
+  globbed `~/.sovereign/comms/letters` and compared the count to the heartbeat's — and
+  comparing the heartbeat's glob to the test's glob of the same directory is nearly vacuous:
+  both sides can be zero, or wrong the same way, and it still passes. Rewritten against a
+  synthetic root with known, mutually different per-bucket counts, plus a falsifier asserting
+  that an EMPTY root yields `status: "unmeasured"` with no surfaces rather than a set of
+  confident zeros — which is the aperture's own thesis turned on the test that measures it.
+
+---
+
 ---
 
 ### Also

@@ -47,6 +47,12 @@ THE FOUR GUARANTEES, and the honest bound on the last:
      of the internet and false of the filesystem, and the isolation instrument
      (`tests/isolation_audit.py`) reports the two counts SEPARATELY rather than
      summing them into a reassuring zero.
+  5. ZERO READS OF ANTHONY'S LIVE `~/.sovereign` AS A VERDICT. Added 2026-09-06.
+     Guarantee 3 closed the WRITE side and left the read side open, and a read
+     decides tests too: `seat_identity.sovereign_root()` resolves
+     `SOVEREIGN_ROOT` fresh per call and falls back to `~/.sovereign`, so any
+     test that did not set it consulted the LIVE seat registry. See
+     `_no_live_sovereign_root` for the failure that found it.
 """
 
 from __future__ import annotations
@@ -156,6 +162,43 @@ def _no_live_stores(monkeypatch, tmp_path_factory):
         monkeypatch.setattr(
             session_tokens, "DB_PATH", root / "session_tokens.db", raising=False
         )
+
+
+@pytest.fixture(autouse=True)
+def _no_live_sovereign_root(monkeypatch, tmp_path_factory):
+    """`SOVEREIGN_ROOT` points at an empty tmp dir unless a test says otherwise.
+
+    ⚠ FOUND BY A TEST THAT WENT RED WITHOUT A COMMIT.
+    `tests/test_seat_socket.py::test_a_child_declaring_a_seat_its_environment_does_not_name_is_denied`
+    passed on 2026-09-06 morning and failed the same afternoon on the same
+    source. Nothing in this repo moved: Anthony added `grok-build-studio` to
+    `~/.sovereign/hq/seats/registry.json` (mtime 15:15) and the test's own
+    FALSIFIER — "the same stamp, declaring truthfully, stops on the NEXT
+    condition instead" — stopped holding, because the next condition is
+    `registry["seats"][seat_id]["enabled"]` and the live registry now says
+    True. `resolve_seat` returned ok and `pytest.raises` saw no raise.
+
+    That is the class SOP #12's closing bullet named after `a6f42cf`
+    (sovereign-stack boot tests asserting against the live protected drawer)
+    and `28592c7` (a token-DB test writing 14 real chronicle records): a suite
+    deciding against Anthony's production state. Guarantee 3 closed the WRITE
+    half of it here in the same release and left this half open, because
+    `sovereign_root()` is a FUNCTION reading an env var rather than a
+    module-level constant — so it was invisible to a fixture that redirects
+    constants, and it is a read, so nothing was ever corrupted to give it away.
+
+    Autouse and suite-wide for the reason `_no_live_stores` gives verbatim: a
+    per-test opt-in is not isolation, it is a convention, and a convention is
+    only as good as the next author's memory. Most tests here already set
+    `SOVEREIGN_ROOT` themselves; their `monkeypatch.setenv` still wins, which
+    is the intended order. What changes is the default for the ones that do
+    not — an EMPTY directory, so an unset test gets "no registry" (the switch's
+    documented off position) rather than whatever Anthony's machine happens to
+    hold this hour.
+    """
+    monkeypatch.setenv(
+        "SOVEREIGN_ROOT", str(tmp_path_factory.mktemp("sovereign-root-isolation"))
+    )
 
 
 @pytest.fixture(autouse=True)
