@@ -1,5 +1,51 @@
 # Changelog — Sovereign Bridge
 
+## 2026-09-07 — the arrival ask is parsed, or refused, never dropped
+
+- **THE SCOPE FIELD NOBODY AGREED ON.** `ArrivalRequest` declared
+  `requested_scope`; `MintRequest`, one screen up in the same file, calls the same
+  concept `scope`; the ntfy push and the confirm page printed the bare word "scope";
+  and `/api/discover` documented the arrival flow without ever naming a body field.
+  Pydantic ignores unknown fields, so `POST /api/arrival/request` with
+  `{"scope": ["read","write"]}` returned **201**, wrote a row holding `["read"]`,
+  pushed a tap that said `scope: read`, and released a read grant — with nothing on
+  any surface saying the ask had been discarded. On 2026-09-06 an outside seat
+  (Hermes desktop, grok-4.6) asked read+write twice, received read twice, and could
+  not tell why. Success reported on a partial, from code working exactly as written.
+- **Both halves are closed.** `scope` is now an accepted ALIAS of `requested_scope`
+  (both spellings sent with different values is a 422 naming both — guessing which
+  one the caller meant would be the same silent edit in a new costume), and unknown
+  fields are REFUSED (`extra="forbid"`) with a 422 whose message names every accepted
+  field. `ARRIVAL_REQUEST_FIELDS` is that list, and the model, the refusal and the
+  discover doc all read it, so a field cannot be added to one and missed by the other
+  two. That also converts the TTL half of the same divergence — a caller sending
+  `ttl_hours`, the mint endpoint's spelling — from a silent default into a loud 422.
+- **The reduction still happens; the silence does not.** `clamp_scope` is unchanged
+  (spec §4.1 behaviour: non-grantable entries dropped, empty → read) and lost the word
+  "silently" from its docstring. New `session_tokens.scope_report()` answers all three
+  questions at once — asked / granted / dropped — and the 201 response, the poll
+  response, the ntfy line and the confirm page all render it through ONE
+  `arrival_gate.describe_scope()`: *"requested read+write, would grant read+write"*,
+  *"requested nothing, default read"*, *"requested read+admin, would grant read
+  (dropped, not grantable: admin)"*. Two implementations could disagree about what was
+  asked for, which would put the seat and the human consenting for it on different
+  facts.
+- **A no-scope ask now records `[]`, not `["read"]`.** "Asked for read" and "asked for
+  nothing" are different events; the default still lands (documented behaviour,
+  unchanged) and the response says which happened.
+- **Duplicate suppression was the same fail-open one step over**, and it bites the
+  caller who spells the field correctly: a second ask within 60 s returns the first
+  pending row, discarding the new scope whole. Which ask wins is a behaviour question
+  above this change; being told is not, so the dup response now carries the pending
+  request's scopes and an explicit `ask_not_applied` note when the new ask differs.
+- **TTL clamping is reported to the caller** (`requested_ttl_hours` /
+  `granted_ttl_hours`) and deliberately NOT on the tap surfaces: those read the request
+  row, and the requested TTL is not persisted because `arrival_requests` is created
+  with `CREATE TABLE IF NOT EXISTS` — a new column would never reach an existing store
+  without a migration this change does not make.
+  *`tests/test_arrival_gate.py`, 13 new tests, every one of them red on `357be83`.*
+
+
 ## Release 2026-09-06, round 2 — the RC review's fixes
 
 Cross-substrate review of the release candidate at `e728255` (gpt-6-astra, Codex seat 3/3)

@@ -109,6 +109,36 @@ def _expire_stale(conn: sqlite3.Connection) -> None:
     )
 
 
+def describe_scope(requested: list[str] | None, granted: list[str] | None) -> str:
+    """One sentence naming the ask AND the grant, for every human surface.
+
+    ⚠ ONE IMPLEMENTATION, THREE SURFACES, ON PURPOSE. This string is what the
+    POST response tells the seat, what the ntfy push tells Anthony's phone, and
+    what the confirm page tells him again before he taps. Two implementations
+    could disagree about what was asked for, which would put the seat and the
+    human who is consenting FOR that seat on different facts — the failure this
+    whole change exists to close.
+
+    "requested read+write, would grant read+write" · "requested nothing,
+    default read" · "requested read+admin, would grant read (dropped, not
+    grantable: admin)".
+    """
+    grant = list(granted or ["read"])
+    if requested is None:
+        # ⚠ NOT THE SAME AS AN EMPTY ASK. None means nobody measured the ask —
+        # a caller that omitted the key — and answering "requested nothing" to
+        # that would put a fact on Anthony's phone that this function invented.
+        return f"would grant {'+'.join(grant)} (ask not recorded)"
+    asked = list(requested)
+    if not asked:
+        return "requested nothing, default read"
+    line = f"requested {'+'.join(asked)}, would grant {'+'.join(grant)}"
+    dropped = [s for s in asked if s not in st.GRANTABLE_SCOPES]
+    if dropped:
+        line += f" (dropped, not grantable: {'+'.join(dropped)})"
+    return line
+
+
 def create_request(
     source_instance: str | None,
     seat_description: str | None,
@@ -119,24 +149,49 @@ def create_request(
     """Create a pending arrival request. Raises ValueError('rate_limited')
     over the caps (spec §12)."""
     now = _now()
+    report = st.scope_report(requested_scope)
+    granted_ttl = st.clamp_ttl(requested_ttl_hours)
     with _connect() as conn:
         _expire_stale(conn)
         # Duplicate suppression: same instance+IP within 60s reuses pending.
         dup = conn.execute(
-            "SELECT rid, code FROM arrival_requests WHERE status='pending'"
+            "SELECT rid, code, requested_scope, granted_scope FROM arrival_requests"
+            " WHERE status='pending'"
             " AND source_instance IS ? AND requester_ip IS ?"
             " AND CAST(strftime('%s', created_at) AS REAL) > ?",
             (source_instance, requester_ip, now.timestamp() - DUP_SUPPRESS_SECONDS),
         ).fetchone()
         if dup:
-            return {
+            # ⚠ THE SUPPRESSED ASK IS THE SAME FAIL-OPEN ONE STEP OVER, and it
+            # bites the caller who spells the field CORRECTLY. Asking read,
+            # then asking read+write 20 seconds later, returns the first row —
+            # so the second ask is discarded whole. Which scope wins is a
+            # behaviour question above this change; being told is not.
+            pending_requested = json.loads(dup["requested_scope"] or "[]")
+            pending_granted = json.loads(dup["granted_scope"] or "[]")
+            out = {
                 "arrival_request_id": dup["rid"],
                 "code": dup["code"],
                 "status": "pending",
                 "poll_interval_seconds": POLL_INTERVAL_SECONDS,
                 "expires_in_seconds": PENDING_WINDOW_SECONDS,
                 "duplicate_of_recent_request": True,
+                "requested_scope": pending_requested,
+                "granted_scope": pending_granted,
+                "dropped_scope": [
+                    s for s in pending_requested if s not in st.GRANTABLE_SCOPES
+                ],
+                "scope_note": describe_scope(pending_requested, pending_granted),
             }
+            if report["requested_scope"] != pending_requested:
+                out["ask_not_applied"] = True
+                out["note"] = (
+                    "This ask was NOT applied. A request from the same instance "
+                    f"and IP is already pending and asks {describe_scope(pending_requested, pending_granted)}; "
+                    f"this call asked {'+'.join(report['requested_scope']) or 'nothing'}. "
+                    "Let the pending request expire or be decided, then ask again."
+                )
+            return out
         pending = conn.execute(
             "SELECT COUNT(*) c FROM arrival_requests WHERE status='pending'"
         ).fetchone()["c"]
@@ -161,9 +216,9 @@ def create_request(
                 code,
                 source_instance,
                 seat_description,
-                json.dumps(requested_scope or []),
-                json.dumps(st.clamp_scope(requested_scope)),
-                st.clamp_ttl(requested_ttl_hours),
+                json.dumps(report["requested_scope"]),
+                json.dumps(report["granted_scope"]),
+                granted_ttl,
                 "pending",
                 now.isoformat(),
                 requester_ip,
@@ -175,6 +230,20 @@ def create_request(
         "status": "pending",
         "poll_interval_seconds": POLL_INTERVAL_SECONDS,
         "expires_in_seconds": PENDING_WINDOW_SECONDS,
+        # The ask and the grant, side by side, in the FIRST response the seat
+        # gets. Before this, a seat asking read+write received 201 and a read
+        # grant with nothing anywhere saying so.
+        "requested_scope": report["requested_scope"],
+        "granted_scope": report["granted_scope"],
+        "dropped_scope": report["dropped_scope"],
+        "scope_note": describe_scope(report["requested_scope"], report["granted_scope"]),
+        # TTL is clamped by the same kind of quiet reduction (clamp_ttl). The
+        # requested value is NOT persisted — the arrival_requests table is
+        # created with CREATE TABLE IF NOT EXISTS, so a new column would never
+        # reach an existing store without a migration — so it is reported here,
+        # where the caller is, and not on the tap surfaces, which read the row.
+        "requested_ttl_hours": requested_ttl_hours,
+        "granted_ttl_hours": granted_ttl,
         "instructions": (
             f"Tell Anthony your code is '{code}' in the conversation, then poll "
             f"GET /api/arrival/poll/{rid} every {POLL_INTERVAL_SECONDS}s."
@@ -293,6 +362,13 @@ def poll(rid: str) -> dict:
         "session_token": minted["session_token"],  # the one appearance
         "token_id": minted["token_id"],
         "scope": minted["scope"],
+        # The seat asked once, minutes ago, and this is the last thing it reads
+        # before it starts working. Carrying only the grant here is how "I asked
+        # for write twice and got read twice and could not tell why" happens.
+        "requested_scope": json.loads(row["requested_scope"] or "[]"),
+        "scope_note": describe_scope(
+            json.loads(row["requested_scope"] or "[]"), minted["scope"]
+        ),
         "expires_at": minted["expires_at"],
         "grant": {
             "code": row["code"],
@@ -329,7 +405,7 @@ def build_ntfy_message(req: dict, base_url: str) -> dict:
         "message": (
             f"{req.get('source_instance') or 'unknown instance'} — "
             f"{req.get('seat_description') or 'no seat description'}\n"
-            f"scope: {'+'.join(req.get('granted_scope') or ['read'])} · "
+            f"{describe_scope(req.get('requested_scope'), req.get('granted_scope'))} · "
             f"TTL {req.get('ttl_hours')}h · ip {req.get('requester_ip') or '?'}\n"
             f"Tap Approve or Deny to open the decision page. Match this code "
             f"against the one claimed in your conversation first."
@@ -352,7 +428,7 @@ CONFIRM_PAGE = """<!doctype html><html><head><meta name="viewport" content="widt
 <body style="font-family:-apple-system,sans-serif;max-width:26em;margin:3em auto;text-align:center">
 <h2>Arrival request</h2>
 <p style="font-size:1.6em;letter-spacing:.05em"><b>{code}</b></p>
-<p>{source} — {seat}<br>scope {scope} · TTL {ttl}h</p>
+<p>{source} — {seat}<br>{scope} · TTL {ttl}h</p>
 <p>Match this code against the one claimed in the conversation before deciding.</p>
 <form method="post" action="/api/arrival/decide?rid={rid}&amp;action={action}&amp;exp={exp}&amp;sig={sig}">
 <button type="submit" style="font-size:1.2em;padding:.6em 2em">{label}</button>

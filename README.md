@@ -294,6 +294,21 @@ the stack's own words) rather than arriving as a TaskGroup wrapper.
 A tokenless seat earns a scoped key with a human tap, instead of being handed the master token.
 
 1. The seat `POST /api/arrival/request` with its model line + a one-line description → gets a two-word code (e.g. `harbor-juniper`).
+
+   ```json
+   {"source_instance": "hermes-desktop — grok-4.6",
+    "seat_description": "outside seat, needs to file one insight",
+    "requested_scope": ["read", "write"],
+    "requested_ttl_hours": 12}
+   ```
+
+   `scope` is an accepted alias of `requested_scope`; sending both with different
+   values is a 422. Any OTHER field name is refused with a 422 naming the accepted
+   ones, rather than ignored — before 2026-09-07 a misnamed scope field was dropped in
+   silence and the caller got a 201 and a read grant with nothing saying why. The 201
+   carries `requested_scope` / `granted_scope` / `dropped_scope` / `scope_note`, and the
+   push and the confirm page carry the same sentence, so the seat and the human deciding
+   for it read the same three facts.
 2. The phone gets an ntfy push with Approve/Deny; the seat says its code in the conversation so the human can match it.
 3. On Approve, the seat's next poll mints and releases a scoped session token **exactly once** — plaintext exists in that one response and nowhere else; the store holds sha256 only.
 

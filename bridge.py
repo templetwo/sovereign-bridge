@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Header, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, model_validator
 
 import httpx
 
@@ -1364,6 +1364,20 @@ async def discover():
             "comms_send": {"method": "POST", "path": "/api/comms/send", "body": {"sender": "string", "content": "string", "channel": "general"}, "auth": True, "note": "Demoted in v1.3.3 — chronicle won the correspondence layer race; prefer record_insight."},
             "comms_read": {"method": "GET", "path": "/api/comms/read?channel=general&limit=10", "auth": True, "note": "Demoted in v1.3.3."},
             "discover": {"method": "GET", "path": "/api/discover", "auth": False},
+            "arrival_request": {
+                "method": "POST",
+                "path": "/api/arrival/request",
+                "auth": False,
+                "body": {
+                    "source_instance": "string, OPTIONAL — your seat and model line, e.g. 'hermes-desktop — grok-4.6'",
+                    "seat_description": "string, OPTIONAL — one line on who you are and what you need",
+                    "requested_scope": "list[str], OPTIONAL — any of read | write | session. Alias: 'scope' is accepted and means the same field; sending BOTH with different values is a 422, never a guess. Omit it and you get the documented default, read, and the response says the ask was empty.",
+                    "requested_ttl_hours": f"int, OPTIONAL — default {st.TTL_DEFAULT_HOURS}, clamped to {st.TTL_MIN_HOURS}..{st.TTL_MAX_HOURS}. NOTE the name: the mint endpoint next door calls its own field 'ttl_hours', this one does not.",
+                },
+                "on_unknown_field": "422 whose message names every accepted field. Unknown fields are REFUSED, not ignored — before 2026-09-07 a misnamed scope field was dropped in silence and the caller got 201 and a read grant with nothing saying why.",
+                "response": "201 with arrival_request_id, a two-word code, and requested_scope / granted_scope / dropped_scope / scope_note — what you asked for, what a tap would grant you, and what was not grantable. The same sentence goes to the phone that decides.",
+                "note": "The Door That Asks: you get a code, Anthony's phone gets the same code, he taps, your next poll of GET /api/arrival/poll/{arrival_request_id} returns a scoped session token exactly once.",
+            },
         },
         "boot_ritual": {
             "step_0": "GET /api/heartbeat — verify the stack is alive (no auth).",
@@ -2333,11 +2347,86 @@ import approval_gate as apg
 from fastapi.responses import HTMLResponse, JSONResponse
 
 
+# Every body field this endpoint accepts, in the 422 that names them. The
+# tuple is the single source: the model, the refusal message and the
+# /api/discover doc all read it, so a field cannot be added to one and missing
+# from the other two.
+ARRIVAL_REQUEST_FIELDS = (
+    "source_instance",
+    "seat_description",
+    "requested_scope",
+    "scope",
+    "requested_ttl_hours",
+)
+
+
 class ArrivalRequest(BaseModel):
+    """The tokenless seat's ask — parsed, or refused, but never dropped.
+
+    ⚠ WHY extra="forbid" AND WHY `scope` IS AN ALIAS. Pydantic ignores unknown
+    fields by default, and this model called the field `requested_scope` while
+    the mint endpoint next door calls the same concept `scope`, the ntfy line
+    printed the word "scope", and /api/discover documented the flow without
+    ever naming a body field. On 2026-09-06 an outside seat sent
+    `{"scope": ["read","write"]}` twice, got 201 twice, got a read grant twice,
+    and had nothing anywhere telling it the ask had been discarded — success
+    reported on a partial, from a model that was working exactly as written.
+
+    Both halves of the fix are here: the spelling the caller reached for is
+    ACCEPTED, and any spelling nobody accepts is REFUSED with the accepted
+    names in the message. Refusing beats ignoring for the reason the temple
+    harness independently reached on its own clamp: a dropped field reads as an
+    honoured one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     source_instance: Optional[str] = None
     seat_description: Optional[str] = None
-    requested_scope: list[str] = ["read"]
+    # No ["read"] default here any more: the DEFAULT still lands (clamp_scope
+    # turns an empty ask into read, documented behaviour, unchanged), but this
+    # model must be able to tell "asked for read" from "asked for nothing" so
+    # the response can say which happened.
+    requested_scope: Optional[list[str]] = None
+    scope: Optional[list[str]] = None
     requested_ttl_hours: int = st.TTL_DEFAULT_HOURS
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_unknown_and_conflicting(cls, data):
+        """Unknown fields first, then the both-spellings conflict.
+
+        The order is deliberate: a caller who both misnames a field AND sends
+        both scope spellings needs the accepted-names list, which is the
+        message that lets it fix everything in one pass.
+        """
+        if not isinstance(data, dict):
+            return data
+        unknown = sorted(k for k in data if k not in ARRIVAL_REQUEST_FIELDS)
+        if unknown:
+            raise ValueError(
+                "unknown field(s): "
+                + ", ".join(unknown)
+                + ". This endpoint accepts only: "
+                + ", ".join(ARRIVAL_REQUEST_FIELDS)
+                + " ('scope' is an accepted alias of 'requested_scope'). "
+                "Refused rather than ignored — a dropped field reads as an "
+                "honoured one."
+            )
+        asked, alias = data.get("requested_scope"), data.get("scope")
+        if asked is not None and alias is not None and asked != alias:
+            raise ValueError(
+                "requested_scope and its alias scope were both sent and "
+                f"disagree: requested_scope={asked!r} vs scope={alias!r}. "
+                "Send one of them, or send the same value in both — guessing "
+                "which you meant is exactly the silent edit this endpoint no "
+                "longer makes."
+            )
+        return data
+
+    def effective_scope(self) -> list[str] | None:
+        """The ask under either spelling. None means nothing was asked for."""
+        return self.requested_scope if self.requested_scope is not None else self.scope
 
 
 def _gate_or_404():
@@ -2374,7 +2463,7 @@ async def arrival_request(req: ArrivalRequest, request: Request):
         created = ag.create_request(
             source_instance=req.source_instance,
             seat_description=req.seat_description,
-            requested_scope=req.requested_scope,
+            requested_scope=req.effective_scope(),
             requested_ttl_hours=req.requested_ttl_hours,
             requester_ip=ip,
         )
@@ -2391,6 +2480,7 @@ async def arrival_request(req: ArrivalRequest, request: Request):
                     **created,
                     "source_instance": row.get("source_instance"),
                     "seat_description": row.get("seat_description"),
+                    "requested_scope": json.loads(row.get("requested_scope") or "[]"),
                     "granted_scope": json.loads(row.get("granted_scope") or "[]"),
                     "ttl_hours": row.get("ttl_hours"),
                     "requester_ip": row.get("requester_ip"),
@@ -2475,7 +2565,15 @@ async def arrival_decide_confirm(rid: str, action: str, exp: int, sig: str):
             code=_html.escape(row["code"]),
             source=_html.escape(row.get("source_instance") or "unknown instance"),
             seat=_html.escape(row.get("seat_description") or "no seat description"),
-            scope=_html.escape("+".join(json.loads(row.get("granted_scope") or "[]"))),
+            # The ask AND the grant, from arrival_gate's one implementation —
+            # the phone screen shows what the ntfy line showed and what the
+            # seat was told, so consent is given on the same three facts.
+            scope=_html.escape(
+                ag.describe_scope(
+                    json.loads(row.get("requested_scope") or "[]"),
+                    json.loads(row.get("granted_scope") or "[]"),
+                )
+            ),
             ttl=_html.escape(str(row.get("ttl_hours"))),
             label=_html.escape(action.capitalize()),
         )
