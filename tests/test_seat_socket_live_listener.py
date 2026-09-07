@@ -38,6 +38,8 @@ import errno
 import os
 import socket
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -296,10 +298,14 @@ def test_a_real_unprobeable_path_counts_as_LIVE():
 def test_an_unprobeable_socket_counts_as_LIVE(monkeypatch, short_sock_path, err):
     """⚠ FAIL CLOSED, AND THIS IS THE ASSERTION THAT SAYS SO.
 
-    ECONNREFUSED is the ONLY answer that proves nobody is listening. A full
-    backlog times out; a permissions problem raises EACCES. Reading either as
-    "dead" would unlink a socket somebody is serving on — the exact 21:51
-    failure, reached by a different road. Unsure must mean live.
+    A permissions problem raises EACCES; an over-long path raises outright.
+    Reading either as "dead" would unlink a socket somebody is serving on — the
+    exact 21:51 failure, reached by a different road. Unsure must mean live.
+
+    ⚠ AND ECONNREFUSED IS NOT THE CLEAN PROOF THIS DOCSTRING ONCE CLAIMED.
+    It said "a full backlog times out", which is Linux; on BSD/macOS a full
+    backlog REFUSES. That is why a refusal now has to persist across
+    `PROBE_ATTEMPTS` — see the full-backlog block above.
     """
     path = short_sock_path()
 
@@ -320,6 +326,157 @@ def test_a_probe_that_cannot_even_run_counts_as_LIVE(monkeypatch, short_sock_pat
 
     monkeypatch.setattr(socket.socket, "connect_ex", boom)
     assert ss.socket_is_live(path) is True
+
+
+# ── THE FULL-BACKLOG AMBIGUITY (Grok review, 2026-09-06) ────────────────────
+#
+# On BSD/macOS a connect to a LIVE listener whose backlog is full returns
+# ECONNREFUSED — the identical errno a stale socket file returns. Measured on
+# macOS 26.6.1 / arm64, CPython 3.12: `listen(1)` plus one held connection makes
+# every subsequent connect_ex return 61. The first version of `socket_is_live`
+# read one refusal as proof of death, so a live bridge that was momentarily
+# behind would have been classified stale and replaced — the 21:51 outage by a
+# narrower road.
+
+
+def _saturate(path, srv):
+    """Fill `srv`'s backlog and return the held client sockets.
+
+    Deterministic on this kernel BECAUSE the fixture uses `listen(1)`: the
+    first connect is queued, the second is refused. Asserted, not assumed — if
+    a future kernel queues more, the assertion says so instead of the test
+    quietly measuring nothing.
+    """
+    held = []
+    for _ in range(8):
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(0.5)
+        if c.connect_ex(str(path)) == 0:
+            held.append(c)
+        else:
+            c.close()
+            break
+    else:  # pragma: no cover — kernel change
+        for c in held:
+            c.close()
+        pytest.skip("backlog never saturated on this kernel; the premise is gone")
+    return held
+
+
+@pytest.fixture
+def saturated_listener(short_sock_path):
+    """A REAL listener, alive and healthy, whose backlog is full."""
+    path = short_sock_path()
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(path))
+    srv.listen(1)
+    held = _saturate(path, srv)
+    try:
+        yield path, srv, held
+    finally:
+        for c in held:
+            c.close()
+        srv.close()
+
+
+def test_a_full_backlog_refuses_exactly_like_a_stale_file(saturated_listener):
+    """THE PREMISE, PINNED. If this ever stops being true the two tests below
+    are measuring a world that no longer exists, and they should fail loudly
+    rather than keep passing for the wrong reason."""
+    path, _srv, _held = saturated_listener
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.settimeout(0.5)
+    try:
+        assert c.connect_ex(str(path)) == errno.ECONNREFUSED
+    finally:
+        c.close()
+
+
+def test_a_backlog_that_drains_inside_the_window_reads_live(saturated_listener):
+    """WHAT THE RETRY BUYS, proved rather than asserted.
+
+    A momentarily-full backlog is the realistic case: a busy bridge is behind
+    for milliseconds, not forever. The listener accepts one connection partway
+    through the probe window, and `socket_is_live` must come back True.
+
+    Timing has margin on both sides — the drain fires at ~0.35s, the window is
+    3 probes over ~0.6s — so this is not a stopwatch test.
+    """
+    path, srv, _held = saturated_listener
+    accepted = []
+
+    def drain():
+        time.sleep(0.35)
+        try:
+            conn, _ = srv.accept()
+            accepted.append(conn)
+        except OSError:  # pragma: no cover
+            pass
+
+    t = threading.Thread(target=drain, daemon=True)
+    t.start()
+    try:
+        assert ss.socket_is_live(path) is True, (
+            "a live listener whose backlog drained mid-window was reported dead"
+        )
+    finally:
+        t.join(timeout=2)
+        for conn in accepted:
+            conn.close()
+    assert accepted, "premise: the drain must actually have accepted something"
+
+
+def test_RESIDUAL_a_permanently_saturated_backlog_still_reads_dead(saturated_listener):
+    """⚠ THE HOLE THAT IS STILL OPEN, NAMED RATHER THAN PAPERED OVER.
+
+    A listener whose backlog stays full for the ENTIRE window is still reported
+    dead, and `prepare_socket_path` would replace it. Measured: 4 consecutive
+    probes over ~600ms against a permanently saturated listener all return
+    ECONNREFUSED.
+
+    THE RETRY NARROWS THIS RACE; IT DOES NOT CLOSE IT, and this test exists so
+    nobody reads the retry as a fix it is not. ECONNREFUSED carries nothing
+    that separates "stale file" from "saturated listener", and macOS offers no
+    cheap second signal — there is no `/proc/net/unix`. Closing it properly
+    needs a different kind of evidence (a pidfile the bridge owns, or a
+    `libproc` walk of open descriptors), which is a design change and not this
+    lane's to make.
+
+    This asserts the CURRENT behaviour on purpose. When someone closes the
+    hole, this test goes red, and the red is the notification.
+    """
+    path, _srv, _held = saturated_listener
+    assert ss.socket_is_live(path) is False
+
+
+def test_a_single_refusal_is_not_enough(monkeypatch, short_sock_path):
+    """The retry logic itself, isolated from kernel timing: refuse once, then
+    answer. One refusal must not decide."""
+    path = short_sock_path()
+    seq = [errno.ECONNREFUSED, 0, 0]
+
+    def fake_connect_ex(self, address):
+        return seq.pop(0) if seq else 0
+
+    monkeypatch.setattr(socket.socket, "connect_ex", fake_connect_ex)
+    monkeypatch.setattr(ss, "PROBE_RETRY_INTERVAL_SECONDS", 0.0)
+    assert ss.socket_is_live(path, interval=0.0) is True
+    assert len(seq) == 1, "the probe stopped as soon as it got a non-refusal"
+
+
+def test_every_attempt_must_refuse_before_a_path_is_called_dead(monkeypatch, short_sock_path):
+    """The other half: all of them refusing IS the proof, and the count is the
+    module constant rather than a number this test made up."""
+    path = short_sock_path()
+    calls = []
+
+    def fake_connect_ex(self, address):
+        calls.append(1)
+        return errno.ECONNREFUSED
+
+    monkeypatch.setattr(socket.socket, "connect_ex", fake_connect_ex)
+    assert ss.socket_is_live(path, interval=0.0) is False
+    assert len(calls) == ss.PROBE_ATTEMPTS
 
 
 def test_the_guard_can_fail(monkeypatch, live_listener):

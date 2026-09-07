@@ -317,13 +317,29 @@ turned them into decisions D1–D10. Each is closed below with a test that fails
   from resolving the live root and closes the recurrence on this branch only — `main` still
   does it on any run, and any other caller still could. `seat_socket.prepare_socket_path`
   (`seat_socket.py:601`) now PROBES before it unlinks: `socket_is_live()`
-  (`seat_socket.py:573`) connects to the path, and only a **refused** connection — the one
-  answer that proves nobody is listening — permits a replace. Anything else (answered, EACCES,
-  a timed-out full backlog, a probe that could not run at all) counts as LIVE and raises
-  `LiveListenerPresent` (`seat_socket.py:559`, raised at `:646`) without touching the file. A
-  stale file left by a killed process is still replaced, so a bridge restarting after a crash
-  can take its own socket back.
-  *`tests/test_seat_socket_live_listener.py`, 18 tests, 15 of them red on `49f270d`. One,
+  (`seat_socket.py:611`) connects to the path, and only a **refused** connection permits a
+  replace. Anything else — answered, EACCES, a probe that could not run at all — counts as
+  LIVE and raises `LiveListenerPresent` (`seat_socket.py:560`, raised at `:693`) without
+  touching the file. A stale file left by a killed process is still replaced, so a bridge
+  restarting after a crash can take its own socket back.
+- **AND ONE REFUSAL IS NOT PROOF — a Grok review catch, verified here.** The first version
+  said "a full backlog times out", which is Linux. On BSD/macOS a connect to a LIVE listener
+  whose `listen()` backlog is full returns **ECONNREFUSED**, the identical errno a stale
+  socket file returns: measured on macOS 26.6.1 / arm64 / CPython 3.12, `listen(1)` plus one
+  held connection makes every subsequent `connect_ex` return 61 while the listener is healthy.
+  A refusal must therefore persist across `PROBE_ATTEMPTS` (3) spaced
+  `PROBE_RETRY_INTERVAL_SECONDS` (0.3) apart before it counts as death, so a backlog that
+  drains inside the ~0.6 s window is correctly read as live. Cost, named: a genuinely stale
+  file delays a bridge start by ~0.6 s once, on a path about to be replaced anyway.
+- **THE RESIDUAL IS NAMED, NOT PAPERED OVER.** A backlog that stays full for the WHOLE window
+  is still read as dead — measured, 4 consecutive probes over ~600 ms all refused. The retry
+  narrows the race and does not close it: ECONNREFUSED carries nothing that separates the two
+  cases, and macOS has no `/proc/net/unix` to ask a second way. Closing it needs different
+  evidence (a pidfile the bridge owns, or a `libproc` walk), which is a design change and not
+  this lane's to make. `test_RESIDUAL_a_permanently_saturated_backlog_still_reads_dead`
+  asserts the CURRENT behaviour on purpose, so whoever closes the hole gets a red test as the
+  notification.
+  *`tests/test_seat_socket_live_listener.py`, 23 tests, 20 of them red on `49f270d`. One,
   `test_a_live_socket_is_never_stolen`, names no new symbol and swallows `OSError`, so on
   `49f270d` it runs to completion and fails on BEHAVIOUR — "the live socket's path was
   unlinked" — rather than on the fix being absent. Two more pin what was MEASURED rather

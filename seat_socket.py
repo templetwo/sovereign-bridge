@@ -114,6 +114,7 @@ import os
 import socket
 import stat
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -564,38 +565,84 @@ class LiveListenerPresent(OSError):
     """
 
 
-# How long the liveness probe waits for a connect to resolve. A local AF_UNIX
-# connect either succeeds or is refused essentially immediately; anything that
-# takes longer is a listener whose backlog is full, which is a LIVE listener.
+# How long one probe waits for a connect to resolve.
 PROBE_TIMEOUT_SECONDS = 0.5
 
+# ⚠ WHY ONE REFUSAL IS NOT AN ANSWER (Grok review, 2026-09-06; verified here).
+#
+# The first version of this module said "a full backlog times out", which is
+# Linux. On BSD — and this house runs macOS — a connect to a listener whose
+# `listen()` backlog is FULL returns **ECONNREFUSED**, the same errno a stale
+# socket file returns. Measured on macOS 26.6.1 / arm64, CPython 3.12:
+# `listen(1)` plus one held connection makes every subsequent `connect_ex`
+# return 61 ECONNREFUSED while the listener is alive and healthy.
+#
+# So a single refusal does not distinguish "nobody is there" from "somebody is
+# there and momentarily behind" — and reading the second as the first is the
+# 21:51 outage again, by a narrower road. A refusal must therefore PERSIST
+# across a bounded window before it counts as proof of death.
+#
+# COST, NAMED: a genuinely stale file now delays a bridge start by
+# (PROBE_ATTEMPTS - 1) * PROBE_RETRY_INTERVAL_SECONDS, i.e. ~0.6s once, on a
+# path that is about to be replaced anyway.
+PROBE_ATTEMPTS = 3
+PROBE_RETRY_INTERVAL_SECONDS = 0.3
 
-def socket_is_live(path: Path, timeout: float = PROBE_TIMEOUT_SECONDS) -> bool:
-    """True if something ANSWERS at `path`. Fails CLOSED: unsure means live.
 
-    ⚠ THE ONLY SAFE DEFAULT IS "LIVE", AND THE INCIDENT BELOW IS WHY.
-    ECONNREFUSED is the one answer that PROVES nobody is listening — the kernel
-    has the socket file and no process bound to it. Every other outcome is
-    ambiguous: a full backlog times out, a permissions problem raises EACCES, an
-    interrupted call raises EINTR. Treating any of those as "dead" would unlink
-    a socket somebody is serving on, which is precisely the failure this
-    function now exists to prevent. So the probe returns True unless it is
-    certain, and the caller refuses to bind.
-    """
+def _probe_once(path: Path, timeout: float) -> str:
+    """One connect attempt. "answered" | "refused" | "unsure"."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         sock.settimeout(timeout)
         err = sock.connect_ex(str(path))
     except OSError:
-        # The probe itself could not run. Unsure -> live.
-        return True
+        # The probe itself could not run (an over-long AF_UNIX path raises
+        # rather than returning an errno). We learned nothing.
+        return "unsure"
     finally:
         sock.close()
     if err == 0:
-        return True  # answered
+        return "answered"
     if err in (errno.ECONNREFUSED, errno.ENOENT):
-        return False  # proven dead: a stale file, or already gone
-    return True  # EACCES, EAGAIN, ETIMEDOUT, anything else -> unsure -> live
+        return "refused"
+    return "unsure"
+
+
+def socket_is_live(
+    path: Path,
+    timeout: float = PROBE_TIMEOUT_SECONDS,
+    attempts: int = PROBE_ATTEMPTS,
+    interval: float = PROBE_RETRY_INTERVAL_SECONDS,
+) -> bool:
+    """True if something may be ANSWERING at `path`. Fails CLOSED: unsure means live.
+
+    ⚠ THE ONLY SAFE DEFAULT IS "LIVE". Anything but a refusal returns True
+    immediately — an answered connect obviously, but also EACCES, a timeout, or
+    a probe that could not run at all. Treating an ambiguous result as "dead"
+    would unlink a socket somebody is serving on, which is the failure this
+    function exists to prevent.
+
+    ⚠ AND A REFUSAL IS ONLY AN ANSWER IF IT PERSISTS. On BSD/macOS a connect to
+    a LIVE listener whose backlog is full returns ECONNREFUSED — the identical
+    errno a stale socket file returns (measured: macOS 26.6.1, `listen(1)` plus
+    one held connection). So `attempts` probes spaced `interval` apart must ALL
+    refuse before this reports dead. A backlog that drains inside the window is
+    then correctly read as live.
+
+    ⚠ RESIDUAL, NAMED RATHER THAN PAPERED OVER: a listener whose backlog stays
+    full for the WHOLE window is still reported dead, because ECONNREFUSED
+    carries no information that separates the two cases and this kernel offers
+    no cheap second signal (there is no /proc/net/unix on macOS). The retry
+    turns a race into a much narrower one; it does not close it. See
+    `tests/test_seat_socket_live_listener.py::test_RESIDUAL_a_permanently_saturated_backlog_still_reads_dead`.
+    """
+    for attempt in range(max(1, attempts)):
+        verdict = _probe_once(path, timeout)
+        if verdict != "refused":
+            return True
+        if attempt + 1 < attempts:
+            time.sleep(interval)
+    return False
 
 
 def prepare_socket_path(path: Path) -> Path:
