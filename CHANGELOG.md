@@ -43,7 +43,28 @@
   row, and the requested TTL is not persisted because `arrival_requests` is created
   with `CREATE TABLE IF NOT EXISTS` — a new column would never reach an existing store
   without a migration this change does not make.
-  *`tests/test_arrival_gate.py`, 13 new tests, every one of them red on `357be83`.*
+- **AND THE FIX ITSELF SHIPPED A LEAK, CAUGHT IN REVIEW AND MEASURED BOTH WAYS.**
+  FastAPI validates a declared body model BEFORE the handler runs, so `extra="forbid"`
+  answered a caller the gate is meant to be invisible to. With
+  `ARRIVAL_GATE_ENABLED=false`, measured: main returned 404 for an unknown field and
+  **422 naming the field for a wrong TYPE** (a pre-existing leak nobody had named); the
+  first draft of this change returned 422 **plus every accepted field name** for any
+  unknown field — a route-existence oracle on the public unauthenticated endpoint,
+  shipped by the commit that closed the fail-open. `arrival_gate.py`'s own header states
+  the invariant: *all routes 404 when the gate is disabled*. The body is now parsed
+  INSIDE the handler, after `_gate_or_404()`, so the gate decides first and all four
+  probe bodies return 404 — closing the widened leak and main's older one together. The
+  named cost: this route no longer contributes a body schema to the generated OpenAPI
+  doc (nothing in this house reads it; `/api/discover` is the real self-description).
+  Refusals follow the house envelope of the 429 beside them — `failure_class:
+  "malformed"` plus the accepted field list.
+  *`tests/test_arrival_gate.py`, 22 new tests. Measured against `357be83` with only the
+  tip's test file copied in: **17 red, 17 green** (the 12 pre-existing arrival tests, all
+  untouched but for one comment, plus 5 of the new ones that are green on main BY DESIGN —
+  3 measured-caller-body regression guards, and 2 of the 3 gate-off cases, main having
+  held that invariant for an unknown field and a disagreeing pair and broken it for a
+  wrong type). Full suite: **555 passed on the tip vs 533 on main**; `tests/isolation_audit.py`
+  exit 0 on both. This repo has no CI workflow, so those local counts are the whole record.*
 
 
 ## Release 2026-09-06, round 2 — the RC review's fixes

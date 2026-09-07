@@ -442,3 +442,53 @@ def test_describe_scope_distinguishes_an_unmeasured_ask_from_an_empty_one():
     assert ag.describe_scope(None, ["read", "write"]) == (
         "would grant read+write (ask not recorded)"
     )
+
+
+# ⚠ THE GATE DECIDES BEFORE THE BODY IS PARSED, AND A REFUSAL MESSAGE IS NOT AN
+# ORACLE. arrival_gate.py's header states the invariant in its own words: "All
+# routes 404 when the gate is disabled or the decide secret is missing
+# (fail-closed)." FastAPI validates a declared body model BEFORE the handler
+# runs, so a malformed body was answered by the validator instead of the gate.
+#
+# RED ON MAIN FOR ONE OF THESE THREE, AND SAY WHICH: with the gate off, main
+# returned 404 for the unknown field and for the disagreeing spellings (it
+# ignored both) and 422 NAMING THE FIELD for the wrong type. The extra="forbid"
+# added in this same change would have widened that to all three — an
+# unauthenticated route-existence oracle shipped by the commit that closed the
+# fail-open. Both halves close here.
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"requested_scopes": ["read"]},          # unknown field
+        {"requested_scope": "read"},             # wrong type — RED ON MAIN
+        {"requested_scope": ["read"], "scope": ["read", "write"]},  # both, differing
+    ],
+    ids=["unknown-field", "wrong-type", "both-spellings-differ"],
+)
+def test_a_disabled_gate_answers_a_malformed_body_with_404_not_a_field_list(
+    client, monkeypatch, body
+):
+    monkeypatch.setenv("ARRIVAL_GATE_ENABLED", "false")
+    r = client.post("/api/arrival/request", json=body)
+    assert r.status_code == 404, r.text
+    # And the 404 says nothing about the shape of a route that is switched off.
+    assert "requested_scope" not in r.text
+    assert "arrival" not in r.text.lower()
+
+
+# The same refusal with the gate ON still names what to send instead — the fix
+# above must not have turned an honest 422 into a mute one.
+def test_with_the_gate_on_the_refusal_still_names_the_accepted_fields(client):
+    r = client.post("/api/arrival/request", json={"requested_scopes": ["read"]})
+    assert r.status_code == 422
+    for name in bridge.ARRIVAL_REQUEST_FIELDS:
+        assert name in r.text
+    assert r.json()["failure_class"] == "malformed"
+
+
+# A body that is not an object at all is refused the same way, not 500.
+def test_a_non_object_body_is_refused_with_the_accepted_fields(client):
+    r = client.post("/api/arrival/request", json=["read"])
+    assert r.status_code == 422, r.text
+    assert "source_instance" in r.text
+    assert r.json()["failure_class"] == "malformed"

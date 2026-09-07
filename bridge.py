@@ -40,6 +40,7 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Header, Query, Request
 from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import ValidationError as PydanticValidationError
 
 import httpx
 
@@ -2453,9 +2454,60 @@ async def _ntfy_publish(payload: dict) -> bool:
         return False
 
 
+def _arrival_problems(exc: PydanticValidationError) -> list[str]:
+    """Pydantic's errors, flattened to "<field>: <what is wrong>" lines."""
+    problems = []
+    for err in exc.errors():
+        loc = ".".join(str(p) for p in (err.get("loc") or ())) or "body"
+        problems.append(f"{loc}: {err.get('msg')}")
+    return problems
+
+
+def _arrival_malformed(problems: list[str]) -> JSONResponse:
+    """A refusal that says what to send instead — and only that.
+
+    Same envelope shape as the 429 below (`failure_class` at the top level), so
+    a caller disambiguates without a second request.
+    """
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": problems,
+            "accepted_fields": list(ARRIVAL_REQUEST_FIELDS),
+            "failure_class": "malformed",
+        },
+    )
+
+
 @app.post("/api/arrival/request", status_code=201)
-async def arrival_request(req: ArrivalRequest, request: Request):
+async def arrival_request(request: Request):
+    # ⚠ THE BODY IS PARSED HERE, IN THE HANDLER, NOT IN THE SIGNATURE — AND
+    # THAT IS THE WHOLE POINT. FastAPI validates a declared body model BEFORE
+    # the coroutine runs, so a 422 answers a caller the gate is meant to be
+    # invisible to. Measured 2026-09-07 with ARRIVAL_GATE_ENABLED=false:
+    # `{"requested_scope": "read"}` (wrong type) already returned 422 naming
+    # the field on main, and once extra="forbid" went in, ANY unknown field did
+    # too — the refusal message became a route-existence oracle on the public
+    # unauthenticated endpoint, shipped by the same commit that closed the
+    # fail-open. This is the class tests/test_no_slash_redirects.py exists for:
+    # "a 3xx here would leak the existence of a route to a caller holding
+    # nothing." arrival_gate.py's header states the invariant — ALL routes 404
+    # when the gate is disabled — so the gate decides first and the body is
+    # parsed second, always.
+    #
+    # Cost, named rather than discovered later: this route no longer
+    # contributes a body schema to the generated OpenAPI doc. Nothing in this
+    # house reads that doc, and /api/discover — which now documents this body
+    # field by field — is the house's real self-description.
     _gate_or_404()
+    try:
+        payload = await request.json()
+    except Exception:
+        return _arrival_malformed(["body: must be a JSON object"])
+    try:
+        req = ArrivalRequest.model_validate(payload)
+    except PydanticValidationError as exc:
+        return _arrival_malformed(_arrival_problems(exc))
     ip = request.headers.get("cf-connecting-ip") or (
         request.client.host if request.client else None
     )
