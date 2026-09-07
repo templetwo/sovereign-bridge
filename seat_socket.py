@@ -109,6 +109,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import errno
 import os
 import socket
 import stat
@@ -555,12 +556,83 @@ def make_protocol_class(base):
     return SeatPeerProtocol
 
 
+class LiveListenerPresent(OSError):
+    """Something is ANSWERING at the path we were about to bind.
+
+    Its own type so a caller can tell "another process owns this socket" from
+    every other bind failure, and so the log line can say which.
+    """
+
+
+# How long the liveness probe waits for a connect to resolve. A local AF_UNIX
+# connect either succeeds or is refused essentially immediately; anything that
+# takes longer is a listener whose backlog is full, which is a LIVE listener.
+PROBE_TIMEOUT_SECONDS = 0.5
+
+
+def socket_is_live(path: Path, timeout: float = PROBE_TIMEOUT_SECONDS) -> bool:
+    """True if something ANSWERS at `path`. Fails CLOSED: unsure means live.
+
+    ⚠ THE ONLY SAFE DEFAULT IS "LIVE", AND THE INCIDENT BELOW IS WHY.
+    ECONNREFUSED is the one answer that PROVES nobody is listening — the kernel
+    has the socket file and no process bound to it. Every other outcome is
+    ambiguous: a full backlog times out, a permissions problem raises EACCES, an
+    interrupted call raises EINTR. Treating any of those as "dead" would unlink
+    a socket somebody is serving on, which is precisely the failure this
+    function now exists to prevent. So the probe returns True unless it is
+    certain, and the caller refuses to bind.
+    """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        err = sock.connect_ex(str(path))
+    except OSError:
+        # The probe itself could not run. Unsure -> live.
+        return True
+    finally:
+        sock.close()
+    if err == 0:
+        return True  # answered
+    if err in (errno.ECONNREFUSED, errno.ENOENT):
+        return False  # proven dead: a stale file, or already gone
+    return True  # EACCES, EAGAIN, ETIMEDOUT, anything else -> unsure -> live
+
+
 def prepare_socket_path(path: Path) -> Path:
-    """Make `path` safe to bind: owner-only directory, no stale non-socket file.
+    """Make `path` safe to bind: owner-only directory, no LIVE socket, no stale
+    non-socket file.
 
     Fails closed and LOUD. A socket that quietly ends up world-writable is the
     whole feature undone, so every failure here raises rather than degrading to
     a wider mode.
+
+    ⚠ THE LIVENESS PROBE IS NOT DEFENSIVE PROGRAMMING. IT CLOSES A MEASURED
+    OUTAGE, 2026-09-06 21:51 EDT.
+
+    This function used to unlink ANY existing socket file and bind a new one.
+    That is correct for a stale file and catastrophic for a live one, because
+    unlinking a bound AF_UNIX path does not disturb the process serving it: the
+    running bridge keeps its file descriptor on the now-nameless inode and goes
+    on accepting nothing, while every NEW connect resolves the name to whatever
+    was bound in its place. The old listener is alive, healthy, and
+    unreachable — a fail-open in the shape this house hunts, because nothing
+    anywhere reports an error.
+
+    What happened: a test suite run resolved `SOVEREIGN_ROOT` to the live
+    `~/.sovereign`, found the live seat registry, and started the app's
+    lifespan. `_start_seat_socket` called this function on
+    `~/.sovereign/hq/seats/sock/bridge.sock`; it unlinked the socket the running
+    bridge (pid 26173, up since 15:15:02) still held on fd 10, bound a
+    test-owned one in its place, and closed it when the test ended. Every seat
+    connect returned ECONNREFUSED for ~24 minutes until the bridge was
+    restarted by hand. Measured: socket birth = mtime = 21:51:28, `sock/` dir
+    mtime moved to the same second, dir birth still 15:15:02.
+
+    Test isolation was the immediate cause and has its own fix (conftest.py
+    guarantee 5). THIS is the structural one: no caller, test or otherwise,
+    should be able to take a live socket away from the process serving it, and
+    a function that unlinks without looking cannot tell the two cases apart.
+    Only an UNANSWERED path may be replaced.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -570,6 +642,17 @@ def prepare_socket_path(path: Path) -> Path:
             raise OSError(
                 f"{path} exists and is not a socket; refusing to unlink it. "
                 "Seat identity will not start until that path is clear."
+            )
+        if socket_is_live(path):
+            raise LiveListenerPresent(
+                f"{path} has a live listener answering on it; refusing to "
+                "unlink or rebind. Another process — most likely a running "
+                "sovereign-bridge — is serving seats on this socket, and "
+                "replacing it would leave that process alive, holding a "
+                "descriptor on a nameless inode, and unreachable to every "
+                "seat. Stop that process first, or point SOVEREIGN_ROOT "
+                "somewhere else. (A socket that cannot be probed counts as "
+                "live: only a refused connection proves nobody is there.)"
             )
         path.unlink()
     return path

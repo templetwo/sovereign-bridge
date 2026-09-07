@@ -288,6 +288,48 @@ turned them into decisions D1–D10. Each is closed below with a test that fails
 
 ---
 
+### The incident this branch's own suite caused, and the guard that ends the class
+
+- **21:51:28 EDT, 2026-09-06 — A SUITE RUN TOOK THE LIVE SEAT SOCKET AWAY FROM THE RUNNING
+  BRIDGE.** This branch's own `pytest` run, on the tree as it stood at `b1793d1` (stamped
+  21:51:12) and therefore BEFORE guarantee 5 existed, resolved `SOVEREIGN_ROOT` to the live
+  `~/.sovereign`, found the live seat registry, and ran the app lifespan.
+  `bridge._start_seat_socket` → `seat_socket.prepare_socket_path` unlinked
+  `~/.sovereign/hq/seats/sock/bridge.sock` — the socket the running bridge (pid 26173, up
+  since 15:15:02) still held on fd 10 — bound a test-owned one in its place, and closed it
+  when the test ended. **Every seat connect returned ECONNREFUSED until HQ restarted the
+  bridge at ~22:15.** Measured by HQ: socket birth = mtime = **21:51:28**, `sock/` dir mtime
+  moved to the same second, dir birth still 15:15:02.
+- **WHY IT WAS SILENT.** Unlinking a bound AF_UNIX path does not disturb the process serving
+  it: the old listener keeps its descriptor on a now-nameless inode and accepts nothing,
+  while every new connect resolves the name to whatever was bound in its place. Nobody
+  errors, the server's logs stay clean, and the only symptom is on the caller's side, where
+  it reads as "the bridge is down" while the bridge is fine.
+- **WHO DID IT, MEASURED NOT GUESSED.** Reproduced on pristine `49f270d` with
+  `SOVEREIGN_ROOT` pointed at a THROWAWAY root and `prepare_socket_path` wrapped to record
+  `PYTEST_CURRENT_TEST`: 31 calls in one full run — 8 from `tests/test_seat_socket.py`, each
+  on a root that test created (correct, untouched by this fix), and **23 on the ambient root,
+  every one from `tests/test_approval_gate.py`**, one per test, all through its `client`
+  fixture (line 72), the only fixture in the suite that enters `TestClient` as a CONTEXT
+  MANAGER — which is what runs the lifespan. It sets no `SOVEREIGN_ROOT`. In production 22 of
+  those 23 unlinked an already-existing socket; the first unlinked Anthony's live one.
+- **THE STRUCTURAL FIX, and it is not the same as guarantee 5.** Guarantee 5 stops the SUITE
+  from resolving the live root and closes the recurrence on this branch only — `main` still
+  does it on any run, and any other caller still could. `seat_socket.prepare_socket_path`
+  (`seat_socket.py:601`) now PROBES before it unlinks: `socket_is_live()`
+  (`seat_socket.py:573`) connects to the path, and only a **refused** connection — the one
+  answer that proves nobody is listening — permits a replace. Anything else (answered, EACCES,
+  a timed-out full backlog, a probe that could not run at all) counts as LIVE and raises
+  `LiveListenerPresent` (`seat_socket.py:559`, raised at `:646`) without touching the file. A
+  stale file left by a killed process is still replaced, so a bridge restarting after a crash
+  can take its own socket back.
+  *`tests/test_seat_socket_live_listener.py`, 16 tests. One of them,
+  `test_a_live_socket_is_never_stolen`, names no new symbol and swallows `OSError`, so on
+  `49f270d` it runs to completion and fails on BEHAVIOUR — "the live socket's path was
+  unlinked" — rather than on the fix being absent.*
+
+---
+
 ### Also, out of the lane — the suite decided against Anthony's live state
 
 - **A TEST WENT RED WITH NO COMMIT.** `tests/test_seat_socket.py::test_a_child_declaring_a_seat_its_environment_does_not_name_is_denied`
