@@ -323,10 +323,15 @@ turned them into decisions D1–D10. Each is closed below with a test that fails
   `LiveListenerPresent` (`seat_socket.py:559`, raised at `:646`) without touching the file. A
   stale file left by a killed process is still replaced, so a bridge restarting after a crash
   can take its own socket back.
-  *`tests/test_seat_socket_live_listener.py`, 16 tests. One of them,
+  *`tests/test_seat_socket_live_listener.py`, 18 tests, 15 of them red on `49f270d`. One,
   `test_a_live_socket_is_never_stolen`, names no new symbol and swallows `OSError`, so on
   `49f270d` it runs to completion and fails on BEHAVIOUR — "the live socket's path was
-  unlinked" — rather than on the fix being absent.*
+  unlinked" — rather than on the fix being absent. Two more pin what was MEASURED rather
+  than assumed about the probe: on macOS/CPython 3.12 a live AF_UNIX listener returns
+  exactly `0` from `connect_ex` (so `err == 0` is the branch that fires, not the catch-all),
+  a stale file returns `61 ECONNREFUSED`, a missing path `2 ENOENT`, and an over-long path
+  RAISES `OSError` — a real, reachable specimen of the fail-closed arm rather than a
+  monkeypatched errno.*
 
 ---
 

@@ -46,24 +46,45 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import seat_socket as ss  # noqa: E402
 
 
-def _short_sock_path(tmp_path: Path, name: str = "bridge.sock") -> Path:
-    """AF_UNIX paths are capped near 104 bytes on macOS and pytest's tmp_path is
-    long. A real short directory, not a mock, so the bind under test is real."""
+@pytest.fixture
+def short_sock_path():
+    """A path short enough to actually bind, plus cleanup.
+
+    ⚠ NOT pytest's `tmp_path`. AF_UNIX paths are capped near 104 bytes on macOS
+    and `tmp_path` is far longer, so a bind there fails with "AF_UNIX path too
+    long" — and every socket in this file is REAL, because a guard that
+    distinguishes a bound socket from a stale file cannot be exercised against
+    a mock. Returns a factory so a test can take more than one.
+
+    The directory is removed at teardown; the old module-level helper leaked one
+    `/tmp/ss-*` dir per call.
+    """
+    import shutil
     import tempfile
 
-    d = Path(tempfile.mkdtemp(prefix="ss-", dir="/tmp"))
-    return d / name
+    made: list[Path] = []
+
+    def make(name: str = "bridge.sock") -> Path:
+        d = Path(tempfile.mkdtemp(prefix="ss-", dir="/tmp"))
+        made.append(d)
+        return d / name
+
+    try:
+        yield make
+    finally:
+        for d in made:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 @pytest.fixture
-def live_listener():
+def live_listener(short_sock_path):
     """A REAL AF_UNIX listener, held open for the duration of the test.
 
     Not a stub: the guard's whole job is to distinguish a socket file with a
     process behind it from one without, and only a real bound socket exercises
     that distinction.
     """
-    path = _short_sock_path(Path("/tmp"))
+    path = short_sock_path()
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(str(path))
     srv.listen(8)
@@ -78,10 +99,10 @@ def live_listener():
 
 
 @pytest.fixture
-def stale_socket_file():
+def stale_socket_file(short_sock_path):
     """A socket FILE with nobody behind it — bound, listened, then closed
     WITHOUT unlinking, which is exactly what a killed process leaves."""
-    path = _short_sock_path(Path("/tmp"))
+    path = short_sock_path()
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(str(path))
     srv.listen(8)
@@ -212,9 +233,9 @@ def test_a_stale_socket_file_is_still_replaced(stale_socket_file):
         srv.close()
 
 
-def test_a_free_path_is_untouched(tmp_path):
+def test_a_free_path_is_untouched(short_sock_path):
     """No file, no probe, no refusal — the ordinary first start."""
-    path = _short_sock_path(tmp_path)
+    path = short_sock_path()
     assert ss.prepare_socket_path(path) == path
     assert not path.exists()
 
@@ -231,15 +252,48 @@ def test_the_probe_calls_a_stale_file_dead(stale_socket_file):
     assert ss.socket_is_live(stale_socket_file) is False
 
 
-def test_the_probe_calls_a_missing_path_dead(tmp_path):
+def test_the_probe_calls_a_missing_path_dead(short_sock_path):
     """ENOENT is as conclusive as ECONNREFUSED: there is nothing there."""
-    assert ss.socket_is_live(_short_sock_path(tmp_path)) is False
+    assert ss.socket_is_live(short_sock_path()) is False
+
+
+def test_a_live_listener_answers_through_the_err_zero_branch(live_listener):
+    """WHICH BRANCH ACTUALLY DECIDES, measured rather than assumed.
+
+    `socket_is_live` calls `settimeout()` before `connect_ex`, which puts the
+    socket in non-blocking mode — and on some platforms a non-blocking connect
+    reports `EINPROGRESS`/`EAGAIN` instead of `0`. Both are classified LIVE, so
+    the guard holds either way, but "holds either way" is how a dead branch
+    hides. Measured here (macOS, CPython 3.12): a live AF_UNIX listener returns
+    exactly **0**, a stale file returns **61 ECONNREFUSED**, a missing path
+    returns **2 ENOENT**. So `err == 0` is the branch that fires, not the
+    catch-all.
+    """
+    path, _srv = live_listener
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(ss.PROBE_TIMEOUT_SECONDS)
+    try:
+        assert sock.connect_ex(str(path)) == 0
+    finally:
+        sock.close()
+
+
+def test_a_real_unprobeable_path_counts_as_LIVE():
+    """The fail-closed branch with a REAL specimen, not a monkeypatched errno.
+
+    An AF_UNIX path over ~104 bytes makes `connect_ex` RAISE `OSError`
+    ("AF_UNIX path too long") rather than return an errno — so the
+    `except OSError` arm is genuinely reachable in the world, and this pins it
+    with a path the kernel itself rejects. Unsure still means live.
+    """
+    too_long = Path("/tmp") / ("d" * 90) / ("e" * 90) / "bridge.sock"
+    assert ss.socket_is_live(too_long) is True
 
 
 @pytest.mark.parametrize(
     "err", [errno.EACCES, errno.EAGAIN, errno.ETIMEDOUT, errno.EPERM, 0xDEAD]
 )
-def test_an_unprobeable_socket_counts_as_LIVE(monkeypatch, tmp_path, err):
+def test_an_unprobeable_socket_counts_as_LIVE(monkeypatch, short_sock_path, err):
     """⚠ FAIL CLOSED, AND THIS IS THE ASSERTION THAT SAYS SO.
 
     ECONNREFUSED is the ONLY answer that proves nobody is listening. A full
@@ -247,7 +301,7 @@ def test_an_unprobeable_socket_counts_as_LIVE(monkeypatch, tmp_path, err):
     "dead" would unlink a socket somebody is serving on — the exact 21:51
     failure, reached by a different road. Unsure must mean live.
     """
-    path = _short_sock_path(tmp_path)
+    path = short_sock_path()
 
     def fake_connect_ex(self, address):
         return err
@@ -256,10 +310,10 @@ def test_an_unprobeable_socket_counts_as_LIVE(monkeypatch, tmp_path, err):
     assert ss.socket_is_live(path) is True
 
 
-def test_a_probe_that_cannot_even_run_counts_as_LIVE(monkeypatch, tmp_path):
+def test_a_probe_that_cannot_even_run_counts_as_LIVE(monkeypatch, short_sock_path):
     """Same rule one layer out: if the probe itself raises, we learned nothing,
     and nothing is not permission to unlink."""
-    path = _short_sock_path(tmp_path)
+    path = short_sock_path()
 
     def boom(self, address):
         raise OSError("the probe could not run")
@@ -268,18 +322,20 @@ def test_a_probe_that_cannot_even_run_counts_as_LIVE(monkeypatch, tmp_path):
     assert ss.socket_is_live(path) is True
 
 
-def test_the_guard_can_fail(live_listener):
+def test_the_guard_can_fail(monkeypatch, live_listener):
     """Experimental law #2 applied to this guard: it must be demonstrably able
     to NOT fire. With the probe forced to report dead, the same call unlinks —
     which is 49f270d's behaviour, reproduced deliberately so a green run above
-    is evidence about the probe and not about an unreachable branch."""
+    is evidence about the probe and not about an unreachable branch.
+
+    `monkeypatch`, not a hand-rolled try/finally: a raise between the
+    assignment and the restore would leave the guard DISABLED for the rest of
+    the session, and a test that can silently switch off the protection it
+    verifies is its own small fail-open.
+    """
     path, _srv = live_listener
-    ss_socket_is_live = ss.socket_is_live
-    try:
-        ss.socket_is_live = lambda *a, **k: False
-        ss.prepare_socket_path(path)
-    finally:
-        ss.socket_is_live = ss_socket_is_live
+    monkeypatch.setattr(ss, "socket_is_live", lambda *a, **k: False)
+    ss.prepare_socket_path(path)
     assert not path.exists(), "with the probe disabled the old path is unlinked"
 
 
