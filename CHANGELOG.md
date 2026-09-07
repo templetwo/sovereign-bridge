@@ -212,6 +212,32 @@ turned them into decisions D1–D10. Each is closed below with a test that fails
   `closed_by`, `owner` or `source_seat` is refused rather than overwritten, and a stack
   without that module cannot serve `signal_ack` to a seat at all.
 
+### Round 5 — the outside-seat grant map after the stack's retirement census
+
+- **THE GRANT MAP OFFERED TWO TOOLS THE STACK NO LONGER SERVES — a seat-permission
+  change, and named as one.** The stack's 2026-09-06 census retired `ask_scribe` and
+  `reflection_ack`; `session_tokens.TOOL_SCOPES` went on granting both, so an outside seat
+  with a read grant saw `ask_scribe` enumerated on `GET /api/tools` and got a refusal from
+  the stack on every call, and a write grant saw `reflection_ack` the same way. A menu that
+  lists what cannot be ordered is the read-side of a fail-open. Both grants removed.
+  `signals_summary` **added** to `read`: the heartbeat has carried `unacked_signals` since
+  the previous release, so a read grant could see that a count existed with no tool to read
+  what it counted; the stack classifies it `read`
+  (`signal_ledger.SIGNAL_TOOL_INTENTS`) and neither of its modes mutates anything.
+  **`signal_ack` was deliberately NOT added, in any scope** — whether an outside,
+  arrival-granted caller may close a Temple signal is a seat-permission question and
+  Anthony's to answer. The local seat path admits it under HQ decision D1 because a
+  kernel-verified seat is a different actor from a bearer token; that says nothing about
+  this one. The drift that caused all of this was silent by construction — the two tables
+  live in two repos and nothing joined them — so the join is now a test, twice: against the
+  in-repo pinned retired set (deterministic, never skips) and against the stack source on
+  disk in a subprocess (catches the *next* census, skips loudly with the paths it tried when
+  no stack tree is present). A red there is the signal to update the grant map, not
+  flakiness.
+  *`tests/test_session_scope_retirement.py`, 12 tests; `tests/test_seat_identity.py::test_a_seat_is_never_narrower_than_a_session_grant` amended — its two closing assertions pinned the last residue of this defect and are now inverted.*
+
+---
+
 ### Also
 
 - `tests/test_runtime_receipt.py` — two tests failed under the house-mandated
