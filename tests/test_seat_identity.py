@@ -213,7 +213,7 @@ def sse_headers(monkeypatch):
     """
     seen = []
 
-    def fake_sse_client(url, headers=None):
+    def fake_sse_client(url, headers=None, **kwargs):
         seen.append({"url": url, "headers": headers})
         raise RuntimeError("recorded, not connected")
 
@@ -561,6 +561,14 @@ def test_a_seat_is_never_narrower_than_a_session_grant(registry, calls, surface)
     them gets a retired-tool error from the stack. The invariant that survives,
     and the one HQ decision D2 names: on any tool the stack actually PUBLISHES,
     a seat is never narrower than a read+write session grant.
+
+    ⚠ AMENDED 2026-09-06 (this lane). The two closing assertions used to read
+    `{"ask_scribe", "reflection_ack"} <= session_grant` — they pinned the LAST
+    residue of the defect: the grant map still OFFERED two names the stack had
+    stopped serving, so a scoped seat saw them on GET /api/tools and was
+    refused on every call. The grants are now gone from `TOOL_SCOPES`, so the
+    assertion is inverted rather than deleted; `tests/test_session_scope_retirement.py`
+    is where the general form of it now lives.
     """
     session_grant = {t for t, sc in st.TOOL_SCOPES.items() if sc in ("read", "write")}
     published_grant = session_grant & surface.published
@@ -570,10 +578,10 @@ def test_a_seat_is_never_narrower_than_a_session_grant(registry, calls, surface)
         "a seated Studio terminal reaches fewer PUBLISHED tools than a scoped "
         f"outside visitor: {sorted(lost)}"
     )
-    # ...and the two names the old defect was about are gone from the grant's
-    # reach for the stack's own reason, not this bridge's.
-    assert {"ask_scribe", "reflection_ack"} <= session_grant
+    # ...and the two names the old defect was about are gone from BOTH sides
+    # now: the stack retired them, and the grant map no longer offers them.
     assert {"ask_scribe", "reflection_ack"} <= surface.retired
+    assert {"ask_scribe", "reflection_ack"}.isdisjoint(session_grant)
 
 
 def test_tools_the_old_scope_map_never_carried_are_now_reachable(registry, calls, surface):
@@ -941,7 +949,7 @@ def test_a_stack_refusal_at_connect_is_named_not_wrapped_in_taskgroup_text(
             super().__init__("400 Bad Request")
             self.response = _Resp(400, {"detail": detail})
 
-    def boom(url, headers=None):
+    def boom(url, headers=None, **kwargs):
         raise ExceptionGroup("unhandled errors in a TaskGroup (1 sub-exception)", [_Refused()])
 
     monkeypatch.setattr(bridge, "sse_client", boom)
@@ -966,7 +974,7 @@ def test_a_refusal_that_is_not_about_the_seat_keeps_its_own_class(
             super().__init__("401 Unauthorized")
             self.response = _Resp(401, {"detail": "credential rejected"})
 
-    def boom(url, headers=None):
+    def boom(url, headers=None, **kwargs):
         raise ExceptionGroup("unhandled errors in a TaskGroup (1 sub-exception)", [_Refused()])
 
     monkeypatch.setattr(bridge, "sse_client", boom)
@@ -982,7 +990,7 @@ def test_a_genuine_network_failure_is_still_egress(sse_headers, monkeypatch):
     reclassifies every failure would be worse than the generic text it
     replaced."""
 
-    def boom(url, headers=None):
+    def boom(url, headers=None, **kwargs):
         raise ConnectionRefusedError("[Errno 61] Connection refused")
 
     monkeypatch.setattr(bridge, "sse_client", boom)

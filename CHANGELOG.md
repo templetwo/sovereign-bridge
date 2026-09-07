@@ -212,6 +212,195 @@ turned them into decisions D1–D10. Each is closed below with a test that fails
   `closed_by`, `owner` or `source_seat` is refused rather than overwritten, and a stack
   without that module cannot serve `signal_ack` to a seat at all.
 
+### Round 5 — the outside-seat grant map after the stack's retirement census
+
+- **THE GRANT MAP OFFERED TWO TOOLS THE STACK NO LONGER SERVES — a seat-permission
+  change, and named as one.** The stack's 2026-09-06 census retired `ask_scribe` and
+  `reflection_ack`; `session_tokens.TOOL_SCOPES` went on granting both, so an outside seat
+  with a read grant saw `ask_scribe` enumerated on `GET /api/tools` and got a refusal from
+  the stack on every call, and a write grant saw `reflection_ack` the same way. A menu that
+  lists what cannot be ordered is the read-side of a fail-open. Both grants removed.
+  `signals_summary` **added** to `read`: the heartbeat has carried `unacked_signals` since
+  the previous release, so a read grant could see that a count existed with no tool to read
+  what it counted; the stack classifies it `read`
+  (`signal_ledger.SIGNAL_TOOL_INTENTS`) and neither of its modes mutates anything.
+  **`signal_ack` was deliberately NOT added, in any scope** — whether an outside,
+  arrival-granted caller may close a Temple signal is a seat-permission question and
+  Anthony's to answer. The local seat path admits it under HQ decision D1 because a
+  kernel-verified seat is a different actor from a bearer token; that says nothing about
+  this one. The drift that caused all of this was silent by construction — the two tables
+  live in two repos and nothing joined them — so the join is now a test, twice: against the
+  in-repo pinned retired set (deterministic, never skips) and against the stack source on
+  disk in a subprocess (catches the *next* census, skips loudly with the paths it tried when
+  no stack tree is present). A red there is the signal to update the grant map, not
+  flakiness.
+  *`tests/test_session_scope_retirement.py`, 12 tests; `tests/test_seat_identity.py::test_a_seat_is_never_narrower_than_a_session_grant` amended — its two closing assertions pinned the last residue of this defect and are now inverted.*
+
+- **N4's DIAGNOSTIC COULD NEVER REACH THE DETAIL IT WAS WRITTEN TO CARRY.** Round 4 shipped
+  `_connect_refusal` to prefer the stack's own refusal sentence over httpx's paraphrase, and
+  in production it read nothing: the MCP SSE transport opens the door with
+  `httpx_sse.aconnect_sse` — a STREAMING request — and raises `raise_for_status()` inside
+  that context manager, so the body is unread at the raise and the response is CLOSED by the
+  time `call_mcp_tool` catches it. Measured on httpx 0.28.1: `.json()` and `.text` raise
+  `ResponseNotRead`, `.read()` and `.aread()` raise `StreamClosed`. `detail` therefore fell
+  back to `str(leaf)` — "Client error '400 Bad Request' for url …" — which names no seat, so
+  `named_seat` was always False and **every seat-name refusal was reported as
+  `stack_refused_session` with a message naming nothing.** The bytes are unrecoverable after
+  the fact, so the fix cannot live in the handler: `bridge._read_error_body`, an httpx
+  response event hook installed by `bridge._mcp_client_factory`, reads the body AT the
+  response, and only for status >= 400 (reading a 2xx would consume the SSE stream the
+  transport is about to iterate and hang the connection). All three `sse_client` call sites
+  take the factory, `_list_tools_raw` included — a test reads the source and counts them,
+  because the heartbeat's inventory fetch is exactly the path a reader forgets. The hook is
+  fail-QUIET, not fail-open: it decides nothing, and on an unreadable body the old fallback
+  still runs.
+  **The existing N4 tests could not have caught this** — they assert against a hand-made
+  response whose `.json()` simply works. Every test in the new file builds its 400 with
+  `stream=httpx.ByteStream(...)`, never `content=`, which is the difference between
+  reproducing the bug and testing a world where it cannot happen.
+  *`tests/test_sse_connect_refusal_body.py`, 10 tests. `conftest.py`'s blocked-SSE stub grew
+  `**kwargs`: pinned to the old two-argument signature it raises `TypeError`, which
+  `call_mcp_tool` classifies `stack` instead of `egress`, so every "the SSE server is down"
+  test would have gone green on a degradation path it never exercised.*
+
+---
+
+- **THE BRIDGE ANSWERED 3xx, AND ITS CONTRACT SAYS IT NEVER DOES.** The web seat's
+  field-level contract of the MCP shim (chronicle domain
+  `temple-harness,stack-readiness,mcp-shim-contract,hq-lane,substrate-carries,2026-09-06`)
+  requires that this door never redirect. HQ measured `POST /api/call/` returning **HTTP
+  307** on the live bridge — Starlette's `redirect_slashes`, on by default. `FastAPI(...,
+  redirect_slashes=False)`: the trailing-slash form now answers 404, indistinguishable from
+  any other unknown path.
+  **A CONTRACT FIX, NOT A BEHAVIOUR CHANGE FOR ANY KNOWN CLIENT** — the shim refuses every
+  3xx and never follows one, so it already failed closed against the 307 and nothing that
+  works today stops working. It still matters: a 307 preserves method and body, so a client
+  that DOES follow re-sends its `Authorization` header and the whole call to whatever
+  `Location` names, which makes a redirect from an authenticated tool endpoint a
+  credential-forwarding instruction — and the callers here hold scoped session grants.
+  The flag is app-wide, so its one risk is asserted rather than assumed: a route DEFINED
+  with a trailing slash would stop answering its non-slash form. Only `@app.get("/")` is,
+  the root is unaffected, the app mounts nothing and includes no router, and a test fails if
+  that ever changes.
+  *`tests/test_no_slash_redirects.py`, 18 tests — every request passes
+  `follow_redirects=False`, because TestClient follows by default and would turn a
+  307-then-404 into a bare 404 and pass against the unfixed app.*
+
+---
+
+### The incident this branch's own suite caused, and the guard that ends the class
+
+- **21:51:28 EDT, 2026-09-06 — A SUITE RUN TOOK THE LIVE SEAT SOCKET AWAY FROM THE RUNNING
+  BRIDGE.** This branch's own `pytest` run, on the tree as it stood at `b1793d1` (stamped
+  21:51:12) and therefore BEFORE guarantee 5 existed, resolved `SOVEREIGN_ROOT` to the live
+  `~/.sovereign`, found the live seat registry, and ran the app lifespan.
+  `bridge._start_seat_socket` → `seat_socket.prepare_socket_path` unlinked
+  `~/.sovereign/hq/seats/sock/bridge.sock` — the socket the running bridge (pid 26173, up
+  since 15:15:02) still held on fd 10 — bound a test-owned one in its place, and closed it
+  when the test ended. **Every seat connect returned ECONNREFUSED until HQ restarted the
+  bridge at ~22:15.** Measured by HQ: socket birth = mtime = **21:51:28**, `sock/` dir mtime
+  moved to the same second, dir birth still 15:15:02.
+- **WHY IT WAS SILENT.** Unlinking a bound AF_UNIX path does not disturb the process serving
+  it: the old listener keeps its descriptor on a now-nameless inode and accepts nothing,
+  while every new connect resolves the name to whatever was bound in its place. Nobody
+  errors, the server's logs stay clean, and the only symptom is on the caller's side, where
+  it reads as "the bridge is down" while the bridge is fine.
+- **WHO DID IT, MEASURED NOT GUESSED.** Reproduced on pristine `49f270d` with
+  `SOVEREIGN_ROOT` pointed at a THROWAWAY root and `prepare_socket_path` wrapped to record
+  `PYTEST_CURRENT_TEST`: 31 calls in one full run — 8 from `tests/test_seat_socket.py`, each
+  on a root that test created (correct, untouched by this fix), and **23 on the ambient root,
+  every one from `tests/test_approval_gate.py`**, one per test, all through its `client`
+  fixture (line 72), the only fixture in the suite that enters `TestClient` as a CONTEXT
+  MANAGER — which is what runs the lifespan. It sets no `SOVEREIGN_ROOT`. In production 22 of
+  those 23 unlinked an already-existing socket; the first unlinked Anthony's live one.
+- **THE STRUCTURAL FIX, and it is not the same as guarantee 5.** Guarantee 5 stops the SUITE
+  from resolving the live root and closes the recurrence on this branch only — `main` still
+  does it on any run, and any other caller still could. `seat_socket.prepare_socket_path`
+  (`seat_socket.py:601`) now PROBES before it unlinks: `socket_is_live()`
+  (`seat_socket.py:611`) connects to the path, and only a **refused** connection permits a
+  replace. Anything else — answered, EACCES, a probe that could not run at all — counts as
+  LIVE and raises `LiveListenerPresent` (`seat_socket.py:560`, raised at `:693`) without
+  touching the file. A stale file left by a killed process is still replaced, so a bridge
+  restarting after a crash can take its own socket back.
+- **AND ONE REFUSAL IS NOT PROOF — a Grok review catch, verified here.** The first version
+  said "a full backlog times out", which is Linux. On BSD/macOS a connect to a LIVE listener
+  whose `listen()` backlog is full returns **ECONNREFUSED**, the identical errno a stale
+  socket file returns: measured on macOS 26.6.1 / arm64 / CPython 3.12, `listen(1)` plus one
+  held connection makes every subsequent `connect_ex` return 61 while the listener is healthy.
+  A refusal must therefore persist across `PROBE_ATTEMPTS` (3) spaced
+  `PROBE_RETRY_INTERVAL_SECONDS` (0.3) apart before it counts as death, so a backlog that
+  drains inside the ~0.6 s window is correctly read as live. Cost, named: a genuinely stale
+  file delays a bridge start by ~0.6 s once, on a path about to be replaced anyway.
+- **THE RESIDUAL IS NAMED, NOT PAPERED OVER.** A backlog that stays full for the WHOLE window
+  is still read as dead — `socket_is_live` issues `PROBE_ATTEMPTS` (3) probes spaced
+  `PROBE_RETRY_INTERVAL_SECONDS` (0.3) apart, ~0.6 s in all, and against a permanently
+  saturated listener every one of them refuses (Grok measured 3 refusals over 617.8 ms). The retry
+  narrows the race and does not close it: ECONNREFUSED carries nothing that separates the two
+  cases, and macOS has no `/proc/net/unix` to ask a second way. Closing it needs different
+  evidence (a pidfile the bridge owns, or a `libproc` walk), which is a design change and not
+  this lane's to make. `test_RESIDUAL_a_permanently_saturated_backlog_still_reads_dead`
+  asserts the CURRENT behaviour on purpose, so whoever closes the hole gets a red test as the
+  notification.
+  *`tests/test_seat_socket_live_listener.py`, 24 tests: **19 red on `49f270d`, 5 green on
+  both** — not the 20 red an earlier draft of this line claimed before the count was taken.
+  The five that pass on both are the two falsifiers (`test_a_stale_socket_file_is_still_replaced`,
+  `test_a_free_path_is_untouched`), `test_the_incident_path_is_named`,
+  **`test_a_full_backlog_refuses_exactly_like_a_stale_file`** — which passes on `49f270d`
+  because it names no new symbol and asserts a fact about BSD, not about our code — and
+  **`test_the_saturation_helper_refuses_an_empty_saturation`**, which passes there for the
+  same reason: it exercises this file's own `_saturate` helper, not the guard. Both are
+  supposed to be green on both sides; a premise test that went red with the fix would mean
+  the premise was never a premise. One,
+  `test_a_live_socket_is_never_stolen`, names no new symbol and swallows `OSError`, so on
+  `49f270d` it runs to completion and fails on BEHAVIOUR — "the live socket's path was
+  unlinked" — rather than on the fix being absent. Two more pin what was MEASURED rather
+  than assumed about the probe: on macOS/CPython 3.12 a live AF_UNIX listener returns
+  exactly `0` from `connect_ex` (so `err == 0` is the branch that fires, not the catch-all),
+  a stale file returns `61 ECONNREFUSED`, a missing path `2 ENOENT`, and an over-long path
+  RAISES `OSError` — a real, reachable specimen of the fail-closed arm rather than a
+  monkeypatched errno.*
+
+---
+
+### Also, out of the lane — the suite decided against Anthony's live state
+
+- **A TEST WENT RED WITH NO COMMIT.** `tests/test_seat_socket.py::test_a_child_declaring_a_seat_its_environment_does_not_name_is_denied`
+  passed on the morning of 2026-09-06 and failed the same afternoon on identical source.
+  Nothing in this repo moved: Anthony added `grok-build-studio` to
+  `~/.sovereign/hq/seats/registry.json` (mtime 15:15) and the test's own FALSIFIER — "the
+  same stamp, declaring truthfully, stops on the NEXT condition instead" — stopped holding,
+  because the next condition is `enabled` and the live registry now says true. Measured on
+  `49f270d`: **466 passed / 1 failed on this machine at this hour**, which is why the lane's
+  467 no longer reproduces.
+  The class is the one SOP #12's closing bullet names after `a6f42cf` and `28592c7`: a suite
+  deciding against production state. This release's own `conftest.py` closed the WRITE half
+  (guarantee 3) and left this half open, because `seat_identity.sovereign_root()` is a
+  FUNCTION reading `SOVEREIGN_ROOT` rather than a module-level constant — invisible to a
+  fixture that redirects constants, and a read, so nothing was ever corrupted to give it
+  away. **Guarantee 5** now points `SOVEREIGN_ROOT` at an empty tmp dir for every test;
+  tests that set it themselves still win.
+- **AND THE GUARANTEE IS BOUNDED, NOT ASSERTED.** An env-var redirect reaches only code that
+  resolves through `sovereign_root()`; it cannot reach a test that hardcodes
+  `Path.home() / ".sovereign"` (one did — see below), and it does not reach
+  `sovereign_stack.gate_census`, which every `GET /api/heartbeat` in this suite calls and
+  which reads Anthony's live store through `clients/bridge_core`. **Measured 2026-09-06:
+  ~696 live opens per heartbeat request, 41,064 across one full suite run** — read-only, and
+  no verdict in this suite depends on them today. So `tests/isolation_audit.py` now COUNTS
+  opens under the live root and prints `live_sovereign_open_count` with a path sample, as its
+  own number that does not decide `clean`. A counted, bounded figure beats an absolute nobody
+  measured; the resolution for the gate-census path lives in sovereign-stack, not here.
+- **IT IMMEDIATELY FOUND A SECOND ONE.** `tests/test_heartbeat_aperture.py::TestItReportsTotalsNotJustCaps`
+  globbed `~/.sovereign/comms/letters` and compared the count to the heartbeat's — and
+  comparing the heartbeat's glob to the test's glob of the same directory is nearly vacuous:
+  both sides can be zero, or wrong the same way, and it still passes. Rewritten against a
+  synthetic root with known, mutually different per-bucket counts, plus a falsifier asserting
+  that an EMPTY root yields `status: "unmeasured"` with no surfaces rather than a set of
+  confident zeros — which is the aperture's own thesis turned on the test that measures it.
+
+---
+
+---
+
 ### Also
 
 - `tests/test_runtime_receipt.py` — two tests failed under the house-mandated

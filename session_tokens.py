@@ -56,6 +56,33 @@ TTL_DEFAULT_HOURS = 12
 #   * close_session / spiral_inherit pulled out of write into a separate
 #     'session' scope — they mutate global spiral state and are granted
 #     deliberately, never bundled.
+#
+# ── 2026-09-06, AFTER THE STACK'S RETIREMENT CENSUS ─────────────────────────
+#
+# `ask_scribe` (read) and `reflection_ack` (write) were REMOVED. Both were
+# retired on the stack the same day (sovereign_stack.server.RETIRED_TOOLS), so
+# both grants had become dead entries: a scoped seat could see them enumerated
+# on GET /api/tools and every call it made would be refused by the stack. A
+# menu that lists what cannot be ordered is the read-side of a fail-open — it
+# reports capability the surface does not have.
+#
+# `signals_summary` was ADDED to read. The heartbeat already carries
+# `unacked_signals`, so an outside seat with a read grant could see that a
+# count existed and had no tool to read what it counted. It is a read by the
+# stack's own classification — sovereign_stack.signal_ledger.SIGNAL_TOOL_INTENTS
+# maps it to "read" — and its two modes ('summary' counts, 'list' rows) mutate
+# nothing.
+#
+# ⚠ `signal_ack` IS DELIBERATELY NOT HERE, IN ANY SCOPE. Acknowledging a
+# signal writes to the ledger, and whether an OUTSIDE seat (an
+# arrival-granted, non-seated caller) may close a Temple signal is a
+# seat-permission question — Anthony's, not this module's. The local seat path
+# admits it under HQ decision D1 (seat_identity.SEAT_NEVER_TOOLS) because a
+# kernel-verified seat is a different actor from a bearer token. Read half
+# granted, write half withheld, on purpose: do not "complete the pair".
+#
+# The drift itself is now guarded — tests/test_session_scope_retirement.py
+# fails if any TOOL_SCOPES member is retired by the stack.
 TOOL_SCOPES: dict[str, str] = {
     # read — orientation + recall, no side effects
     "arrive_lineage": "read",
@@ -66,8 +93,8 @@ TOOL_SCOPES: dict[str, str] = {
     "get_open_threads": "read",
     "current_policies": "read",
     "inspect_claim": "read",
-    "ask_scribe": "read",
     "season_review": "read",
+    "signals_summary": "read",
     "compass_check": "read",
     "check_mistakes": "read",
     "spiral_status": "read",
@@ -76,7 +103,6 @@ TOOL_SCOPES: dict[str, str] = {
     "record_open_thread": "write",
     "handoff": "write",
     "archive_exchange": "write",
-    "reflection_ack": "write",
     "spiral_reflect": "write",
     # session — global spiral-state mutation, granted deliberately
     "close_session": "session",

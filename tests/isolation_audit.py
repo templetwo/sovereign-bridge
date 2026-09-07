@@ -19,7 +19,13 @@ TWO CHANGES FROM THE ORIGINAL, both to make the claim bigger and more honest:
 
   1. IT RUNS THE WHOLE SUITE, not one test. A single test proves one path is
      clean and says nothing about the other four hundred.
-  2. IT COUNTS AF_INET AND AF_UNIX CONNECTS SEPARATELY, AND DOES NOT BLOCK THE
+  2. IT COUNTS OPENS UNDER THE LIVE `~/.sovereign` AND PRINTS THEM AS THEIR
+     OWN NUMBER. conftest's `SOVEREIGN_ROOT` redirect covers readers that go
+     through `sovereign_root()`; it cannot cover a test that hardcodes the
+     path, and one did. A counted, bounded number beats an absolute nobody
+     measured. Non-zero is a finding, not a failure — it does not decide
+     `clean`.
+  3. IT COUNTS AF_INET AND AF_UNIX CONNECTS SEPARATELY, AND DOES NOT BLOCK THE
      LATTER. The original raised PermissionError on every `socket.connect`,
      which would kill `tests/test_seat_socket.py` — a suite whose whole subject
      is a Unix domain socket. "Zero connection attempts" is true of the
@@ -40,11 +46,14 @@ os.chdir(REPO)
 sys.path.insert(0, str(REPO))
 
 REAL_CREDENTIAL_FILE = str(Path.home() / ".config" / "sovereign-bridge.env")
+# Anthony's LIVE store. Not blocked and not fatal — see the counter below.
+REAL_SOVEREIGN_ROOT = str(Path.home() / ".sovereign")
 
 credential_reads: list[str] = []
 inet_connects: list[str] = []
 unix_connects: list[str] = []
 file_opens_of_credential: list[str] = []
+live_sovereign_opens: list[str] = []
 
 
 def _audit(event, args):
@@ -59,8 +68,31 @@ def _audit(event, args):
             unix_connects.append(repr(address))
     elif event == "open":
         path = args[0] if args else None
-        if isinstance(path, (str, bytes, os.PathLike)) and str(path) == REAL_CREDENTIAL_FILE:
-            file_opens_of_credential.append(str(path))
+        if not isinstance(path, (str, bytes, os.PathLike)):
+            return
+        text = str(path)
+        if text == REAL_CREDENTIAL_FILE:
+            file_opens_of_credential.append(text)
+        # ⚠ COUNTED, NOT BLOCKED, AND REPORTED AS ITS OWN NUMBER — added
+        # 2026-09-06, and the honest bound is stated rather than implied.
+        #
+        # conftest.py guarantee 5 redirects `SOVEREIGN_ROOT` to a tmp dir, which
+        # covers every reader that goes THROUGH `sovereign_root()` /
+        # `provenance.default_sovereign_root()`. It cannot cover a test that
+        # spells `Path.home() / ".sovereign"` itself, and one did:
+        # `tests/test_heartbeat_aperture.py` globbed the live letters directory
+        # and compared the count to the heartbeat's, and had to be rewritten.
+        # An env-var redirect is therefore NOT "zero reads of the live store" —
+        # so the claim is replaced by a MEASUREMENT.
+        #
+        # A NON-ZERO HERE IS NOT AUTOMATICALLY A DEFECT and does not fail the
+        # audit: `bridge` inserts ~/sovereign-stack/src at import and the stack
+        # package may legitimately touch ~/.sovereign at collection. The number
+        # is the finding — it is what makes "the suite reads Anthony's store N
+        # times" a fact somebody can look at instead of an absolute nobody
+        # measured. Paths are sampled so a reader can see WHICH.
+        elif text == REAL_SOVEREIGN_ROOT or text.startswith(REAL_SOVEREIGN_ROOT + os.sep):
+            live_sovereign_opens.append(text)
 
 
 sys.addaudithook(_audit)
@@ -95,6 +127,10 @@ report = {
     "inet_connect_attempts": inet_connects,
     "unix_connect_count": len(unix_connects),
     "unix_connect_paths_sample": sorted(set(unix_connects))[:10],
+    "live_sovereign_root": REAL_SOVEREIGN_ROOT,
+    # Counted, not blocked. Does NOT decide `clean` below — see _audit.
+    "live_sovereign_open_count": len(live_sovereign_opens),
+    "live_sovereign_open_paths_sample": sorted(set(live_sovereign_opens))[:10],
     "bridge_module": sys.modules["bridge"].__file__ if "bridge" in sys.modules else None,
     "bridge_env_file_in_use": os.environ.get("SOVEREIGN_BRIDGE_ENV_FILE"),
 }

@@ -109,10 +109,12 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import errno
 import os
 import socket
 import stat
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -555,12 +557,129 @@ def make_protocol_class(base):
     return SeatPeerProtocol
 
 
+class LiveListenerPresent(OSError):
+    """Something is ANSWERING at the path we were about to bind.
+
+    Its own type so a caller can tell "another process owns this socket" from
+    every other bind failure, and so the log line can say which.
+    """
+
+
+# How long one probe waits for a connect to resolve.
+PROBE_TIMEOUT_SECONDS = 0.5
+
+# ⚠ WHY ONE REFUSAL IS NOT AN ANSWER (Grok review, 2026-09-06; verified here).
+#
+# The first version of this module said "a full backlog times out", which is
+# Linux. On BSD — and this house runs macOS — a connect to a listener whose
+# `listen()` backlog is FULL returns **ECONNREFUSED**, the same errno a stale
+# socket file returns. Measured on macOS 26.6.1 / arm64, CPython 3.12:
+# `listen(1)` plus one held connection makes every subsequent `connect_ex`
+# return 61 ECONNREFUSED while the listener is alive and healthy.
+#
+# So a single refusal does not distinguish "nobody is there" from "somebody is
+# there and momentarily behind" — and reading the second as the first is the
+# 21:51 outage again, by a narrower road. A refusal must therefore PERSIST
+# across a bounded window before it counts as proof of death.
+#
+# COST, NAMED: a genuinely stale file now delays a bridge start by
+# (PROBE_ATTEMPTS - 1) * PROBE_RETRY_INTERVAL_SECONDS, i.e. ~0.6s once, on a
+# path that is about to be replaced anyway.
+PROBE_ATTEMPTS = 3
+PROBE_RETRY_INTERVAL_SECONDS = 0.3
+
+
+def _probe_once(path: Path, timeout: float) -> str:
+    """One connect attempt. "answered" | "refused" | "unsure"."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        err = sock.connect_ex(str(path))
+    except OSError:
+        # The probe itself could not run (an over-long AF_UNIX path raises
+        # rather than returning an errno). We learned nothing.
+        return "unsure"
+    finally:
+        sock.close()
+    if err == 0:
+        return "answered"
+    if err in (errno.ECONNREFUSED, errno.ENOENT):
+        return "refused"
+    return "unsure"
+
+
+def socket_is_live(
+    path: Path,
+    timeout: float = PROBE_TIMEOUT_SECONDS,
+    attempts: int = PROBE_ATTEMPTS,
+    interval: float = PROBE_RETRY_INTERVAL_SECONDS,
+) -> bool:
+    """True if something may be ANSWERING at `path`. Fails CLOSED: unsure means live.
+
+    ⚠ THE ONLY SAFE DEFAULT IS "LIVE". Anything but a refusal returns True
+    immediately — an answered connect obviously, but also EACCES, a timeout, or
+    a probe that could not run at all. Treating an ambiguous result as "dead"
+    would unlink a socket somebody is serving on, which is the failure this
+    function exists to prevent.
+
+    ⚠ AND A REFUSAL IS ONLY AN ANSWER IF IT PERSISTS. On BSD/macOS a connect to
+    a LIVE listener whose backlog is full returns ECONNREFUSED — the identical
+    errno a stale socket file returns (measured: macOS 26.6.1, `listen(1)` plus
+    one held connection). So `attempts` probes spaced `interval` apart must ALL
+    refuse before this reports dead. A backlog that drains inside the window is
+    then correctly read as live.
+
+    ⚠ RESIDUAL, NAMED RATHER THAN PAPERED OVER: a listener whose backlog stays
+    full for the WHOLE window is still reported dead, because ECONNREFUSED
+    carries no information that separates the two cases and this kernel offers
+    no cheap second signal (there is no /proc/net/unix on macOS). The retry
+    turns a race into a much narrower one; it does not close it. See
+    `tests/test_seat_socket_live_listener.py::test_RESIDUAL_a_permanently_saturated_backlog_still_reads_dead`.
+    """
+    for attempt in range(max(1, attempts)):
+        verdict = _probe_once(path, timeout)
+        if verdict != "refused":
+            return True
+        if attempt + 1 < attempts:
+            time.sleep(interval)
+    return False
+
+
 def prepare_socket_path(path: Path) -> Path:
-    """Make `path` safe to bind: owner-only directory, no stale non-socket file.
+    """Make `path` safe to bind: owner-only directory, no LIVE socket, no stale
+    non-socket file.
 
     Fails closed and LOUD. A socket that quietly ends up world-writable is the
     whole feature undone, so every failure here raises rather than degrading to
     a wider mode.
+
+    ⚠ THE LIVENESS PROBE IS NOT DEFENSIVE PROGRAMMING. IT CLOSES A MEASURED
+    OUTAGE, 2026-09-06 21:51 EDT.
+
+    This function used to unlink ANY existing socket file and bind a new one.
+    That is correct for a stale file and catastrophic for a live one, because
+    unlinking a bound AF_UNIX path does not disturb the process serving it: the
+    running bridge keeps its file descriptor on the now-nameless inode and goes
+    on accepting nothing, while every NEW connect resolves the name to whatever
+    was bound in its place. The old listener is alive, healthy, and
+    unreachable — a fail-open in the shape this house hunts, because nothing
+    anywhere reports an error.
+
+    What happened: a test suite run resolved `SOVEREIGN_ROOT` to the live
+    `~/.sovereign`, found the live seat registry, and started the app's
+    lifespan. `_start_seat_socket` called this function on
+    `~/.sovereign/hq/seats/sock/bridge.sock`; it unlinked the socket the running
+    bridge (pid 26173, up since 15:15:02) still held on fd 10, bound a
+    test-owned one in its place, and closed it when the test ended. Every seat
+    connect returned ECONNREFUSED for ~24 minutes until the bridge was
+    restarted by hand. Measured: socket birth = mtime = 21:51:28, `sock/` dir
+    mtime moved to the same second, dir birth still 15:15:02.
+
+    Test isolation was the immediate cause and has its own fix (conftest.py
+    guarantee 5). THIS is the structural one: no caller, test or otherwise,
+    should be able to take a live socket away from the process serving it, and
+    a function that unlinks without looking cannot tell the two cases apart.
+    Only an UNANSWERED path may be replaced.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -570,6 +689,20 @@ def prepare_socket_path(path: Path) -> Path:
             raise OSError(
                 f"{path} exists and is not a socket; refusing to unlink it. "
                 "Seat identity will not start until that path is clear."
+            )
+        if socket_is_live(path):
+            raise LiveListenerPresent(
+                f"{path} has a live listener answering on it; refusing to "
+                "unlink or rebind. Another process — most likely a running "
+                "sovereign-bridge — is serving seats on this socket, and "
+                "replacing it would leave that process alive, holding a "
+                "descriptor on a nameless inode, and unreachable to every "
+                "seat. Stop that process first, or point SOVEREIGN_ROOT "
+                "somewhere else. (Anything but a refusal counts as live, and "
+                f"ONE refusal is not enough either: a path is called dead only "
+                f"after {PROBE_ATTEMPTS} probes {PROBE_RETRY_INTERVAL_SECONDS}s "
+                "apart ALL refuse, because on BSD a live listener with a full "
+                "backlog refuses exactly like a stale file.)"
             )
         path.unlink()
     return path

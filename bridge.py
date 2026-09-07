@@ -41,8 +41,11 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Header, Query, Request
 from pydantic import BaseModel
 
+import httpx
+
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
+from mcp.shared._httpx_utils import create_mcp_http_client
 
 # Epistemic breathing — classify messages before delivery
 import sys
@@ -635,6 +638,64 @@ def _certify_seat_result(
 _SEAT_REFUSAL_MARK = "x-sovereign-seat"
 
 
+# ⚠ THE DETAIL IS UNREADABLE BY THE TIME THE ERROR ESCAPES, UNLESS SOMETHING
+# READS IT FIRST. This is the whole of the N4 fix and it is not obvious.
+#
+# The MCP SSE transport opens the door with `httpx_sse.aconnect_sse`, a
+# STREAMING request, and calls `event_source.response.raise_for_status()`
+# inside that context manager. So at the moment of the raise the response body
+# has not been read, and by the moment `call_mcp_tool` catches the exception
+# the context manager has exited and CLOSED the response. Measured on
+# httpx 0.28.1 against a real 400:
+#
+#     response.json()  -> httpx.ResponseNotRead
+#     response.text    -> httpx.ResponseNotRead
+#     response.read()  -> httpx.StreamClosed   (and .aread() likewise)
+#
+# `_connect_refusal` below was already written to prefer the stack's own words
+# and it could not reach them: every branch raised, `detail` fell back to
+# `str(leaf)` — httpx's generic "Client error '400 Bad Request' for url ..." —
+# and the seat-name marker was therefore never present. Every seat-name refusal
+# was reported as `stack_refused_session` with a message that named no seat.
+#
+# There is no repair after the fact; the bytes are gone. The body has to be
+# read AT the response, which is what an httpx response event hook does. Only
+# for >= 400: reading a 2xx here would consume the SSE stream the transport is
+# about to iterate, and hang the connection instead of serving it.
+async def _read_error_body(response: "httpx.Response") -> None:
+    """Read the body of an error response so its detail survives the close.
+
+    Fail-QUIET by design, and that is not the fail-open this house hunts: this
+    hook decides nothing. If it cannot read, `_connect_refusal` falls back to
+    the generic message exactly as it did before, and the caller still gets
+    `ok: false`. Raising here would replace a precise upstream error with an
+    error about the diagnostic, which is strictly worse.
+    """
+    if response.status_code < 400:
+        return
+    try:
+        await response.aread()
+    except Exception:  # noqa: BLE001 — a body we cannot read is not fatal
+        pass
+
+
+def _mcp_client_factory(
+    headers: dict[str, str] | None = None,
+    timeout: "httpx.Timeout | None" = None,
+    auth: "httpx.Auth | None" = None,
+) -> "httpx.AsyncClient":
+    """The httpx client every SSE session opens, with the error-body hook.
+
+    Signature matches `mcp.shared._httpx_utils.McpHttpClientFactory` exactly —
+    `sse_client` calls it by keyword — and it DELEGATES to the SDK's own
+    constructor rather than reimplementing it, so the MCP defaults
+    (follow_redirects, the timeout shape) stay the SDK's to change.
+    """
+    client = create_mcp_http_client(headers=headers, timeout=timeout, auth=auth)
+    client.event_hooks["response"].append(_read_error_body)
+    return client
+
+
 def _leaf_exceptions(exc: BaseException, _seen: set[int] | None = None):
     """Flatten an exception group, and follow __cause__/__context__.
 
@@ -668,6 +729,17 @@ def _connect_refusal(exc: BaseException) -> tuple[int, str] | None:
         status = getattr(response, "status_code", None)
         if isinstance(status, int) and 400 <= status < 500:
             detail = ""
+            # LAST-CHANCE READ, for the response that is still open. The
+            # `_read_error_body` hook is what normally makes the body
+            # available; this covers a transport that never ran the hook (a
+            # test stub, a future SDK path) and costs nothing when the body is
+            # already there. A CLOSED stream raises here and that is fine —
+            # the fallback below is the honest answer for it.
+            if getattr(response, "is_stream_consumed", True) is False:
+                try:
+                    response.read()
+                except Exception:  # noqa: BLE001 — closed or gone; fall through
+                    pass
             try:
                 body = response.json()
                 if isinstance(body, dict):
@@ -694,7 +766,11 @@ async def call_mcp_tool(tool_name: str, arguments: dict, seat: str | None = None
     so the stack cannot mistake an unauthenticated caller for a seated one.
     """
     try:
-        async with sse_client(MCP_SSE_URL, headers=_mcp_headers_for(seat)) as (read, write):
+        async with sse_client(
+            MCP_SSE_URL,
+            headers=_mcp_headers_for(seat),
+            httpx_client_factory=_mcp_client_factory,
+        ) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.call_tool(tool_name, arguments=arguments)
@@ -751,7 +827,11 @@ async def call_mcp_tool(tool_name: str, arguments: dict, seat: str | None = None
 async def call_mcp_tools_batch(calls: list[ToolCall]) -> list[dict]:
     results = []
     try:
-        async with sse_client(MCP_SSE_URL, headers=_MCP_SSE_HEADERS) as (read, write):
+        async with sse_client(
+            MCP_SSE_URL,
+            headers=_MCP_SSE_HEADERS,
+            httpx_client_factory=_mcp_client_factory,
+        ) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 for call in calls:
@@ -789,7 +869,11 @@ async def _list_tools_raw() -> list:
     GET /api/tools and the heartbeat inventory share, so a heartbeat can derive
     its count AND its public summary without a second round-trip, and so tests
     have a single mockable seam (there is no live SSE dependency in unit tests)."""
-    async with sse_client(MCP_SSE_URL, headers=_MCP_SSE_HEADERS) as (read, write):
+    async with sse_client(
+        MCP_SSE_URL,
+        headers=_MCP_SSE_HEADERS,
+        httpx_client_factory=_mcp_client_factory,
+    ) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             listed = await session.list_tools()
@@ -1122,7 +1206,37 @@ async def lifespan(app: FastAPI):
 
 
 # === App ===
-app = FastAPI(title="Sovereign Bridge", version=VERSION, lifespan=lifespan)
+#
+# ⚠ `redirect_slashes=False` IS A CONTRACT TERM, NOT A PREFERENCE.
+#
+# Starlette redirects a path that misses by exactly one trailing slash to the
+# one that matches: `POST /api/call/` answered **HTTP 307** on the live bridge,
+# measured 2026-09-06. The MCP shim's field-level contract says this door never
+# redirects, and the shim enforces it by refusing every 3xx rather than
+# following one — so it already failed closed and no known client changes
+# behaviour here. What changes is what the bridge SAYS: the slash form now
+# answers 404 (`failure_class: "malformed"`, via the house HTTPException
+# handler) instead of pointing somewhere else.
+#
+# WHY A REDIRECT IS THE WRONG ANSWER FROM AN AUTHENTICATED TOOL ENDPOINT, and
+# it is not pedantry: a 307 preserves the method and body, so a client that
+# follows one re-sends the Authorization header and the whole call to whatever
+# `Location` names. That makes the redirect a credential-forwarding
+# instruction, and this door's callers are seats holding scoped grants. A
+# client that follows is one Location header away from sending a token
+# somewhere nobody audited; a client that does not follow (the shim) gets a
+# 3xx it has no way to interpret. Neither is a service. 404 is.
+#
+# EVERY ROUTE IN THIS FILE IS DEFINED WITHOUT A TRAILING SLASH (checked: only
+# `@app.get("/")` has one, and the root path is unaffected), and the app mounts
+# nothing and includes no router — so this flips exactly one behaviour and
+# strands no path. `tests/test_no_slash_redirects.py` asserts both.
+app = FastAPI(
+    title="Sovereign Bridge",
+    version=VERSION,
+    lifespan=lifespan,
+    redirect_slashes=False,
+)
 
 
 @app.exception_handler(HTTPException)
