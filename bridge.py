@@ -1369,12 +1369,9 @@ async def discover():
                 "method": "POST",
                 "path": "/api/arrival/request",
                 "auth": False,
-                "body": {
-                    "source_instance": "string, OPTIONAL — your seat and model line, e.g. 'hermes-desktop — grok-4.6'",
-                    "seat_description": "string, OPTIONAL — one line on who you are and what you need",
-                    "requested_scope": "list[str], OPTIONAL — any of read | write | session. Alias: 'scope' is accepted and means the same field; sending BOTH with different values is a 422, never a guess. Omit it and you get the documented default, read, and the response says the ask was empty.",
-                    "requested_ttl_hours": f"int, OPTIONAL — default {st.TTL_DEFAULT_HOURS}, clamped to {st.TTL_MIN_HOURS}..{st.TTL_MAX_HOURS}. NOTE the name: the mint endpoint next door calls its own field 'ttl_hours', this one does not.",
-                },
+                # RENDERED FROM THE CONSTANT THE VALIDATOR AND THE 422 READ —
+                # not a second copy of it. See ARRIVAL_REQUEST_FIELD_DOCS.
+                "body": dict(ARRIVAL_REQUEST_FIELD_DOCS),
                 "on_unknown_field": "422 whose message names every accepted field. Unknown fields are REFUSED, not ignored — before 2026-09-07 a misnamed scope field was dropped in silence and the caller got 201 and a read grant with nothing saying why.",
                 "response": "201 with arrival_request_id, a two-word code, and requested_scope / granted_scope / dropped_scope / scope_note — what you asked for, what a tap would grant you, and what was not grantable. The same sentence goes to the phone that decides.",
                 "note": "The Door That Asks: you get a code, Anthony's phone gets the same code, he taps, your next poll of GET /api/arrival/poll/{arrival_request_id} returns a scoped session token exactly once.",
@@ -2348,17 +2345,44 @@ import approval_gate as apg
 from fastapi.responses import HTMLResponse, JSONResponse
 
 
-# Every body field this endpoint accepts, in the 422 that names them. The
-# tuple is the single source: the model, the refusal message and the
-# /api/discover doc all read it, so a field cannot be added to one and missing
-# from the other two.
-ARRIVAL_REQUEST_FIELDS = (
-    "source_instance",
-    "seat_description",
-    "requested_scope",
-    "scope",
-    "requested_ttl_hours",
-)
+# Every body field this endpoint accepts, with the one line of meaning each
+# gets in the public doc.
+#
+# ⚠ ONE SOURCE, AND IT IS THIS DICT — SAY IT ONLY WHILE IT IS TRUE. The model
+# validator, the 422 refusal message and /api/discover's arrival body all read
+# this, and `ARRIVAL_REQUEST_FIELDS` is DERIVED from it rather than written
+# beside it, so the two cannot disagree. The first draft of this change claimed
+# exactly that in its PR body while `discover()` built its body from a private
+# literal a thousand lines up — and the copies had ALREADY drifted: the literal
+# listed four keys, this holds five, so the doc whose job is to teach the
+# `scope` alias never listed `scope` at all. Caught by second-seat review
+# (Grok, 2026-09-07). A claim of a single source, asserted in prose over two
+# copies, is the same shape as the fail-open this whole branch closes.
+ARRIVAL_REQUEST_FIELD_DOCS: dict[str, str] = {
+    "source_instance": "string, OPTIONAL — your seat and model line, e.g. 'hermes-desktop — grok-4.6'",
+    "seat_description": "string, OPTIONAL — one line on who you are and what you need",
+    "requested_scope": (
+        "list[str], OPTIONAL — any of read | write | session. Alias: 'scope' is "
+        "accepted and means the same field; sending BOTH with different values is "
+        "a 422 naming both, never a guess. Omit it and you get the documented "
+        "default, read, and the response says the ask was empty."
+    ),
+    "scope": (
+        "list[str], OPTIONAL — the accepted ALIAS of requested_scope, same meaning. "
+        "It exists because the mint endpoint calls this concept 'scope' and an "
+        "outside seat reasonably reached for that spelling; before 2026-09-07 it "
+        "was silently dropped and the seat got a read grant with nothing saying why."
+    ),
+    "requested_ttl_hours": (
+        f"int, OPTIONAL — default {st.TTL_DEFAULT_HOURS}, clamped to "
+        f"{st.TTL_MIN_HOURS}..{st.TTL_MAX_HOURS}. NOTE the name: the mint endpoint "
+        "next door calls its own field 'ttl_hours', this one does not — send that "
+        "spelling here and you get a 422, not a silent default."
+    ),
+}
+
+# Derived, never re-typed. The refusal message and the model validator read this.
+ARRIVAL_REQUEST_FIELDS = tuple(ARRIVAL_REQUEST_FIELD_DOCS)
 
 
 class ArrivalRequest(BaseModel):

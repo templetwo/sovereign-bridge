@@ -492,3 +492,26 @@ def test_a_non_object_body_is_refused_with_the_accepted_fields(client):
     assert r.status_code == 422, r.text
     assert "source_instance" in r.text
     assert r.json()["failure_class"] == "malformed"
+
+
+# ⚠ THE DOC AND THE VALIDATOR READ ONE CONSTANT — MEASURED, NOT ASSERTED IN
+# PROSE. This branch's first draft claimed a single source in its PR body while
+# `discover()` held a private literal a thousand lines from the model, and the
+# two had already drifted: the literal documented four fields, the validator
+# accepted five, and the missing one was `scope` — the alias the doc exists to
+# teach. Caught by second-seat review (Grok, 2026-09-07), red on 0eb36d3.
+def test_discover_renders_the_arrival_body_from_the_one_constant(client):
+    body = client.get("/api/discover").json()["endpoints"]["arrival_request"]["body"]
+    # Names AND order, so a field added to the validator cannot be missing here.
+    assert tuple(body) == bridge.ARRIVAL_REQUEST_FIELDS
+    # And the text is the same object's text, not a paraphrase of it.
+    assert body == dict(bridge.ARRIVAL_REQUEST_FIELD_DOCS)
+
+
+# The alias must be documented as a FIELD NAME a caller can send, not only
+# mentioned in another field's prose — that mention is what the four-key literal
+# had, and it is why nobody noticed `scope` was missing from the doc.
+def test_discover_lists_the_alias_as_a_field_in_its_own_right(client):
+    body = client.get("/api/discover").json()["endpoints"]["arrival_request"]["body"]
+    assert "scope" in body
+    assert "alias" in body["scope"].lower()

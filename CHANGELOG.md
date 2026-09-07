@@ -18,7 +18,11 @@
   fields are REFUSED (`extra="forbid"`) with a 422 whose message names every accepted
   field. `ARRIVAL_REQUEST_FIELDS` is that list, and the model, the refusal and the
   discover doc all read it, so a field cannot be added to one and missed by the other
-  two. That also converts the TTL half of the same divergence — a caller sending
+  two — and `/api/discover` RENDERS that constant rather
+  than holding a second copy, which is the half second-seat review (Grok) found untrue in
+  the first draft: `discover()` had its own four-key literal while the validator accepted
+  five, so the doc that exists to teach the `scope` alias never listed `scope`. The field
+  docs are now the one source and the tuple derives from them. That also converts the TTL half of the same divergence — a caller sending
   `ttl_hours`, the mint endpoint's spelling — from a silent default into a loud 422.
 - **The reduction still happens; the silence does not.** `clamp_scope` is unchanged
   (spec §4.1 behaviour: non-grantable entries dropped, empty → read) and lost the word
