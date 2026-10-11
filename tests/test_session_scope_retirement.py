@@ -32,7 +32,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import session_tokens as st  # noqa: E402
-from suite_support import PINNED_PUBLISHED, PINNED_RETIRED, release_stack_surface  # noqa: E402
+from suite_support import (  # noqa: E402
+    PINNED_PUBLISHED,
+    PINNED_RETIRED,
+    PUBLISHED_SINCE_PIN,
+    STACK_TREES,
+    release_stack_surface,
+)
 
 
 # ── The two names the 2026-09-06 census killed ──────────────────────────────
@@ -60,6 +66,43 @@ def test_signals_summary_is_readable_by_a_read_grant():
     see that a count existed and had no tool to read what it counted."""
     assert st.TOOL_SCOPES.get("signals_summary") == "read"
     assert st.tool_allowed("signals_summary", ["read"])
+
+
+# ── The name Anthony granted on 2026-10-10 ──────────────────────────────────
+
+
+def test_descend_is_readable_by_a_read_grant():
+    """Anthony, 2026-10-10: `descend` goes to the read scope (and BASE on the
+    claude.ai connector, stack clients/claude_bridge/tiers.py). Red before the
+    grant: TOOL_SCOPES had no entry, so default-deny made it master-only."""
+    assert st.TOOL_SCOPES.get("descend") == "read"
+    assert st.tool_allowed("descend", ["read"])
+    # read only: a write-only or session-only grant does not reach it
+    assert not st.tool_allowed("descend", ["write"])
+    assert not st.tool_allowed("descend", ["session"])
+
+
+def test_the_read_scope_is_exactly_these_names():
+    """The read grant asserted BY NAME, not by count: a count survives swapping
+    one tool for another. Any change to the read scope must edit this set, which
+    puts the widening (or narrowing) on the record in the same diff."""
+    read = {t for t, sc in st.TOOL_SCOPES.items() if sc == "read"}
+    assert read == {
+        "arrive_lineage",
+        "start_here",
+        "my_toolkit",
+        "recall_insights",
+        "recall_reflections",
+        "get_open_threads",
+        "current_policies",
+        "inspect_claim",
+        "season_review",
+        "signals_summary",
+        "descend",
+        "compass_check",
+        "check_mistakes",
+        "spiral_status",
+    }
 
 
 def test_signal_ack_is_granted_to_no_outside_scope():
@@ -97,10 +140,34 @@ def test_every_granted_tool_is_actually_published():
     """The other half of the same honesty: a grant for a name the stack never
     publishes is equally dead, and retirement is only one way to get there
     (a rename does it too)."""
-    unpublished = sorted(set(st.TOOL_SCOPES) - PINNED_PUBLISHED)
+    unpublished = sorted(set(st.TOOL_SCOPES) - (PINNED_PUBLISHED | PUBLISHED_SINCE_PIN))
     assert unpublished == [], (
         f"TOOL_SCOPES grants tools the stack does not publish: {unpublished}"
     )
+
+
+def test_published_since_pin_is_a_real_exception_not_a_hole():
+    """PUBLISHED_SINCE_PIN widens the guard above, so it is checked itself.
+
+    Deterministic half: every member is NEW (not already pinned published, not
+    pinned retired). A name that drifted into the exception set while also being
+    retired would otherwise launder a dead grant past the guard.
+    """
+    assert PUBLISHED_SINCE_PIN, "empty exception set: delete it and this test"
+    assert PUBLISHED_SINCE_PIN.isdisjoint(PINNED_PUBLISHED)
+    assert PUBLISHED_SINCE_PIN.isdisjoint(PINNED_RETIRED)
+
+
+def test_published_since_pin_is_published_by_the_live_stack_source():
+    """Measured half: each declared exception is actually published by the
+    stack MAIN source on disk (the live checkout, STACK_TREES[1]) and not
+    retired there. Skips loudly when no stack source is present. Measured in a
+    subprocess for the reason release_stack_surface() documents.
+    """
+    published, retired, tree = release_stack_surface(trees=STACK_TREES[1:])
+    missing = sorted(PUBLISHED_SINCE_PIN - published)
+    assert missing == [], f"measured against {tree}: not published: {missing}"
+    assert PUBLISHED_SINCE_PIN.isdisjoint(retired), f"{tree} retired a declared exception"
 
 
 def test_no_granted_tool_is_retired_by_the_stack_source_on_disk():

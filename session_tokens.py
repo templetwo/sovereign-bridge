@@ -83,6 +83,14 @@ TTL_DEFAULT_HOURS = 12
 #
 # The drift itself is now guarded — tests/test_session_scope_retirement.py
 # fails if any TOOL_SCOPES member is retired by the stack.
+#
+# ── 2026-10-10, ANTHONY'S WORD ───────────────────────────────────────────────
+#
+# `descend` was ADDED to read. THE DESCENT's index over the close store
+# (stack, 2026-10-08): a pure read through the same supersession + protected
+# filter as The Ground, and the stack's own taxonomy says intent "read"
+# (sovereign_stack.descent.DESCENT_TOOL_INTENTS). Same ruling classified it
+# BASE on the claude.ai connector (clients/claude_bridge/tiers.py).
 TOOL_SCOPES: dict[str, str] = {
     # read — orientation + recall, no side effects
     "arrive_lineage": "read",
@@ -95,6 +103,7 @@ TOOL_SCOPES: dict[str, str] = {
     "inspect_claim": "read",
     "season_review": "read",
     "signals_summary": "read",
+    "descend": "read",
     "compass_check": "read",
     "check_mistakes": "read",
     "spiral_status": "read",

@@ -26,6 +26,7 @@ MASTER = "test-master-token-0123456789abcdef-0123456789abcdef"
 # so they exercise the real TOOL_SCOPES / NEVER_TOOLS tables.
 READ_TOOL = "recall_insights"        # read scope
 READ_TOOL_2 = "arrive_lineage"       # read scope
+READ_TOOL_3 = "descend"              # read scope since 2026-10-10 (Anthony)
 WRITE_TOOL = "record_insight"        # write scope — out of a read grant
 SESSION_TOOL = "close_session"       # session scope — out of a read grant
 NEVER_TOOL = "set_policy"            # hard denylist — never visible to any scope
@@ -33,7 +34,7 @@ NEVER_TOOL_2 = "designate_protected"  # hard denylist
 UNMAPPED_TOOL = "some_future_unmapped_tool"  # default-deny (master-only)
 
 _CATALOG_NAMES = [
-    READ_TOOL, READ_TOOL_2, WRITE_TOOL, SESSION_TOOL,
+    READ_TOOL, READ_TOOL_2, READ_TOOL_3, WRITE_TOOL, SESSION_TOOL,
     NEVER_TOOL, NEVER_TOOL_2, UNMAPPED_TOOL,
 ]
 
@@ -94,7 +95,7 @@ def test_read_token_lists_only_read_tools(client):
     body = r.json()
     names = {t["name"] for t in body["tools"]}
     # only the read-scope tools are visible
-    assert names == {READ_TOOL, READ_TOOL_2}
+    assert names == {READ_TOOL, READ_TOOL_2, READ_TOOL_3}
     # every hidden class is absent
     assert WRITE_TOOL not in names
     assert SESSION_TOOL not in names
@@ -102,7 +103,7 @@ def test_read_token_lists_only_read_tools(client):
     assert NEVER_TOOL_2 not in names
     assert UNMAPPED_TOOL not in names
     # the count reflects the FILTERED set, not the full catalog
-    assert body["count"] == 2
+    assert body["count"] == 3
 
 
 def test_read_token_never_tool_absent_from_list(client):

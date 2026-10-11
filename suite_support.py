@@ -83,6 +83,17 @@ PINNED_RETIRED = frozenset(
     }
 )
 
+# Published by sovereign-stack MAIN after the release/2026-09-06 pin above was
+# taken. Kept OUT of PINNED_PUBLISHED on purpose: PINNED_SURFACE is what every
+# seat MECHANICS test decides against, and `test_the_pinned_surface_is_the_stack_release`
+# still checks it against the frozen release worktree, which does not carry
+# these. A name here is a declared, dated exception, checked two ways in
+# tests/test_session_scope_retirement.py: disjoint from both pins, and actually
+# published by the live stack source on disk.
+#   descend — THE DESCENT, stack ff54484, live 2026-10-08 07:49 EDT; granted to
+#             the `read` scope on Anthony's word 2026-10-10.
+PUBLISHED_SINCE_PIN = frozenset({"descend"})
+
 PINNED_SURFACE = seat_identity.Surface(
     PINNED_PUBLISHED, PINNED_RETIRED, "test pin: sovereign-stack release/2026-09-06"
 )
@@ -95,7 +106,7 @@ STACK_TREES = (
 )
 
 
-def release_stack_surface():
+def release_stack_surface(trees=STACK_TREES):
     """(published, retired, tree) measured from the stack source on disk.
 
     ⚠ IN A SUBPROCESS, AND THAT IS LOAD-BEARING. `bridge` inserts
@@ -113,12 +124,12 @@ def release_stack_surface():
     ignore a red suite.
     """
     tree = next(
-        (p for p in STACK_TREES if (p / "sovereign_stack" / "server.py").exists()), None
+        (p for p in trees if (p / "sovereign_stack" / "server.py").exists()), None
     )
     if tree is None:
         pytest.skip(
             "no sovereign-stack source on disk (looked in "
-            + ", ".join(str(p) for p in STACK_TREES)
+            + ", ".join(str(p) for p in trees)
             + "); the published surface cannot be measured, so this is SKIPPED "
             "rather than assumed"
         )
