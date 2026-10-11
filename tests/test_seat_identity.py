@@ -64,6 +64,7 @@ import seat_identity as si  # noqa: E402
 from suite_support import (  # noqa: E402
     PINNED_PUBLISHED,
     PINNED_RETIRED,
+    PUBLISHED_SINCE_PIN,
     release_stack_surface,
     stack_release_tree,
 )
@@ -604,6 +605,25 @@ def test_tools_the_old_scope_map_never_carried_are_now_reachable(registry, calls
         assert si.seat_tool_allowed(tool, surface) == (True, "ok"), tool
         assert call(client(), tool, seat_hdr()).status_code == 200, tool
     assert len(calls) == 8
+
+
+def test_a_seat_is_never_narrower_than_a_session_grant_on_published_since_pin(registry, calls):
+    """D2 for the tools the 52-tool pin cannot see. The test above decides on
+    PINNED_SURFACE, so `session_grant & surface.published` drops `descend` and
+    it can never fire for it. Here the surface is the pin PLUS the dated
+    exception set, and BOTH halves of the seat path are checked: the policy
+    (seat_tool_allowed) and the containment class (unclassified_refusal, which
+    bridge.py applies after it). Red before descend's TOOL_CLASSES row.
+    """
+    widened = si.Surface(
+        PINNED_PUBLISHED | PUBLISHED_SINCE_PIN, PINNED_RETIRED, "pin + PUBLISHED_SINCE_PIN"
+    )
+    session_grant = {t for t, sc in st.TOOL_SCOPES.items() if sc in ("read", "write")}
+    since_pin_granted = session_grant & PUBLISHED_SINCE_PIN
+    assert "descend" in since_pin_granted, "premise: descend is granted and since-pin"
+    for tool in sorted(since_pin_granted):
+        assert si.seat_tool_allowed(tool, widened) == (True, "ok"), tool
+        assert si.unclassified_refusal(tool) is None, f"seat refuses {tool}: unclassified"
 
 
 def test_signal_ack_is_a_watch_seats_ordinary_act(registry, calls, surface, stack_channel):

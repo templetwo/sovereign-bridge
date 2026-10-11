@@ -688,13 +688,26 @@ def test_the_structural_filter_still_runs_on_a_text_tool(seated, upstream):
 def test_the_classification_covers_the_published_surface_exactly(surface):
     """(a) EVERY published tool is in EXACTLY ONE class. A tool missing from the
     table would otherwise pick its own containment class by being absent."""
-    published = set(surface.published) | set(surface.retired)
+    # PUBLISHED_SINCE_PIN: tools the stack main publishes after the 2026-09-06
+    # pin (suite_support, dated). They count as stack tools here, and they must
+    # be classified too, or the exception would let one choose its own class.
+    from suite_support import PUBLISHED_SINCE_PIN
+
+    published = set(surface.published) | set(surface.retired) | set(PUBLISHED_SINCE_PIN)
     classified = set(si.TOOL_CLASSES)
     assert set(surface.published) - classified == set(), "published but unclassified"
+    assert set(PUBLISHED_SINCE_PIN) - classified == set(), "published since pin but unclassified"
     assert classified - published == set(), "classified but not a stack tool"
     assert set(si.TOOL_CLASSES.values()) == {si.TOOL_CLASS_TEXT, si.TOOL_CLASS_STRUCTURED}
     for name in surface.published:
         assert si.tool_class(name) in (si.TOOL_CLASS_TEXT, si.TOOL_CLASS_STRUCTURED), name
+
+
+def test_descend_is_text_the_same_as_the_ground():
+    """2026-10-10: descend renders close bodies as prose, the_ground's class.
+    Red before the row: TOOL_CLASSES had no entry, so seats got tool_not_classified."""
+    assert si.tool_class("descend") == si.tool_class("the_ground") == si.TOOL_CLASS_TEXT
+    assert si.unclassified_refusal("descend") is None
 
 
 def test_every_tool_the_lane_named_is_TEXT():

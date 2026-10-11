@@ -1497,6 +1497,7 @@ TOOL_CLASSES: dict[str, str] = {
     "thread_get_touches": TOOL_CLASS_TEXT,
     "triage_threads": TOOL_CLASS_TEXT,
     "the_ground": TOOL_CLASS_TEXT,
+    "descend": TOOL_CLASS_TEXT,  # THE DESCENT renders close bodies as prose
     "self_model": TOOL_CLASS_TEXT,
     "inspect_claim": TOOL_CLASS_TEXT,
     "archive_exchange": TOOL_CLASS_TEXT,
