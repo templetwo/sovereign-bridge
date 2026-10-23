@@ -2167,7 +2167,7 @@ async def heartbeat(as_: str | None = Query(None, alias="as")):
         attribution = _attribution_unmeasured(now, exc)
 
     # Same guard, same reason, one more surface: an unreadable ledger renders
-    # as an error state with total=None. _measure_signals swallows its own
+    # as the blind shape: every per-source count null, no total. _measure_signals swallows its own
     # exceptions, so this try is the belt to that — a raise here would still
     # not be allowed to sink the handler, or to become a zero.
     try:
