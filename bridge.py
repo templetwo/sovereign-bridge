@@ -983,32 +983,89 @@ RUNTIME_RECEIPT: dict[str, Any] = {
     "bridge_commit": None,          # sovereign-bridge's OWN HEAD — do not confuse with source_commit
     "bridge_working_tree_dirty": None,
     "service_start_time": None,
+    # The ONE entry that is not frozen at start: the stack's HEAD as it stands
+    # NOW, re-read by _head_probe_loop (design A4, see _read_stack_head). The
+    # heartbeat still reads this dict only; the re-read happens off the
+    # request path, the way CLOCK_PROBE's does.
+    "head_now": None,
 }
+
+# Longest git error the PUBLIC heartbeat carries (served_predates_head_reason).
+_GIT_ERROR_MAX = 300
+
+
+def _public_git_error(text: str) -> str:
+    """A git error as the public heartbeat may carry it: one line, bounded, and
+    the home directory written as `~`. The heartbeat answers without a token,
+    through the tunnel too, so an absolute home path is not its to publish."""
+    line = " | ".join(part.strip() for part in text.splitlines() if part.strip())
+    home = str(Path.home())
+    if home and home != "/":
+        line = line.replace(home, "~")
+    return line[:_GIT_ERROR_MAX]
+
+
+async def _kill_quietly(proc) -> None:
+    """Kill a still-running git child and reap it; swallow every error."""
+    if proc is not None and proc.returncode is None:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+
+
+async def _run_git_capture(repo_root: Path, *args: str) -> tuple[str | None, str | None]:
+    """Run one git subcommand against repo_root: (stdout stripped, None) on
+    success, (None, why) on any failure: missing binary, a path that is not a
+    repository, non-zero exit, or timeout. Kills the subprocess on timeout so
+    no zombie lingers — mirrors _probe_one's sntp handling exactly (same
+    hazard, same fix).
+
+    ⚠ PINNED TO repo_root, AND IT HOLDS NO LOCK (design A4, 2026-10-23).
+    `--git-dir`/`--work-tree` name the repository outright, so git does no
+    discovery: with `-C` alone, a `.git` that could not be read made git walk
+    UP and answer for an enclosing repository with exit 0 (measured), a real
+    sha from the wrong repo, which would have read as a clean answer.
+    `--no-optional-locks` stops `git status` from refreshing a stale index,
+    which takes `.git/index.lock` to write it: the HEAD probe re-reads the
+    LIVE stack repo every HEAD_PROBE_INTERVAL, and a lock held at the wrong
+    moment fails a deploy's own git command."""
+    proc = None
+    sub = args[0] if args else "(no subcommand)"
+    try:
+        root = os.path.abspath(repo_root)
+        proc = await asyncio.create_subprocess_exec(
+            GIT_BIN, "-C", root,
+            f"--git-dir={os.path.join(root, '.git')}", f"--work-tree={root}",
+            "--no-optional-locks", *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=GIT_PROBE_TIMEOUT)
+    except asyncio.CancelledError:
+        await _kill_quietly(proc)
+        raise
+    except asyncio.TimeoutError:
+        await _kill_quietly(proc)
+        return None, f"git {sub} timed out after {GIT_PROBE_TIMEOUT}s"
+    except FileNotFoundError:
+        return None, f"git binary not found at {GIT_BIN}"
+    except Exception as exc:
+        await _kill_quietly(proc)
+        return None, _public_git_error(f"git {sub} could not run: {type(exc).__name__}: {exc}")
+    if proc.returncode != 0:
+        detail = (err or b"").decode("utf-8", "replace").strip()
+        return None, _public_git_error(
+            f"git {sub} failed: {detail or f'exit status {proc.returncode}'}"
+        )
+    return out.decode("utf-8", "replace").strip(), None
 
 
 async def _run_git(repo_root: Path, *args: str) -> str | None:
-    """Run one git subcommand against repo_root, stdout stripped. Kills the
-    subprocess on timeout so no zombie lingers — mirrors _probe_one's sntp
-    handling exactly (same hazard, same fix). None on any failure: missing
-    binary, non-repo path, non-zero exit, or timeout."""
-    proc = None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            GIT_BIN, "-C", str(repo_root), *args,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=GIT_PROBE_TIMEOUT)
-        if proc.returncode != 0:
-            return None
-        return out.decode("utf-8", "replace").strip()
-    except (asyncio.TimeoutError, FileNotFoundError, Exception):
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.kill()
-                await proc.wait()
-            except Exception:
-                pass
-        return None
+    """stdout of one git subcommand against repo_root, stripped; None on any
+    failure (_run_git_capture says why, for the callers that publish it)."""
+    out, _ = await _run_git_capture(repo_root, *args)
+    return out
 
 
 async def _git_head_state(repo_root: Path | None) -> tuple[str | None, bool | None]:
@@ -1034,18 +1091,164 @@ async def _git_head_state(repo_root: Path | None) -> tuple[str | None, bool | No
 
 async def _compute_runtime_receipt() -> None:
     """Populate RUNTIME_RECEIPT once. Called from lifespan before the app
-    starts serving — never per-request."""
+    starts serving — never per-request. Takes the first HEAD reading too, so
+    served_predates_head has an answer from the first request on."""
     RUNTIME_RECEIPT["service_start_time"] = datetime.now(timezone.utc).isoformat()
     RUNTIME_RECEIPT["source_repo"] = str(_STACK_REPO_ROOT) if _STACK_REPO_ROOT else None
     bridge_root = _find_repo_root(Path(__file__).resolve().parent)
-    (stack_sha, stack_dirty), (bridge_sha, bridge_dirty) = await asyncio.gather(
+    (stack_sha, stack_dirty), (bridge_sha, bridge_dirty), head_now = await asyncio.gather(
         _git_head_state(_STACK_REPO_ROOT),
         _git_head_state(bridge_root),
+        _read_stack_head(_STACK_REPO_ROOT),
     )
     RUNTIME_RECEIPT["source_commit"] = stack_sha
     RUNTIME_RECEIPT["working_tree_dirty"] = stack_dirty
     RUNTIME_RECEIPT["bridge_commit"] = bridge_sha
     RUNTIME_RECEIPT["bridge_working_tree_dirty"] = bridge_dirty
+    RUNTIME_RECEIPT["head_now"] = head_now
+
+
+# === Served vs HEAD (design A4) ===============================================
+# The receipt above is read ONCE, at start: it says what the process LOADED.
+# HEAD can move after that with no restart: a commit, a merge, or a checkout in
+# the live tree, and a checkout is a deploy that nothing announces (a branch was
+# checked out in a live tree twice in the record, 08-28 and 09-01). HEAD as read
+# at start was already committed when the process started, so comparing the
+# start with it cannot come out true; the stack's HEAD is therefore RE-READ every
+# HEAD_PROBE_INTERVAL by _head_probe_loop (same shape as the NTP probe: the
+# request path reads the cache only) and the heartbeat derives one field:
+#
+#   served_predates_head  True   service_start_time is older than HEAD's commit
+#                                time, or the tree is dirty
+#                         False  both were read and neither holds
+#                         None   anything needed to decide was not read, with
+#                                the reason; None is NEVER False (plan 1,
+#                                Review Focus 4): a heartbeat that could not
+#                                read the repository must not say it matches.
+#
+# The stack repo only (source_commit's repo), and the bridge process's own
+# start time stands for "served": the bridge serves the stack modules it
+# imports in-process; the SSE server is a separate process with its own start.
+HEAD_PROBE_INTERVAL = 60  # seconds between re-reads of the stack's HEAD
+# A reading older than this says what HEAD WAS: null, never its old answer.
+# Fixed at import, so a test that shortens the interval keeps the bound.
+HEAD_READING_MAX_AGE = 2 * HEAD_PROBE_INTERVAL
+
+
+async def _read_stack_head(repo_root: Path | None) -> dict[str, Any]:
+    """The stack's HEAD as it stands NOW, for served_predates_head.
+
+    {short_sha, committed_at (HEAD's COMMITTER date, ISO UTC), dirty (tracked
+    files only, the same rule as working_tree_dirty), error, measured_at}.
+    Never raises. `error` says why when HEAD or its commit time could not be
+    read (short_sha is then None) or when `git status` failed (dirty is then
+    None)."""
+    reading: dict[str, Any] = {
+        "short_sha": None,
+        "committed_at": None,
+        "dirty": None,
+        "error": None,
+        "measured_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if repo_root is None:
+        reading["error"] = (
+            "the stack repo root is unknown (sovereign_stack was not imported from a git checkout)"
+        )
+        return reading
+    if not Path(GIT_BIN).exists():
+        reading["error"] = f"git binary not found at {GIT_BIN}"
+        return reading
+    # --no-show-signature: a `log.showSignature` config would put gpg's lines
+    # into stdout ahead of the format and the reading would fail to parse.
+    out, err = await _run_git_capture(
+        repo_root, "log", "-1", "--no-show-signature", "--format=%h %ct", "HEAD"
+    )
+    if out is None:
+        reading["error"] = err
+        return reading
+    try:
+        short_sha, epoch = out.split()
+        committed_at = datetime.fromtimestamp(int(epoch), timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        reading["error"] = _public_git_error(f"HEAD could not be parsed: {out!r}")
+        return reading
+    reading["short_sha"] = short_sha
+    reading["committed_at"] = committed_at.isoformat()
+    status, err = await _run_git_capture(repo_root, "status", "--porcelain", "--untracked-files=no")
+    if status is None:
+        reading["error"] = err
+    else:
+        reading["dirty"] = bool(status)
+    return reading
+
+
+async def _refresh_head_reading() -> None:
+    """One probe tick: re-read the stack's HEAD into the receipt cache."""
+    RUNTIME_RECEIPT["head_now"] = await _read_stack_head(_STACK_REPO_ROOT)
+
+
+async def _head_probe_loop() -> None:
+    """Re-read the stack's HEAD every HEAD_PROBE_INTERVAL seconds. The first
+    reading is taken by _compute_runtime_receipt before the app serves, so this
+    sleeps first. Never raises out: a failed read is recorded in the reading's
+    `error`, and a raise leaves the last reading to age past
+    HEAD_READING_MAX_AGE, which the heartbeat reports as null."""
+    while True:
+        await asyncio.sleep(HEAD_PROBE_INTERVAL)
+        try:
+            await _refresh_head_reading()
+        except Exception:
+            pass
+
+
+def _served_predates_head(receipt: dict[str, Any], now: datetime) -> tuple[bool | None, str]:
+    """(served_predates_head, served_predates_head_reason), from the cache only.
+
+    Reasons, verbatim: "service started <t> before HEAD <sha> committed at <t2>"
+    and "working tree dirty" (joined with "; " when both hold); for null, what
+    was not read, with git's own error when the metadata was unreadable."""
+    start_text = receipt.get("service_start_time")
+    try:
+        start = datetime.fromisoformat(start_text) if start_text else None
+    except (TypeError, ValueError):
+        start = None
+    if start is None or start.tzinfo is None:
+        return None, "service start time unknown"
+    head = receipt.get("head_now")
+    if not head:
+        return None, "HEAD has not been read since service start"
+    measured_text = head.get("measured_at")
+    try:
+        age = (now - datetime.fromisoformat(measured_text)).total_seconds()
+    except (TypeError, ValueError):
+        age = None
+    if age is None or age > HEAD_READING_MAX_AGE:
+        return None, f"HEAD reading is stale: last read {measured_text}"
+    sha = head.get("short_sha")
+    committed_text = head.get("committed_at")
+    if not sha or not committed_text:
+        return None, f"git metadata unreadable: {head.get('error') or 'no detail recorded'}"
+    try:
+        committed = datetime.fromisoformat(committed_text)
+    except (TypeError, ValueError):
+        committed = None
+    if committed is None or committed.tzinfo is None:
+        return None, f"git metadata unreadable: HEAD commit time {committed_text!r}"
+    reasons = []
+    if start < committed:
+        reasons.append(
+            f"service started {start_text} before HEAD {sha} committed at {committed_text}"
+        )
+    if head.get("dirty") is True:
+        reasons.append("working tree dirty")
+    if reasons:
+        return True, "; ".join(reasons)
+    if head.get("dirty") is not False:
+        return None, f"working tree state unreadable: {head.get('error') or 'no detail recorded'}"
+    return False, (
+        f"service started {start_text} at or after HEAD {sha} committed at {committed_text}; "
+        "working tree clean"
+    )
 
 
 # === Clock-trust self-attestation ===========================================
@@ -1189,6 +1392,9 @@ async def lifespan(app: FastAPI):
     # Start the read-only clock-drift probe daemon. It runs the first probe
     # itself (probe-then-sleep), so startup is NOT delayed waiting on sntp.
     task = asyncio.create_task(_clock_probe_loop())
+    # Served vs HEAD (design A4): re-read the stack's HEAD off the request
+    # path. The first reading was taken above; this one sleeps first.
+    head_task = asyncio.create_task(_head_probe_loop())
     seat_server = await _start_seat_socket(app)
     try:
         yield
@@ -1199,11 +1405,12 @@ async def lifespan(app: FastAPI):
                 await seat_server.wait_closed()
             except Exception:
                 pass
-        task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
+        for background in (task, head_task):
+            background.cancel()
+            try:
+                await background
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 # === App ===
@@ -1888,6 +2095,19 @@ async def heartbeat(as_: str | None = Query(None, alias="as")):
     except Exception as exc:  # pragma: no cover — _measure_signals is total
         signals = _signals_unmeasured(exc)
 
+    # Served vs HEAD (design A4), derived from the receipt cache ONLY: the HEAD
+    # probe re-reads git off the request path. Same guard as every subsystem
+    # above: a raise is an unmeasured answer, null with its reason, never false.
+    try:
+        served_predates_head, served_predates_head_reason = _served_predates_head(
+            RUNTIME_RECEIPT, now
+        )
+    except Exception as exc:
+        served_predates_head = None
+        served_predates_head_reason = (
+            f"served_predates_head could not be derived: {type(exc).__name__}: {exc}"
+        )
+
     return {
         "status": "ok" if healthy else "degraded",
         "version": VERSION,
@@ -1909,9 +2129,13 @@ async def heartbeat(as_: str | None = Query(None, alias="as")):
         "source_commit": RUNTIME_RECEIPT.get("source_commit"),
         "working_tree_dirty": RUNTIME_RECEIPT.get("working_tree_dirty"),
         "service_start_time": RUNTIME_RECEIPT.get("service_start_time"),
+        "served_predates_head": served_predates_head,
+        "served_predates_head_reason": served_predates_head_reason,
         "bridge_commit": RUNTIME_RECEIPT.get("bridge_commit"),
         "bridge_working_tree_dirty": RUNTIME_RECEIPT.get("bridge_working_tree_dirty"),
-        "source_note": "version is read from sovereign_stack's pyproject.toml in the checked-out tree, NOT from installed package metadata (that metadata is a snapshot frozen at the last `pip install -e .` and can silently outlive a later `git checkout` — see 2026-07-11 postmortem). source_commit is sovereign_stack's git HEAD, the field that cannot lie the way a stale version string can; bridge_commit is this bridge script's OWN repo HEAD — do not confuse the two.",
+        "source_note": "version is read from sovereign_stack's pyproject.toml in the checked-out tree, NOT from installed package metadata (that metadata is a snapshot frozen at the last `pip install -e .` and can silently outlive a later `git checkout` — see 2026-07-11 postmortem). source_commit is sovereign_stack's git HEAD, the field that cannot lie the way a stale version string can; bridge_commit is this bridge script's OWN repo HEAD — do not confuse the two. "
+        "source_commit, working_tree_dirty and service_start_time are read once, at process start: they say what the process loaded. "
+        f"served_predates_head compares service_start_time with the stack's HEAD as RE-READ every {HEAD_PROBE_INTERVAL}s: true when the process started before HEAD's commit time or the tree is dirty, false when both were read and neither holds, and null, with served_predates_head_reason, when it could not be decided. null is never false.",
         "welcome": (
             "You are through. The stack is alive."
             if healthy
