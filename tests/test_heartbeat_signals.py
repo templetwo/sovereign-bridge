@@ -63,6 +63,24 @@ LIVE = {
 }
 
 
+# THE BRIDGE'S OWN FALLBACK, `_signals_unmeasured`, SPEAKS THE STACK'S BLIND
+# SHAPE (design A3, sovereign-stack plan 1; its final review, finding I-3): every
+# count null and per source, no cross-source sum under any name, `measured`
+# false, and `note` and `source_labels` in the stack's own words, so
+# `unacked_signals.note` means one thing whichever route answered. Its warning
+# rides in `warning`. The tests below that make the bridge fall back assert
+# this, never a `total`.
+_SUMS = frozenset({"total", "stale_24h", "stale_7d"})
+
+
+def _assert_blind(field):
+    assert field["by_source"] is None
+    assert field["stale_24h_by_source"] is None
+    assert field["by_source_detail"] is None
+    assert field["measured"] is False
+    assert not _SUMS & set(field), f"the fallback publishes a sum: {sorted(_SUMS & set(field))}"
+
+
 def test_the_field_is_on_the_heartbeat_at_all():
     """A field written and unwired is this house's most expensive shape. It is
     on the door, under the name Anthony's instruction used."""
@@ -117,11 +135,69 @@ def test_a_raising_ledger_is_an_error_state_and_not_a_zero(monkeypatch):
 
     _importable(monkeypatch, boom)
     field = _hb()["unacked_signals"]
-    assert field["total"] is None
-    assert field["stale_24h"] is None and field["stale_7d"] is None
-    assert field["by_source"] is None
+    _assert_blind(field)
     assert field["error"] == "unreadable:OSError"
     assert field["ingestion"] == "error"
+
+
+def test_the_fallback_note_and_labels_are_the_stacks(monkeypatch):
+    """One meaning for `note` on both routes: the stack's reason there is no
+    total. The fallback's own warning, that an absent count is not a zero, has a
+    key of its own."""
+
+    def boom(root=None):
+        raise OSError("permission denied")
+
+    _importable(monkeypatch, boom)
+    field = _hb()["unacked_signals"]
+    assert field["note"] == bridge.SIGNALS_BY_SOURCE_NOTE
+    assert field["source_labels"] == bridge.SIGNALS_SOURCE_LABELS == {"thread": "open threads"}
+    assert "an absent count is NOT a zero count" in field["warning"]
+    # A fresh copy per read, as the stack's field gives: no caller can relabel
+    # the next reader.
+    field["source_labels"]["thread"] = "relabelled"
+    assert _hb()["unacked_signals"]["source_labels"] == {"thread": "open threads"}
+
+
+def test_the_fallback_constants_are_the_stacks_own(tmp_path):
+    """Copied into the bridge, not imported, because the fallback answers exactly
+    when the import failed. So the copies are held to the stack's constants,
+    read in a subprocess from the first stack tree on disk that carries them, and
+    the test skips, naming the trees, while none does (the release worktree and
+    a live checkout older than the A3 deploy carry neither)."""
+    import json as _json
+    import subprocess
+
+    probe = (
+        "import json,sys;sys.path.insert(0,%r);"
+        "from sovereign_stack import signal_ledger as sl;"
+        "print(json.dumps({'note': getattr(sl, 'BY_SOURCE_NOTE', None),"
+        " 'labels': getattr(sl, 'SOURCE_LABELS', None)}))"
+    )
+    candidates = [
+        Path.home() / ".cache" / "wt-release-stack" / "src",
+        Path.home() / "sovereign-stack" / "src",
+    ]
+    for src in candidates:
+        if not (src / "sovereign_stack" / "signal_ledger.py").exists():
+            continue
+        out = subprocess.run(
+            [sys.executable, "-B", "-c", probe % str(src)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert out.returncode == 0, out.stderr
+        constants = _json.loads(out.stdout.strip().splitlines()[-1])
+        if constants["note"] is None:
+            continue  # a stack older than design A3
+        assert constants["note"] == bridge.SIGNALS_BY_SOURCE_NOTE, src
+        assert constants["labels"] == bridge.SIGNALS_SOURCE_LABELS, src
+        return
+    pytest.skip(
+        "no stack tree on disk carries signal_ledger.BY_SOURCE_NOTE yet (design A3 "
+        f"not deployed), looked in: {[str(c) for c in candidates]}"
+    )
 
 
 # ── The fallback: ask the stack when we cannot import it ────────────────────
@@ -252,7 +328,7 @@ def test_a_stack_too_old_to_carry_the_field_is_an_error_not_a_zero(monkeypatch):
     _unimportable(monkeypatch)
     _upstream(monkeypatch, {"ok": True, "result": {"status": "ok", "tools": 98}})
     field = _hb()["unacked_signals"]
-    assert field["total"] is None
+    _assert_blind(field)
     assert "older than release/2026-09-06" in field["error"]
 
 
@@ -263,7 +339,7 @@ def test_a_failing_stack_heartbeat_is_an_error_state_naming_both_routes(monkeypa
     _unimportable(monkeypatch)
     _upstream(monkeypatch, {"ok": False, "error": "Connection refused", "failure_class": "egress"})
     field = _hb()["unacked_signals"]
-    assert field["total"] is None
+    _assert_blind(field)
     assert "signal_ledger_unavailable" in field["error"]
     assert "stack heartbeat failed" in field["error"]
 
@@ -280,7 +356,7 @@ def test_the_local_import_is_preferred_and_a_local_error_is_not_laundered(monkey
     seen = _upstream(monkeypatch, {"ok": True, "result": {"ok": True, "total": 0}})
     field = _hb()["unacked_signals"]
     assert field["error"] == "unreadable:OSError"
-    assert field["total"] is None
+    _assert_blind(field)
     assert seen == [], "a local ledger error was laundered through the upstream tool"
 
 
@@ -297,7 +373,7 @@ def test_a_slow_stack_tool_is_bounded(monkeypatch):
 
     monkeypatch.setattr(bridge, "call_mcp_tool", slow)
     field = _hb()["unacked_signals"]
-    assert field["total"] is None
+    _assert_blind(field)
     assert "stack heartbeat failed" in field["error"]
 
 
@@ -343,7 +419,7 @@ def test_a_nonsense_return_is_refused_rather_than_passed_on(monkeypatch):
     for junk in (None, [], "7", 7):
         _importable(monkeypatch, lambda root=None, j=junk: j)
         field = _hb()["unacked_signals"]
-        assert field["total"] is None, junk
+        _assert_blind(field)
         assert field["error"].startswith("unreadable:"), junk
 
 
@@ -358,7 +434,7 @@ def test_a_broken_ledger_does_not_sink_the_heartbeat(monkeypatch):
 
     _importable(monkeypatch, boom)
     body = _hb()
-    assert body["unacked_signals"]["total"] is None
+    _assert_blind(body["unacked_signals"])
     for key in ("server_time_utc", "version", "aperture", "gate", "attribution"):
         assert key in body, key
 
@@ -410,5 +486,7 @@ def test_the_contract_holds_against_the_real_stack_module(tmp_path):
     )
     assert out.returncode == 0, out.stderr
     empty = _json.loads(out.stdout)
-    assert empty["total"] is None, "a never-scanned ledger reported a count"
+    # Per source, which both the release tree's shape and the stack's A3 shape
+    # carry: never `total`, which A3 removes (the A3 shape is plan 1's).
+    assert empty["by_source"] is None, "a never-scanned ledger reported a count"
     assert empty["error"] == "not_scanned"

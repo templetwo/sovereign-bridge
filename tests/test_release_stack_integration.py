@@ -192,8 +192,13 @@ print(json.dumps(loaded))
     field = result["field"]
     assert field["source"] == "sovereign_stack.signal_ledger"
     # A MEASURED zero is still a zero. "never render 0" implemented literally
-    # would make the field useless in the state everyone wants.
-    assert field["total"] == 0, prov
+    # would make the field useless in the state everyone wants. Read per source:
+    # the stack's design A3 (sovereign-stack plan 1) publishes no cross-source sum
+    # in any shape, and the per-source keys read here are in that shape and in the
+    # release tree's alike, so this holds whichever stack the bridge ships beside.
+    assert field["by_source"] and set(field["by_source"].values()) == {0}, prov
+    for source, detail in field["by_source_detail"].items():
+        assert (detail["stale_24h"], detail["stale_7d"]) == (0, 0), (source, prov)
     assert field["error"] is None, prov
 
 
@@ -227,9 +232,16 @@ print(json.dumps(loaded))
     assert result["signals_source"] == "unavailable", result["sovereign_stack"]
     field = result["field"]
     assert field["source"] == "stack tool heartbeat"
-    assert field["total"] is None, "an unimportable ledger reported a COUNT"
-    assert field["stale_24h"] is None
-    assert field["by_source"] is None
+    # The bridge's own fallback, in the stack's blind shape (design A3): every
+    # count null and per source, no cross-source sum under any name.
+    assert field["by_source"] is None, "an unimportable ledger reported a COUNT"
+    assert field["stale_24h_by_source"] is None
+    assert field["by_source_detail"] is None
+    assert not {"total", "stale_24h", "stale_7d"} & set(field)
+    assert field["note"] == (
+        "a total would be mostly the open-thread backlog by construction; read by source"
+    )
+    assert field["source_labels"] == {"thread": "open threads"}
     assert "signal_ledger_unavailable" in field["error"]
 
 
@@ -285,12 +297,18 @@ print(json.dumps(loaded))
     assert "corrupt" in str(field["error"]).lower(), (
         f"the error does not name the corruption ({prov}): {field['error']!r}"
     )
-    assert field["total"] is None, (
+    # Per source, in both the release tree's shape and the stack's A3 shape
+    # (which publishes no total): every source's counts must be null.
+    counted = {
+        source: detail
+        for source, detail in field["by_source_detail"].items()
+        if (detail["open"], detail["stale_24h"], detail["stale_7d"]) != (None, None, None)
+    }
+    assert field["by_source"] and set(field["by_source"].values()) == {None}, (
         "F4 IS STILL OPEN in the stack this bridge was measured against: a valid "
         "marker over a schema-corrupt row reported a COUNT alongside its error, "
-        f"and a count is what a reader acts on. Measured {field['total']!r} "
+        f"and a count is what a reader acts on. Measured {field['by_source']!r} "
         f"against {prov}. This is the stack's to close (signal_ledger.heartbeat_field); "
         "the bridge propagates it faithfully and cannot fix it from here."
     )
-    assert field["stale_24h"] is None, prov
-    assert field["stale_7d"] is None, prov
+    assert counted == {}, (counted, prov)

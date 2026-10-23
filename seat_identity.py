@@ -498,6 +498,7 @@ SEAT_SIGNABLE_TOOLS = frozenset(
         "handoff",
         "record_insight",
         "record_open_thread",
+        "resolve_thread_by_id",
         "where_did_i_leave_off",
     }
 )
