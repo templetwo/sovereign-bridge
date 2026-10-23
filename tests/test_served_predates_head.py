@@ -365,13 +365,19 @@ def test_an_unknown_stack_repo_is_null_with_the_reason():
 # --- the probe reads, and never writes --------------------------------------
 
 
-def test_the_probe_never_rewrites_the_index(tmp_path):
+def test_the_probe_never_rewrites_the_index(monkeypatch, tmp_path):
     """The probe re-reads the LIVE stack repo every HEAD_PROBE_INTERVAL. A plain
     `git status` refreshes a stale index and takes `.git/index.lock` to write
     it, which could collide with a deploy's own git command; the probe passes
     --no-optional-locks and must leave the index byte-identical. The control
     after it shows a plain status DOES rewrite this exact index, so the
-    unchanged bytes are not vacuous."""
+    unchanged bytes are not vacuous.
+
+    GIT_OPTIONAL_LOCKS=0 in the environment turns the refresh off for every git
+    call, the probe's and the control's alike: the control then fails, and a
+    probe that dropped its own flag would pass unseen. Measured in the Task 10
+    fix-round-1 scratch-HOME harness, which sets it; so the test sets its own."""
+    monkeypatch.delenv("GIT_OPTIONAL_LOCKS", raising=False)
     repo = tmp_path / "stack"
     _repo_with_one_commit(repo)
     tracked = repo / "f.txt"
