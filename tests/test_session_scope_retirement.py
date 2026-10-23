@@ -151,9 +151,12 @@ def test_published_since_pin_is_a_real_exception_not_a_hole():
 
     Deterministic half: every member is NEW (not already pinned published, not
     pinned retired). A name that drifted into the exception set while also being
-    retired would otherwise launder a dead grant past the guard.
+    retired would otherwise launder a dead grant past the guard. Skips while the
+    set is empty (release 1.23.0, where `descend` joined the pin), so the check
+    stays armed for the next published-since-pin tool instead of passing on nothing.
     """
-    assert PUBLISHED_SINCE_PIN, "empty exception set: delete it and this test"
+    if not PUBLISHED_SINCE_PIN:
+        pytest.skip("no published-since-pin exceptions at this pin (release 1.23.0)")
     assert PUBLISHED_SINCE_PIN.isdisjoint(PINNED_PUBLISHED)
     assert PUBLISHED_SINCE_PIN.isdisjoint(PINNED_RETIRED)
 
@@ -162,8 +165,12 @@ def test_published_since_pin_is_published_by_the_live_stack_source():
     """Measured half: each declared exception is actually published by the
     stack MAIN source on disk (the live checkout, STACK_TREES[1]) and not
     retired there. Skips loudly when no stack source is present. Measured in a
-    subprocess for the reason release_stack_surface() documents.
+    subprocess for the reason release_stack_surface() documents. Also skips while
+    the set is empty, where every assertion below would pass without measuring a
+    single name.
     """
+    if not PUBLISHED_SINCE_PIN:
+        pytest.skip("no published-since-pin exceptions at this pin (release 1.23.0)")
     published, retired, tree = release_stack_surface(trees=STACK_TREES[1:])
     missing = sorted(PUBLISHED_SINCE_PIN - published)
     assert missing == [], f"measured against {tree}: not published: {missing}"

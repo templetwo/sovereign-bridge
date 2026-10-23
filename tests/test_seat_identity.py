@@ -608,19 +608,25 @@ def test_tools_the_old_scope_map_never_carried_are_now_reachable(registry, calls
 
 
 def test_a_seat_is_never_narrower_than_a_session_grant_on_published_since_pin(registry, calls):
-    """D2 for the tools the 52-tool pin cannot see. The test above decides on
-    PINNED_SURFACE, so `session_grant & surface.published` drops `descend` and
-    it can never fire for it. Here the surface is the pin PLUS the dated
-    exception set, and BOTH halves of the seat path are checked: the policy
-    (seat_tool_allowed) and the containment class (unclassified_refusal, which
-    bridge.py applies after it). Red before descend's TOOL_CLASSES row.
+    """D2 for the tools the pin cannot see. Its sibling above,
+    `test_a_seat_is_never_narrower_than_a_session_grant`, decides on
+    PINNED_SURFACE, so `session_grant & surface.published` drops every
+    PUBLISHED_SINCE_PIN tool and can never fire for one. Here the surface is the
+    pin PLUS the dated exception set, and BOTH halves of the seat path are
+    checked: the policy (seat_tool_allowed) and the containment class
+    (unclassified_refusal, which bridge.py applies after it). Written for
+    `descend`, red here before its TOOL_CLASSES row; since release 1.23.0
+    descend is IN the pin (that sibling checks its policy half,
+    tests/test_seat_protected.py its class), the set is empty, and this skips
+    until the next published-since-pin tool is granted.
     """
     widened = si.Surface(
         PINNED_PUBLISHED | PUBLISHED_SINCE_PIN, PINNED_RETIRED, "pin + PUBLISHED_SINCE_PIN"
     )
     session_grant = {t for t, sc in st.TOOL_SCOPES.items() if sc in ("read", "write")}
     since_pin_granted = session_grant & PUBLISHED_SINCE_PIN
-    assert "descend" in since_pin_granted, "premise: descend is granted and since-pin"
+    if not since_pin_granted:
+        pytest.skip("no published-since-pin exceptions at this pin (release 1.23.0)")
     for tool in sorted(since_pin_granted):
         assert si.seat_tool_allowed(tool, widened) == (True, "ok"), tool
         assert si.unclassified_refusal(tool) is None, f"seat refuses {tool}: unclassified"
@@ -1117,17 +1123,20 @@ def test_the_pinned_surface_is_the_stack_release(registry, calls):
     )
 
 
-def test_the_seat_reaches_49_of_the_52_published_tools(registry, calls, surface):
-    """HQ decision D10's expected arithmetic, after admitting signal_ack:
-    49 allowed / 3 governance-denied of 52 published.
+def test_the_seat_reaches_50_of_the_53_published_tools(registry, calls, surface):
+    """HQ decision D10's expected arithmetic, after admitting signal_ack, moved
+    with the pin to sovereign-stack release 1.23.0: 50 allowed / 3
+    governance-denied of 53 published. At release/2026-09-06 it was 49 of 52;
+    the one name between the two pins is `descend`, and a seat reaches it.
 
     The three are named, not counted: a count alone would survive swapping one
     denial for another.
     """
     allowed = si.seat_allowed_tools(surface)
     denied = si.seat_denied_tools(surface)
-    assert len(surface.published) == 52
-    assert len(allowed) == 49, sorted(set(surface.published) - set(allowed))
+    assert len(surface.published) == 53
+    assert len(allowed) == 50, sorted(set(surface.published) - set(allowed))
+    assert "descend" in allowed
     assert [t for t, _ in denied] == ["close_session", "set_policy", "spiral_inherit"]
     assert {r for _, r in denied} == {"governance"}
 

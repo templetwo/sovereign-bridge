@@ -688,7 +688,7 @@ def test_the_structural_filter_still_runs_on_a_text_tool(seated, upstream):
 def test_the_classification_covers_the_published_surface_exactly(surface):
     """(a) EVERY published tool is in EXACTLY ONE class. A tool missing from the
     table would otherwise pick its own containment class by being absent."""
-    # PUBLISHED_SINCE_PIN: tools the stack main publishes after the 2026-09-06
+    # PUBLISHED_SINCE_PIN: tools the stack main publishes after the release 1.23.0
     # pin (suite_support, dated). They count as stack tools here, and they must
     # be classified too, or the exception would let one choose its own class.
     from suite_support import PUBLISHED_SINCE_PIN
