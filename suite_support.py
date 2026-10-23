@@ -25,9 +25,11 @@ drift here is therefore a RED TEST, never a quiet change of policy — which is
 the whole difference between this copy and the two production constants it
 replaced.
 
-Source: sovereign-stack release/2026-09-06. `list_tools` (server.py:2427) is
-every registered tool minus `RETIRED_TOOLS`: 100 registered, 48 retired,
-52 published.
+Source: sovereign-stack release 1.23.0 (main 278d42b, served 2026-10-23).
+`list_tools` (server.py:2492) is every registered tool minus `RETIRED_TOOLS`:
+101 registered, 48 retired, 53 published. The previous pin was
+release/2026-09-06 (100 registered, 48 retired, 52 published); the one name
+between the two is `descend`.
 """
 
 from __future__ import annotations
@@ -47,7 +49,8 @@ PINNED_PUBLISHED = frozenset(
         "archive_exchange", "arrive", "arrive_lineage", "check_mistakes",
         "close_session", "comms_channels", "comms_get_acks", "comms_recall",
         "compass_check", "connectivity_status", "context_retrieve",
-        "current_policies", "get_compaction_context", "get_compaction_stats",
+        "current_policies", "descend",
+        "get_compaction_context", "get_compaction_stats",
         "get_growth_summary", "get_inheritable_context", "get_my_patterns",
         "get_open_threads", "get_pending_experiments",
         "get_unresolved_uncertainties", "handoff", "handoff_acted_on_records",
@@ -83,19 +86,30 @@ PINNED_RETIRED = frozenset(
     }
 )
 
-# Published by sovereign-stack MAIN after the release/2026-09-06 pin above was
-# taken. Kept OUT of PINNED_PUBLISHED on purpose: PINNED_SURFACE is what every
-# seat MECHANICS test decides against, and `test_the_pinned_surface_is_the_stack_release`
-# still checks it against the frozen release worktree, which does not carry
-# these. A name here is a declared, dated exception, checked two ways in
-# tests/test_session_scope_retirement.py: disjoint from both pins, and actually
-# published by the live stack source on disk.
+# Tools sovereign-stack publishes AFTER the pin above was taken: a declared,
+# dated exception set, kept OUT of PINNED_PUBLISHED on purpose. PINNED_SURFACE
+# is what every seat MECHANICS test decides against, and
+# `test_the_pinned_surface_is_the_stack_release` checks it against the release
+# worktree, which does not carry a name published after it.
+#
+# EMPTY AT THIS PIN. The pin moved to sovereign-stack release 1.23.0
+# (main 278d42b) on 2026-10-23 and `descend` joined PINNED_PUBLISHED. The set
+# stays as the mechanism for the NEXT tool the stack publishes after this pin:
+# when non-empty it is checked two ways in tests/test_session_scope_retirement.py
+# (disjoint from both pins, and actually published by the live stack source on
+# disk). While it is empty those two checks, and the seat-grant premise test in
+# tests/test_seat_identity.py, SKIP rather than pass on an empty set.
+#
+# Past entry, kept as history:
 #   descend — THE DESCENT, stack ff54484, live 2026-10-08 07:49 EDT; granted to
-#             the `read` scope on Anthony's word 2026-10-10.
-PUBLISHED_SINCE_PIN = frozenset({"descend"})
+#             the `read` scope on Anthony's word 2026-10-10. Since-pin until
+#             2026-10-23, when it joined PINNED_PUBLISHED with release 1.23.0.
+PUBLISHED_SINCE_PIN = frozenset()
 
 PINNED_SURFACE = seat_identity.Surface(
-    PINNED_PUBLISHED, PINNED_RETIRED, "test pin: sovereign-stack release/2026-09-06"
+    PINNED_PUBLISHED,
+    PINNED_RETIRED,
+    "test pin: sovereign-stack release 1.23.0 (main 278d42b)",
 )
 
 # Preference order: the release worktree this bridge release ships beside, then
