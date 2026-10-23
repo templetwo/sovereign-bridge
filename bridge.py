@@ -988,6 +988,11 @@ RUNTIME_RECEIPT: dict[str, Any] = {
     # heartbeat still reads this dict only; the re-read happens off the
     # request path, the way CLOCK_PROBE's does.
     "head_now": None,
+    # source_commit's FULL sha, pinned at start from the first HEAD reading
+    # (see _compute_runtime_receipt), for served_predates_head's sha rule: a
+    # short sha's length can grow with the repo, so the rule compares full
+    # shas. Internal: the heartbeat does not publish it.
+    "source_commit_full": None,
 }
 
 # Longest git error the PUBLIC heartbeat carries (served_predates_head_reason).
@@ -1106,25 +1111,46 @@ async def _compute_runtime_receipt() -> None:
     RUNTIME_RECEIPT["bridge_commit"] = bridge_sha
     RUNTIME_RECEIPT["bridge_working_tree_dirty"] = bridge_dirty
     RUNTIME_RECEIPT["head_now"] = head_now
+    # Pin source_commit to its FULL sha from the first HEAD reading, taken in
+    # the same gather. Kept only when that reading IS source_commit (the short
+    # form is the full sha's prefix): if HEAD moved between the two reads, or
+    # either read failed, it stays None and served_predates_head reads null
+    # rather than compare HEAD with a commit the process may not have loaded.
+    first_full = head_now.get("sha") if isinstance(head_now, dict) else None
+    RUNTIME_RECEIPT["source_commit_full"] = (
+        first_full if stack_sha and first_full and first_full.startswith(stack_sha) else None
+    )
 
 
 # === Served vs HEAD (design A4) ===============================================
 # The receipt above is read ONCE, at start: it says what the process LOADED.
-# HEAD can move after that with no restart: a commit, a merge, or a checkout in
-# the live tree, and a checkout is a deploy that nothing announces (a branch was
-# checked out in a live tree twice in the record, 08-28 and 09-01). HEAD as read
-# at start was already committed when the process started, so comparing the
-# start with it cannot come out true; the stack's HEAD is therefore RE-READ every
-# HEAD_PROBE_INTERVAL by _head_probe_loop (same shape as the NTP probe: the
-# request path reads the cache only) and the heartbeat derives one field:
+# HEAD can move after that with no restart: a commit, a merge, a fast-forward,
+# a reset, or a checkout in the live tree, and a checkout is a deploy that
+# nothing announces (a branch was checked out in a live tree twice in the
+# record, 08-28 and 09-01). HEAD as read at start was already committed when
+# the process started, so comparing the start with it cannot come out true; the
+# stack's HEAD is therefore RE-READ every HEAD_PROBE_INTERVAL by _head_probe_loop
+# (same shape as the NTP probe: the request path reads the cache only) and the
+# heartbeat derives one field:
 #
-#   served_predates_head  True   service_start_time is older than HEAD's commit
-#                                time, or the tree is dirty
-#                         False  both were read and neither holds
+#   served_predates_head  True   any of: service_start_time is older than
+#                                HEAD's commit time (the spec's rule); HEAD is
+#                                not the commit the process loaded (full shas);
+#                                the tree was dirty at start; the tree is dirty
+#                                now
+#                         False  every one of those was read and none holds
 #                         None   anything needed to decide was not read, with
 #                                the reason; None is NEVER False (plan 1,
 #                                Review Focus 4): a heartbeat that could not
 #                                read the repository must not say it matches.
+#
+# Why four rules and not the spec's two (Task 10 fix round 1, review findings 1
+# and 2). The time rule alone reads False when HEAD moves to a commit dated
+# BEFORE the start: a checkout of an older branch, a reset, or a fast-forward to
+# commits made before the bridge last started, which is this house's normal
+# deploy with the kickstart forgotten. And a process that loaded uncommitted
+# edits still serves them after the tree is cleaned. The sha rule and the
+# start-time working_tree_dirty close those two cases.
 #
 # The stack repo only (source_commit's repo), and the bridge process's own
 # start time stands for "served": the bridge serves the stack modules it
@@ -1138,12 +1164,13 @@ HEAD_READING_MAX_AGE = 2 * HEAD_PROBE_INTERVAL
 async def _read_stack_head(repo_root: Path | None) -> dict[str, Any]:
     """The stack's HEAD as it stands NOW, for served_predates_head.
 
-    {short_sha, committed_at (HEAD's COMMITTER date, ISO UTC), dirty (tracked
-    files only, the same rule as working_tree_dirty), error, measured_at}.
-    Never raises. `error` says why when HEAD or its commit time could not be
-    read (short_sha is then None) or when `git status` failed (dirty is then
-    None)."""
+    {sha (full), short_sha, committed_at (HEAD's COMMITTER date, ISO UTC),
+    dirty (tracked files only, the same rule as working_tree_dirty), error,
+    measured_at}. Never raises. `error` says why when HEAD or its commit time
+    could not be read (sha and short_sha are then None) or when `git status`
+    failed (dirty is then None)."""
     reading: dict[str, Any] = {
+        "sha": None,
         "short_sha": None,
         "committed_at": None,
         "dirty": None,
@@ -1161,17 +1188,18 @@ async def _read_stack_head(repo_root: Path | None) -> dict[str, Any]:
     # --no-show-signature: a `log.showSignature` config would put gpg's lines
     # into stdout ahead of the format and the reading would fail to parse.
     out, err = await _run_git_capture(
-        repo_root, "log", "-1", "--no-show-signature", "--format=%h %ct", "HEAD"
+        repo_root, "log", "-1", "--no-show-signature", "--format=%H %h %ct", "HEAD"
     )
     if out is None:
         reading["error"] = err
         return reading
     try:
-        short_sha, epoch = out.split()
+        full_sha, short_sha, epoch = out.split()
         committed_at = datetime.fromtimestamp(int(epoch), timezone.utc)
     except (ValueError, OverflowError, OSError):
         reading["error"] = _public_git_error(f"HEAD could not be parsed: {out!r}")
         return reading
+    reading["sha"] = full_sha
     reading["short_sha"] = short_sha
     reading["committed_at"] = committed_at.isoformat()
     status, err = await _run_git_capture(repo_root, "status", "--porcelain", "--untracked-files=no")
@@ -1204,9 +1232,15 @@ async def _head_probe_loop() -> None:
 def _served_predates_head(receipt: dict[str, Any], now: datetime) -> tuple[bool | None, str]:
     """(served_predates_head, served_predates_head_reason), from the cache only.
 
-    Reasons, verbatim: "service started <t> before HEAD <sha> committed at <t2>"
-    and "working tree dirty" (joined with "; " when both hold); for null, what
-    was not read, with git's own error when the metadata was unreadable."""
+    True when any rule holds, its reasons joined with "; " in this fixed order:
+      "service started <t> before HEAD <sha> committed at <t2>"
+      "HEAD <sha> is not the commit the service loaded, <source_commit>"
+      "working tree dirty at service start"
+      "working tree dirty"
+    The first and the last are the brief's, verbatim. For null, what was not
+    read: the current HEAD reading first (with git's own error when the
+    metadata was unreadable), then the start-time facts a false would rest on.
+    """
     start_text = receipt.get("service_start_time")
     try:
         start = datetime.fromisoformat(start_text) if start_text else None
@@ -1225,8 +1259,9 @@ def _served_predates_head(receipt: dict[str, Any], now: datetime) -> tuple[bool 
     if age is None or age > HEAD_READING_MAX_AGE:
         return None, f"HEAD reading is stale: last read {measured_text}"
     sha = head.get("short_sha")
+    head_full = head.get("sha")
     committed_text = head.get("committed_at")
-    if not sha or not committed_text:
+    if not sha or not head_full or not committed_text:
         return None, f"git metadata unreadable: {head.get('error') or 'no detail recorded'}"
     try:
         committed = datetime.fromisoformat(committed_text)
@@ -1234,20 +1269,38 @@ def _served_predates_head(receipt: dict[str, Any], now: datetime) -> tuple[bool 
         committed = None
     if committed is None or committed.tzinfo is None:
         return None, f"git metadata unreadable: HEAD commit time {committed_text!r}"
+    loaded_full = receipt.get("source_commit_full")
+    loaded = receipt.get("source_commit")
+    start_dirty = receipt.get("working_tree_dirty")
     reasons = []
     if start < committed:
         reasons.append(
             f"service started {start_text} before HEAD {sha} committed at {committed_text}"
         )
+    # Full shas on both sides: a short form's length can grow, so two short
+    # spellings of one commit may differ, and two commits may share a prefix.
+    if loaded_full and head_full != loaded_full:
+        reasons.append(f"HEAD {sha} is not the commit the service loaded, {loaded or loaded_full}")
+    if start_dirty is True:
+        reasons.append("working tree dirty at service start")
     if head.get("dirty") is True:
         reasons.append("working tree dirty")
     if reasons:
         return True, "; ".join(reasons)
+    if not loaded_full:
+        why = (
+            f"source_commit {loaded} could not be pinned to a full sha"
+            if loaded
+            else "source_commit was not read"
+        )
+        return None, f"the commit the service loaded is unknown: {why} at service start"
+    if start_dirty is not False:
+        return None, "working tree state at service start unknown"
     if head.get("dirty") is not False:
         return None, f"working tree state unreadable: {head.get('error') or 'no detail recorded'}"
     return False, (
         f"service started {start_text} at or after HEAD {sha} committed at {committed_text}; "
-        "working tree clean"
+        "HEAD is the commit the service loaded; working tree clean at service start and now"
     )
 
 
@@ -2135,7 +2188,7 @@ async def heartbeat(as_: str | None = Query(None, alias="as")):
         "bridge_working_tree_dirty": RUNTIME_RECEIPT.get("bridge_working_tree_dirty"),
         "source_note": "version is read from sovereign_stack's pyproject.toml in the checked-out tree, NOT from installed package metadata (that metadata is a snapshot frozen at the last `pip install -e .` and can silently outlive a later `git checkout` — see 2026-07-11 postmortem). source_commit is sovereign_stack's git HEAD, the field that cannot lie the way a stale version string can; bridge_commit is this bridge script's OWN repo HEAD — do not confuse the two. "
         "source_commit, working_tree_dirty and service_start_time are read once, at process start: they say what the process loaded. "
-        f"served_predates_head compares service_start_time with the stack's HEAD as RE-READ every {HEAD_PROBE_INTERVAL}s: true when the process started before HEAD's commit time or the tree is dirty, false when both were read and neither holds, and null, with served_predates_head_reason, when it could not be decided. null is never false.",
+        f"served_predates_head compares what the process loaded with the stack's HEAD as RE-READ every {HEAD_PROBE_INTERVAL}s: true when the process started before HEAD's commit time, when HEAD is not the commit the process loaded, or when the tree was dirty at start or is dirty now; false when all of those were read and none holds; and null, with served_predates_head_reason, when it could not be decided. null is never false.",
         "welcome": (
             "You are through. The stack is alive."
             if healthy
