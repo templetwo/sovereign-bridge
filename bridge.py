@@ -1830,11 +1830,14 @@ except Exception:  # pragma: no cover — stack import failure is already fatal 
 #
 # ⚠ AN UNREADABLE OR NEVER-SCANNED LEDGER IS AN ERROR STATE, NEVER ZERO, and
 # that property is load-bearing enough to say twice. `heartbeat_field` already
-# renders `{"error": "not_scanned", "total": None}` rather than
-# `{"total": 0}` — a zero here would read as "every signal is closed", which is
+# renders `{"error": "not_scanned", "by_source": None, ...}` rather than a
+# count of 0 — a zero here would read as "every signal is closed", which is
 # the single most reassuring lie this field could tell. So NOTHING in this
-# module coerces a None to 0, and the failure paths below render `total: None`
-# with a populated `error` for exactly the same reason.
+# module coerces a None to 0, and the failure paths below render every count
+# null with a populated `error` for exactly the same reason. Since the stack's
+# design A3 (sovereign-stack plan 1) every count is per source and no
+# cross-source sum is published in any shape; the fallback below speaks that
+# blind shape, so the field means one thing whichever route answered.
 #
 # THE IMPORT WILL FAIL TODAY, AND THAT IS EXPECTED, NOT A BUG. bridge.py adds
 # ~/sovereign-stack/src to sys.path (line 49), so `sovereign_stack` resolves to
@@ -1854,6 +1857,17 @@ except Exception:  # pragma: no cover — exercised by the fallback test
         raise RuntimeError("sovereign_stack.signal_ledger unavailable")
 
 
+# The stack's own words for the two constants its blind field carries
+# (sovereign_stack.signal_ledger.BY_SOURCE_NOTE and SOURCE_LABELS, design A3).
+# COPIED, NOT IMPORTED: the fallback below answers exactly when the import
+# failed. tests/test_heartbeat_signals.py holds these copies to the stack's
+# constants whenever a stack tree that carries them is on disk.
+SIGNALS_BY_SOURCE_NOTE = (
+    "a total would be mostly the open-thread backlog by construction; read by source"
+)
+SIGNALS_SOURCE_LABELS = {"thread": "open threads"}
+
+
 def _signals_unmeasured(exc: Exception, route: str | None = None) -> dict:
     """The honest shape of a failed read: an error, and no numbers at all.
 
@@ -1861,6 +1875,15 @@ def _signals_unmeasured(exc: Exception, route: str | None = None) -> dict:
     are two and they mean different things to whoever reads the heartbeat: an
     unimportable module is a deploy-ordering fact, an upstream tool failure is
     a live-service fact. A single opaque error word would have merged them.
+
+    THE STACK'S BLIND SHAPE (design A3; sovereign-stack plan 1's final review,
+    finding I-3): every count null and per source, no `total`, `stale_24h` or
+    `stale_7d` (the stack publishes no cross-source sum in any shape), the
+    stack's own `measured: False`, and `note` and `source_labels` in the
+    stack's words, so `unacked_signals.note` says the same thing whichever
+    route answered. Before, this fallback's `note` was its warning below and
+    the stack's was its reason for publishing no total: one key, two meanings
+    by route. The warning now has a key of its own.
     """
     return {
         "source": route or SIGNALS_SOURCE,
@@ -1871,11 +1894,14 @@ def _signals_unmeasured(exc: Exception, route: str | None = None) -> dict:
         ),
         "ingestion": "error",
         "scanned_at": None,
-        "total": None,
-        "stale_24h": None,
-        "stale_7d": None,
+        "measured": False,
         "by_source": None,
-        "note": (
+        "stale_24h_by_source": None,
+        "by_source_detail": None,
+        "note": SIGNALS_BY_SOURCE_NOTE,
+        # A fresh copy per read, as the stack's field gives.
+        "source_labels": dict(SIGNALS_SOURCE_LABELS),
+        "warning": (
             "the signal ledger could not be read; an absent count is NOT a zero "
             "count, and this field must never be rendered as 'no unacked signals'"
         ),
@@ -1957,9 +1983,10 @@ async def _signals_via_tool() -> dict:
 
 async def _measure_signals() -> dict:
     """`unacked_signals` for the heartbeat. Never raises, never fabricates a
-    zero. A raise from the ledger becomes an error state carrying `total: None`;
-    a successful read is passed through with its own error field intact, since
-    `heartbeat_field` already distinguishes not_scanned from a real count.
+    zero. A raise from the ledger becomes an error state carrying every count
+    null (`_signals_unmeasured`); a successful read is passed through with its
+    own error field intact, since `heartbeat_field` already distinguishes
+    not_scanned from a real count.
 
     Local import first — it is a filesystem read with no network in it. The
     upstream tool is the fallback, and only when the import is the thing that
