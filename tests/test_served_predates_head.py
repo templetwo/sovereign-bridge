@@ -128,12 +128,13 @@ def _isolate(monkeypatch, tmp_path):
 
     Beyond the isolation tests/test_runtime_receipt.py uses (comms in tmp, the
     clock probe and the tool inventory faked), the four censuses are stubbed
-    too: aperture, gate, attribution and signals each read the LIVE
-    ~/.sovereign through the stack modules bridge.py imports. Measured with an
-    audit hook before this was added (Task 10 fix round 1, review cannot-verify
-    4): about 2,800 opens and listings there per heartbeat, plus no-op mkdir
-    and same-mode chmod calls from the oauth and queue modules the gate census
-    imports; after it, none from any test in this file."""
+    too. Measured with an audit hook before this was added, one heartbeat with
+    one census held at a time (Task 10 fix round 1, review cannot-verify 4):
+    the attribution census made about 2,370 opens and listings under the LIVE
+    ~/.sovereign and the gate census about 460, plus no-op mkdir and same-mode
+    chmod calls on the bridges' oauth and queue directories from the modules
+    it imports; the aperture and signals censuses made none here. After it, no
+    test in this file touches the live store."""
     monkeypatch.setattr(bridge, "COMMS_DIR", tmp_path / "comms")
     monkeypatch.setattr(
         bridge,
